@@ -1,0 +1,243 @@
+{
+  "name": "antigravity-code-review",
+  "displayName": "Antigravity Code Review",
+  "description": "Comprehension-first, zero-webview native GitHub PR review tool for Antigravity. Features CliffsNotes study guides, logical reading tours, native side-by-side diffs, inline Ask-Antigravity comment threads, and 1-click GitHub Pending Review export.",
+  "version": "1.0.0",
+  "publisher": "antigravity",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other",
+    "SCM Providers"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:antigravityReview.cliffsNotesTree",
+    "onView:antigravityReview.commentsTree",
+    "onView:antigravityReview.checksTree"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "antigravity-code-review",
+          "title": "Antigravity Code Review",
+          "icon": "media/review-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "antigravity-code-review": [
+        {
+          "id": "antigravityReview.cliffsNotesTree",
+          "name": "CliffsNotes & Reading Tour",
+          "icon": "media/review-icon.svg",
+          "contextualTitle": "CliffsNotes & Tour"
+        },
+        {
+          "id": "antigravityReview.commentsTree",
+          "name": "Review Comments & Cart",
+          "contextualTitle": "Review Comments"
+        },
+        {
+          "id": "antigravityReview.checksTree",
+          "name": "Coverage & Repo Checks",
+          "contextualTitle": "Checks & Coverage"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "antigravityReview.loadPrFromUrl",
+        "title": "Review PR from GitHub URL...",
+        "category": "Antigravity Review",
+        "icon": "$(git-pull-request)"
+      },
+      {
+        "command": "antigravityReview.openCliffsNotesGuide",
+        "title": "Open Full CliffsNotes Study Guide",
+        "category": "Antigravity Review",
+        "icon": "$(book)"
+      },
+      {
+        "command": "antigravityReview.nextTourStop",
+        "title": "Next CliffsNotes Tour Stop",
+        "category": "Antigravity Review",
+        "icon": "$(arrow-down)"
+      },
+      {
+        "command": "antigravityReview.prevTourStop",
+        "title": "Previous CliffsNotes Tour Stop",
+        "category": "Antigravity Review",
+        "icon": "$(arrow-up)"
+      },
+      {
+        "command": "antigravityReview.openTourStop",
+        "title": "Open Tour Stop in Diff Editor",
+        "category": "Antigravity Review",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "antigravityReview.jumpToThread",
+        "title": "Jump to Comment Thread in Diff",
+        "category": "Antigravity Review",
+        "icon": "$(comment)"
+      },
+      {
+        "command": "antigravityReview.askInComment",
+        "title": "Ask Antigravity About This Code",
+        "category": "Antigravity Review",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "antigravityReview.askAtLine",
+        "title": "Ask Antigravity in Comment Thread...",
+        "category": "Antigravity Review",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "antigravityReview.stageNewComment",
+        "title": "Stage Review Comment for GitHub",
+        "category": "Antigravity Review",
+        "icon": "$(check)"
+      },
+      {
+        "command": "antigravityReview.stageThread",
+        "title": "Stage for GitHub Pending Review",
+        "category": "Antigravity Review",
+        "icon": "$(check)"
+      },
+      {
+        "command": "antigravityReview.unstageThread",
+        "title": "Unstage Comment",
+        "category": "Antigravity Review",
+        "icon": "$(History)"
+      },
+      {
+        "command": "antigravityReview.dismissThread",
+        "title": "Dismiss Candidate Comment",
+        "category": "Antigravity Review",
+        "icon": "$(close)"
+      },
+      {
+        "command": "antigravityReview.editDraftComment",
+        "title": "Edit Draft GitHub Comment...",
+        "category": "Antigravity Review",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "antigravityReview.exportPendingReview",
+        "title": "Export Staged Comments to GitHub Pending Review",
+        "category": "Antigravity Review",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "antigravityReview.refreshSession",
+        "title": "Refresh Review Session",
+        "category": "Antigravity Review",
+        "icon": "$(refresh)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "antigravityReview.nextTourStop",
+        "key": "alt+down",
+        "mac": "alt+down",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "antigravityReview.prevTourStop",
+        "key": "alt+up",
+        "mac": "alt+up",
+        "when": "editorTextFocus"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "antigravityReview.loadPrFromUrl",
+          "when": "view == antigravityReview.cliffsNotesTree",
+          "group": "navigation@1"
+        },
+        {
+          "command": "antigravityReview.openCliffsNotesGuide",
+          "when": "view == antigravityReview.cliffsNotesTree",
+          "group": "navigation@2"
+        },
+        {
+          "command": "antigravityReview.nextTourStop",
+          "when": "view == antigravityReview.cliffsNotesTree",
+          "group": "navigation@3"
+        },
+        {
+          "command": "antigravityReview.exportPendingReview",
+          "when": "view == antigravityReview.commentsTree",
+          "group": "navigation@1"
+        },
+        {
+          "command": "antigravityReview.refreshSession",
+          "when": "view == antigravityReview.commentsTree",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "antigravityReview.stageThread",
+          "when": "view == antigravityReview.commentsTree && viewItem == thread-candidate",
+          "group": "inline@1"
+        },
+        {
+          "command": "antigravityReview.editDraftComment",
+          "when": "view == antigravityReview.commentsTree && (viewItem == thread-candidate || viewItem == thread-staged)",
+          "group": "inline@2"
+        },
+        {
+          "command": "antigravityReview.dismissThread",
+          "when": "view == antigravityReview.commentsTree && viewItem == thread-candidate",
+          "group": "inline@3"
+        },
+        {
+          "command": "antigravityReview.unstageThread",
+          "when": "view == antigravityReview.commentsTree && viewItem == thread-staged",
+          "group": "inline@1"
+        }
+      ],
+      "comments/commentThread/title": [
+        {
+          "command": "antigravityReview.stageThread",
+          "when": "commentController == antigravity-code-review && commentThread =~ /candidate|qa/",
+          "group": "inline@1"
+        },
+        {
+          "command": "antigravityReview.editDraftComment",
+          "when": "commentController == antigravity-code-review && commentThread =~ /candidate|staged/",
+          "group": "inline@2"
+        },
+        {
+          "command": "antigravityReview.dismissThread",
+          "when": "commentController == antigravity-code-review && commentThread =~ /candidate|qa/",
+          "group": "inline@3"
+        },
+        {
+          "command": "antigravityReview.unstageThread",
+          "when": "commentController == antigravity-code-review && commentThread =~ /staged/",
+          "group": "inline@1"
+        }
+      ],
+      "comments/commentThread/context": [
+        {
+          "command": "antigravityReview.askInComment",
+          "when": "commentController == antigravity-code-review",
+          "group": "inline@1"
+        },
+        {
+          "command": "antigravityReview.stageNewComment",
+          "when": "commentController == antigravity-code-review",
+          "group": "inline@2"
+        }
+      ]
+    }
+  }
+}
