@@ -55,12 +55,14 @@
     if (segments.length === 0) {
       return { titleLines: ['Node'], subLines: [] };
     }
-    const titleLines = wrapLines(segments[0], 30).slice(0, 2);
+    const primary = segments[0].replace(/\s*\([^)]{22,}\)\s*$/, '').trim() || segments[0];
+    const titleLines = wrapLines(primary, 26).slice(0, 2);
     const subLines = [];
-    for (let i = 1; i < segments.length; i++) {
-      const wrapped = wrapLines(segments[i], 34);
-      for (const ln of wrapped) {
-        if (subLines.length < 4) subLines.push(ln);
+    if (segments.length > 1) {
+      const second = segments[1].replace(/^\((.*)\)$/, '$1').trim();
+      if (second) {
+        const shortSub = second.length > 32 ? second.slice(0, 31) + '…' : second;
+        subLines.push(shortSub);
       }
     }
     return { titleLines, subLines };

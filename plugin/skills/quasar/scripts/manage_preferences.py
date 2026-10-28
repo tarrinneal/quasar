@@ -310,7 +310,6 @@ def discover_candidate_skills(workspace_dir: Optional[str] = None) -> List[Dict[
         os.path.join(home, ".gemini", "config", "skills"),
         os.path.join(home, ".gemini", "skills"),
         os.path.join(home, ".gemini", "config", "plugins"),
-        os.path.join(home, ".gemini", "jetski", "builtin", "skills"),
     ]
     if workspace_dir and os.path.isdir(workspace_dir):
         search_dirs.insert(0, workspace_dir)

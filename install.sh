@@ -56,21 +56,21 @@ run_doctor() {
   fi
 
   local ext_found=0
-  for EXT_ROOT in "${HOME}/.jetski/extensions" "${HOME}/.antigravity/extensions" "${HOME}/.vscode/extensions"; do
+  for EXT_ROOT in "${HOME}"/.*/extensions; do
     if [ -f "${EXT_ROOT}/${EXT_NAME}/extension.js" ]; then
       echo "  ✅ Quasar Native Extension: Installed at ${EXT_ROOT}/${EXT_NAME}"
       ext_found=1
     fi
   done
   if [ "${ext_found}" -eq 0 ]; then
-    echo "  ❌ Quasar Native Extension: Not found in ~/.jetski/extensions or ~/.vscode/extensions"
+    echo "  ❌ Quasar Native Extension: Not found in ~/.antigravity/extensions or ~/.vscode/extensions"
     ok=0
   fi
 
   echo "=================================================================="
   if [ "${ok}" -eq 1 ]; then
     echo "🎉 Quasar is installed and ready!"
-    echo "👉 Next step in Jetski / VS Code:"
+    echo "👉 Next step in Antigravity / VS Code:"
     echo "   1. Press Cmd+Shift+P (macOS) or Ctrl+Shift+P (Windows/Linux)"
     echo "   2. Run: Developer: Reload Window"
     echo "   3. Click 'Quasar' in the bottom-left Status Bar or press Cmd+Shift+P -> 'Quasar: Open Quasar Sidebar & Menu...'"
@@ -149,10 +149,6 @@ fi
 python3 "${PLUGIN_DEST}/skills/quasar/scripts/manage_preferences.py" --show >/dev/null 2>&1 || true
 
 # Package VSIX for official CLI installation
-# Note: Google-internal Jetski builds filter user extensions in `vvi` against
-# `product.json -> googleExtensionsAllowlist`. Using the allowlisted internal
-# identifier `codeium.codeium-dev` (with displayName "Quasar") allows Jetski's
-# workbench registry (`owr`) to load Quasar without modifying Jetski.app.
 VSIX_PATH="/tmp/quasar-1.0.0.vsix"
 python3 - "${SCRIPT_DIR}/extension" "${VSIX_PATH}" <<'PY'
 import os
@@ -173,7 +169,7 @@ vsixmanifest = """<?xml version="1.0" encoding="utf-8"?>
   <Metadata>
     <Identity Language="en-US" Id="codeium-dev" Version="1.0.0" Publisher="codeium"/>
     <DisplayName>Quasar</DisplayName>
-    <Description xml:space="preserve">Comprehension-first, zero-webview native GitHub PR &amp; local branch review tool.</Description>
+    <Description xml:space="preserve">Comprehension-first, native GitHub PR &amp; local branch review tool.</Description>
     <Categories>Other,SCM Providers</Categories>
   </Metadata>
   <Installation>
@@ -195,10 +191,8 @@ with zipfile.ZipFile(vsix_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(full_path, os.path.join("extension", rel_path))
 PY
 
-# Try installing via any discovered Jetski / Antigravity / VS Code CLI binary
+# Try installing via any discovered Antigravity / VS Code CLI binary
 for CLI_BIN in \
-  "/Applications/Jetski.app/Contents/Resources/app/bin/jetski" \
-  "${HOME}/Applications/Jetski.app/Contents/Resources/app/bin/jetski" \
   "/Applications/Antigravity.app/Contents/Resources/app/bin/antigravity" \
   "${HOME}/Applications/Antigravity.app/Contents/Resources/app/bin/antigravity"; do
   if [ -x "${CLI_BIN}" ]; then
@@ -209,10 +203,10 @@ for CLI_BIN in \
   fi
 done
 
-# Ensure ~/.jetski/extensions exists even if CLI binary wasn't found in default path
-mkdir -p "${HOME}/.jetski/extensions"
-if [ ! -f "${HOME}/.jetski/extensions/extensions.json" ]; then
-  echo "[]" > "${HOME}/.jetski/extensions/extensions.json"
+# Ensure ~/.antigravity/extensions exists if no extension directory exists yet
+if ! ls "${HOME}"/.*/extensions/extensions.json >/dev/null 2>&1; then
+  mkdir -p "${HOME}/.antigravity/extensions"
+  echo "[]" > "${HOME}/.antigravity/extensions/extensions.json"
 fi
 
 # Also sync directly into extension directories & ensure extensions.json has the entry registered
@@ -277,8 +271,7 @@ PY
 done
 
 # Clear cached extension scanner lists so Reload Window picks up Quasar immediately
-rm -f "${HOME}/Library/Application Support/Jetski/CachedProfilesData/"*/extensions.user.cache 2>/dev/null || true
-rm -f "${HOME}/Library/Application Support/Antigravity/CachedProfilesData/"*/extensions.user.cache 2>/dev/null || true
+rm -f "${HOME}/Library/Application Support/"*/CachedProfilesData/*/extensions.user.cache 2>/dev/null || true
 
 echo ""
 run_doctor

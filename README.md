@@ -1,6 +1,6 @@
 # Quasar
 
-A **comprehension-first, 100% native (zero-webview)** GitHub PR & local branch code review tool for Jetski / Antigravity.
+A **comprehension-first, 100% native** GitHub PR & local branch code review tool for Antigravity.
 
 Point **Quasar** at any **GitHub PR URL** or **local branch / working-tree diff** and it automatically:
 1. Fetches the PR metadata or local branch commit history, unified diff, and existing comments.
@@ -29,12 +29,12 @@ chmod +x install.sh
 ```
 `./install.sh` automatically:
 1. Installs the **Quasar** agent plugin (`SKILL.md`, Python scripts, and 4 specialist review subagents) to `~/.gemini/config/plugins/quasar`.
-2. Packages and installs the **Quasar** native IDE extension into `~/.jetski/extensions` (and `~/.vscode/extensions`).
+2. Packages and installs the **Quasar** native IDE extension into `~/.antigravity/extensions` (and `~/.vscode/extensions`).
 3. Initializes your persistent preference store at `~/.gemini/quasar/PREFERENCES.md`.
 4. Runs the **Quasar Doctor** (`./install.sh --check`) and prints `✅` checks for every component.
 
 ### Step 3: Reload Your Window (Required Once!)
-Because Jetski scans extensions at window startup, you **must reload the window once** after running `./install.sh`:
+Because the IDE scans extensions at window startup, you **must reload the window once** after running `./install.sh`:
 1. Press **`Cmd+Shift+P`** (macOS) or **`Ctrl+Shift+P`** (Windows/Linux).
 2. Type **`Developer: Reload Window`** and press **Enter**.
 

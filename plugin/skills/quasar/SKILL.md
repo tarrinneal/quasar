@@ -177,9 +177,13 @@ Write `<SCRATCH_DIR>/review_synthesis.json` and publish it using `publish_review
 }
 ```
 
+> **Progressive Disclosure Study Guide Rules (Keep It Simple & Scannable!)**:
+> - **`cliffsNotes.tldr`**, each chapter's **`summary`**, and each tour stop's **`cliffsNotes`** are rendered up front in the default view: keep each one to **1 short, plain-English sentence (under ~140 characters)** without long parenthetical type lists.
+> - Put deeper mechanics, callers, edge cases, and symbol breakdowns into **`cliffsNotes.whatAndWhy`**, **`cliffsNotesBullets`**, **`whyItChanged`**, and **`callersAndInvariants`** — Quasar automatically places those inside expandable `▸ Context & code snippet` drawers alongside a live code preview.
+>
 > **Mermaid Flowchart Rules (`architectureDiagram`)**:
 > - Always quote every node and subgraph label (`ID["Label Text"]`, `subgraph sg_id ["Title"]`).
-> - Keep every node/edge label on a **single line** — never put raw newlines, `\n`, `<br/>`, or `<tag>` angle brackets inside labels (use ` - ` instead of line breaks, and write `Prefix` instead of `<Prefix>`).
+> - Keep node labels short (`Title - 3-5 word subtitle` max) and on a **single line** — never put raw newlines, `\n`, `<br/>`, or `<tag>` angle brackets inside labels.
 > - Use standard `-->` or `-.->` arrows (one edge per line; avoid `<-->` or chained `A --> B --> C`).
 
 Publish the session to the current window's isolated workspace instance:

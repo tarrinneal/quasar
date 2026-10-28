@@ -1264,6 +1264,86 @@ def sanitize_mermaid_diagram(diag: str) -> str:
     return "\n".join(out_lines)
 
 
+def _split_concise_and_detail(raw_text: str, max_short_chars: int = 165) -> Tuple[str, str]:
+    text = re.sub(r"\s+", " ", str(raw_text or "")).strip()
+    if not text:
+        return "", ""
+    # Split after first sentence boundary (. ! ?) not inside backticks
+    in_tick = False
+    split_idx = -1
+    for i in range(len(text) - 1):
+        ch = text[i]
+        if ch == "`":
+            in_tick = not in_tick
+            continue
+        if not in_tick and ch in ".!?" and text[i + 1] == " ":
+            if i >= 22:
+                split_idx = i + 1
+                break
+    if split_idx != -1 and split_idx < len(text) - 4:
+        first = text[:split_idx].strip()
+        rest = text[split_idx:].strip()
+        cleaned_first = re.sub(r"\s*\([^()]{28,}\)", "", first).strip()
+        return cleaned_first or first, rest
+    cleaned = re.sub(r"\s*\([^()]{28,}\)", "", text).strip()
+    if cleaned != text and len(cleaned) >= 24:
+        return cleaned, text
+    if len(text) > max_short_chars:
+        clause_match = re.match(r"^(.{40,145}?[,;—–])\s+(.+)$", text)
+        if clause_match:
+            return clause_match.group(1).rstrip(",;—– ").strip() + ".", text
+    return text, ""
+
+
+def _read_stop_snippet_markdown(session: Dict[str, Any], stop: Dict[str, Any], max_lines: int = 12) -> str:
+    candidates = [
+        stop.get("headSnapshotPath"),
+        stop.get("localWorkspacePath"),
+        os.path.join(session.get("headSnapshotRoot", ""), stop.get("path", "")) if session.get("headSnapshotRoot") and stop.get("path") else None,
+    ]
+    file_path = next((p for p in candidates if p and os.path.isfile(p)), None)
+    if not file_path:
+        return ""
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.read().splitlines()
+        start_l = max(1, int(stop.get("startLine") or 1))
+        end_l = max(start_l, int(stop.get("endLine") or start_l))
+        slice_end = min(len(all_lines), end_l, start_l + max_lines - 1)
+        snippet_lines = all_lines[start_l - 1 : slice_end]
+        if not snippet_lines:
+            return ""
+        ext = os.path.splitext(file_path)[1].lstrip(".").lower()
+        lang_map = {
+            "py": "python",
+            "js": "javascript",
+            "ts": "typescript",
+            "tsx": "tsx",
+            "jsx": "jsx",
+            "dart": "dart",
+            "kt": "kotlin",
+            "kts": "kotlin",
+            "swift": "swift",
+            "rs": "rust",
+            "go": "go",
+            "sh": "bash",
+            "md": "markdown",
+            "json": "json",
+            "yaml": "yaml",
+            "yml": "yaml",
+        }
+        lang = lang_map.get(ext, ext)
+        out = [f"```{lang}"]
+        for idx, line in enumerate(snippet_lines):
+            out.append(f"{start_l + idx:>4} | {line}")
+        if end_l > slice_end:
+            out.append(f"     | ... ({end_l - slice_end} more lines)")
+        out.append("```")
+        return "\n".join(out)
+    except Exception:
+        return ""
+
+
 def render_cliffs_notes_markdown(session: Dict[str, Any]) -> str:
     pr = session.get("pr") or {}
     cn = session.get("cliffsNotes") or {}
@@ -1287,12 +1367,46 @@ def render_cliffs_notes_markdown(session: Dict[str, Any]) -> str:
 
     if session.get("analysisStatus") == "analyzing":
         lines.append("> [!NOTE]")
-        lines.append("> **Deep Analysis in Progress**: Initial file snapshots and diff tour are ready now. Quasar's specialist review lenses (`review-architect`, `review-bug-hunter`, `review-test-critic`, `review-advocate`) are synthesizing deep CliffsNotes and candidate findings...")
+        lines.append("> **Deep Analysis in Progress**: Initial file snapshots and diff tour are ready now. Quasar's specialist review lenses are synthesizing CliffsNotes and candidate findings...")
         lines.append("")
 
-    lines.append("## ⚡ At-a-Glance Summary")
-    lines.append(cn.get("whatAndWhy") or cn.get("tldr") or "")
+    raw_tldr = (cn.get("tldr") or "").strip()
+    raw_what = (cn.get("whatAndWhy") or "").strip()
+    short_summary, extra_summary = _split_concise_and_detail(raw_tldr or raw_what, 190)
+
+    lines.append("## ⚡ TL;DR")
+    lines.append(short_summary or raw_tldr or raw_what)
     lines.append("")
+
+    has_extra_overview = bool(
+        (raw_what and raw_what != short_summary)
+        or extra_summary
+        or cn.get("keySymbols")
+        or cn.get("designTradeoffs")
+    )
+    if has_extra_overview:
+        lines.append("<details>")
+        lines.append("<summary><strong>More context, key symbols & design trade-offs</strong></summary>")
+        lines.append("")
+        if raw_what and raw_what != short_summary:
+            lines.append(raw_what)
+            lines.append("")
+        elif extra_summary:
+            lines.append(extra_summary)
+            lines.append("")
+        if cn.get("keySymbols"):
+            lines.append("| Symbol / File | Role in This Change |")
+            lines.append("| :--- | :--- |")
+            for sym in cn["keySymbols"]:
+                lines.append(f"| `{sym.get('name', '')}` | {sym.get('role', '')} |")
+            lines.append("")
+        if cn.get("designTradeoffs"):
+            lines.append("**Key Design Decisions & Trade-offs:**")
+            for td in cn["designTradeoffs"]:
+                lines.append(f"- {td}")
+            lines.append("")
+        lines.append("</details>")
+        lines.append("")
 
     if cn.get("architectureDiagram"):
         lines.append("## 🧭 Architecture & Data Flow")
@@ -1302,48 +1416,64 @@ def render_cliffs_notes_markdown(session: Dict[str, Any]) -> str:
         lines.append("```")
         lines.append("")
 
-    if cn.get("keySymbols"):
-        lines.append("## 🗂️ Key Symbols & Files (Character List)")
-        lines.append("| Symbol / File | Role in This Change |")
-        lines.append("| :--- | :--- |")
-        for sym in cn["keySymbols"]:
-            lines.append(f"| `{sym.get('name', '')}` | {sym.get('role', '')} |")
-        lines.append("")
-
-    if cn.get("designTradeoffs"):
-        lines.append("## ⚖️ Key Design Decisions & Trade-offs")
-        for td in cn["designTradeoffs"]:
-            lines.append(f"- {td}")
-        lines.append("")
-
-    lines.append("## 📚 Chapter-by-Chapter Reading Guide")
+    lines.append("## 📚 Guided Tour")
     for ch in session.get("chapters") or []:
         lines.append(f"### {ch.get('title')}")
-        if ch.get("summary"):
-            lines.append(f"*{ch.get('summary')}*")
+        ch_short, ch_extra = _split_concise_and_detail(ch.get("summary") or "", 165)
+        if ch_short:
+            lines.append(f"*{ch_short}*")
             lines.append("")
-        for b in ch.get("cliffsNotesBullets") or []:
-            lines.append(f"- {b}")
-        lines.append("")
+        bullets = ch.get("cliffsNotesBullets") or []
+        if ch_extra or bullets:
+            lines.append("<details>")
+            lines.append(f"<summary>Chapter notes ({len(bullets)} key point{'' if len(bullets) == 1 else 's'})</summary>")
+            lines.append("")
+            if ch_extra:
+                lines.append(ch_extra)
+                lines.append("")
+            for b in bullets:
+                lines.append(f"- {b}")
+            lines.append("")
+            lines.append("</details>")
+            lines.append("")
         for stop in ch.get("stops") or []:
             head_path = stop.get("headSnapshotPath") or stop.get("localWorkspacePath") or stop.get("path")
             start_l = stop.get("startLine", 1)
             end_l = stop.get("endLine", start_l)
+            raw_stop_note = stop.get("cliffsNotes") or stop.get("description") or ""
+            stop_short, stop_extra = _split_concise_and_detail(raw_stop_note, 150)
             lines.append(
-                f"1. **[{stop.get('stopNumber')}] [{stop.get('title')}](file://{head_path}#L{start_l}-L{end_l})** — {stop.get('cliffsNotes') or stop.get('description')}"
+                f"- **[{stop.get('stopNumber')}] [{stop.get('title')}](file://{head_path}#L{start_l}-L{end_l})** — {stop_short}"
             )
-            if stop.get("whyItChanged"):
-                lines.append(f"   - *Why it changed*: {stop['whyItChanged']}")
-            if stop.get("callersAndInvariants"):
-                lines.append(f"   - *Context & Invariants*: {stop['callersAndInvariants']}")
+            snippet_md = _read_stop_snippet_markdown(session, stop)
+            if stop_extra or stop.get("whyItChanged") or stop.get("callersAndInvariants") or snippet_md:
+                lines.append("  <details>")
+                lines.append("  <summary>Context & code snippet</summary>")
+                lines.append("")
+                if stop_extra:
+                    lines.append(f"  - **Details**: {stop_extra}")
+                if stop.get("whyItChanged"):
+                    lines.append(f"  - **Why it changed**: {stop['whyItChanged']}")
+                if stop.get("callersAndInvariants"):
+                    lines.append(f"  - **Callers & invariants**: {stop['callersAndInvariants']}")
+                if snippet_md:
+                    lines.append("")
+                    for s_line in snippet_md.splitlines():
+                        lines.append(f"  {s_line}")
+                lines.append("")
+                lines.append("  </details>")
         lines.append("")
 
     if session.get("coverageMatrix"):
-        lines.append("## 🧪 Test Coverage & Hygiene Matrix")
+        lines.append("<details>")
+        lines.append(f"<summary><strong>🧪 Test Coverage & Hygiene Matrix ({len(session['coverageMatrix'])})</strong></summary>")
+        lines.append("")
         lines.append("| Behavior / Change | Verification Status | Notes |")
         lines.append("| :--- | :--- | :--- |")
         for row in session["coverageMatrix"]:
             lines.append(f"| {row.get('behavior', '')} | {row.get('status', '')} | {row.get('notes', '')} |")
+        lines.append("")
+        lines.append("</details>")
         lines.append("")
 
     uncertain_threads = [
@@ -1352,24 +1482,23 @@ def render_cliffs_notes_markdown(session: Dict[str, Any]) -> str:
         if t.get("status") == "uncertain"
     ]
     if uncertain_threads:
-        lines.append("## 🤔 Uncertain Feedback — Needs Your Preference Calibration")
-        lines.append(
-            "> Quasar found borderline or preference-dependent feedback below. Click **Calibrate Preference** on the inline comment thread (or in the **Review Comments & Cart** sidebar) to tell Quasar whether to flag or skip patterns like this in future reviews."
-        )
-        lines.append("")
+        lines.append("## 🤔 Needs Your Preference")
         for idx, t in enumerate(uncertain_threads, 1):
             head_path = os.path.join(session.get("headSnapshotRoot", ""), t.get("path", ""))
             start_l = t.get("startLine", 1)
             end_l = t.get("endLine", start_l)
-            lines.append(f"### ❓ #{idx} [🤔 Preference Check] {t.get('title', 'Uncertain Finding')}")
-            lines.append(f"- **Location**: [{t.get('path')}:L{start_l}-{end_l}](file://{head_path}#L{start_l}-L{end_l})")
+            lines.append(f"- **❓ #{idx} [{os.path.basename(t.get('path', ''))}:L{start_l}-{end_l}](file://{head_path}#L{start_l}-L{end_l}) — {t.get('title', 'Uncertain Finding')}**")
             if t.get("uncertaintyQuestion"):
-                lines.append(f"- **Preference Question**: **{t['uncertaintyQuestion']}**")
+                lines.append(f"  - *Question*: {t['uncertaintyQuestion']}")
+            lines.append("  <details>")
+            lines.append("  <summary>Context & draft comment</summary>")
+            lines.append("")
             if t.get("whyItMatters"):
-                lines.append(f"- **Trade-off Context**: {t['whyItMatters']}")
-            lines.append("- **Candidate Draft Comment**:")
+                lines.append(f"  - **Trade-off Context**: {t['whyItMatters']}")
             lines.append(f"  > {t.get('draftComment', '')}")
             lines.append("")
+            lines.append("  </details>")
+        lines.append("")
 
     candidate_threads = [
         t
@@ -1377,20 +1506,26 @@ def render_cliffs_notes_markdown(session: Dict[str, Any]) -> str:
         if t.get("kind") in ("ai_candidate", "user_staged") and t.get("status") not in ("uncertain", "dismissed")
     ]
     if candidate_threads:
-        lines.append("## 🎯 Curated Review Comments")
+        lines.append("## 🎯 Review Findings")
         for idx, t in enumerate(candidate_threads, 1):
             head_path = os.path.join(session.get("headSnapshotRoot", ""), t.get("path", ""))
             start_l = t.get("startLine", 1)
             end_l = t.get("endLine", start_l)
             sev = t.get("severity", "DESIGN")
             badge = "🔴 Blocking" if "BLOCK" in sev.upper() else ("🟡 Design" if "DESIGN" in sev.upper() else "🟢 Nit")
-            lines.append(f"### #{idx} [{badge}] {t.get('title', 'Review Finding')}")
-            lines.append(f"- **Location**: [{t.get('path')}:L{start_l}-{end_l}](file://{head_path}#L{start_l}-L{end_l})")
-            if t.get("whyItMatters"):
-                lines.append(f"- **CliffsNotes Context (For You)**: {t['whyItMatters']}")
-            lines.append("- **Draft Review Comment**:")
+            why_short, why_extra = _split_concise_and_detail(t.get("whyItMatters") or "", 140)
+            lines.append(f"- **#{idx} [{badge}] [{os.path.basename(t.get('path', ''))}:L{start_l}-{end_l}](file://{head_path}#L{start_l}-L{end_l}) — {t.get('title', 'Review Finding')}**")
+            if why_short:
+                lines.append(f"  - {why_short}")
+            lines.append("  <details>")
+            lines.append("  <summary>Draft comment & details</summary>")
+            lines.append("")
+            if why_extra:
+                lines.append(f"  - **Context**: {why_extra}")
             lines.append(f"  > {t.get('draftComment', '')}")
             lines.append("")
+            lines.append("  </details>")
+        lines.append("")
 
     existing_gh_threads = [
         t

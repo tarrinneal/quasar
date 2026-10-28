@@ -242,7 +242,7 @@ function getAgentApiBinary() {
 
 /**
  * Discovers `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN` from the running
- * Jetski / Antigravity `language_server` process when called from the VS Code Extension Host
+ * Antigravity `language_server` process when called from the VS Code Extension Host
  * (which does not inherit those environment variables directly).
  */
 function discoverAntigravityLsEnv(targetWorkspaceRoot = null) {
@@ -2122,6 +2122,77 @@ function activate(context) {
     return s;
   }
 
+  function splitConciseAndDetail(rawText, maxShortChars = 155) {
+    const clean = String(rawText || '').replace(/\s+/g, ' ').trim();
+    if (!clean) return { shortText: '', extraText: '' };
+
+    // Split on first sentence boundary (. followed by space + capital/backtick)
+    const sentMatch = clean.match(/^(.+?[.!?])(?:\s+([A-Z`*].*))?$/);
+    let firstSent = sentMatch ? sentMatch[1].trim() : clean;
+    const restSent = sentMatch && sentMatch[2] ? sentMatch[2].trim() : '';
+
+    // Strip overly long parenthetical lists (e.g. "(bool, int, double, String, ...)") from the short headline
+    const simplifiedFirst = firstSent.replace(/\s*\([^()]{32,}\)/g, '');
+    const hadLongParens = simplifiedFirst !== firstSent;
+
+    let shortText = simplifiedFirst;
+    let extraText = hadLongParens ? clean : restSent;
+    if (shortText.length > maxShortChars) {
+      const cut = shortText.lastIndexOf(' ', maxShortChars - 1);
+      shortText = (cut > 60 ? shortText.slice(0, cut) : shortText.slice(0, maxShortChars - 1)) + '…';
+      extraText = clean;
+    }
+    return { shortText, extraText };
+  }
+
+  function readStopCodeSnippet(session, stop, maxLines = 16) {
+    if (!session || !stop) return null;
+    const candidates = [
+      stop.headSnapshotPath,
+      session.headSnapshotRoot && stop.path
+        ? path.join(session.headSnapshotRoot, stop.path)
+        : null,
+      stop.localWorkspacePath,
+      session.repoDir && stop.path ? path.join(session.repoDir, stop.path) : null,
+    ].filter(Boolean);
+
+    let filePath = null;
+    for (const c of candidates) {
+      if (fs.existsSync(c)) {
+        try {
+          if (fs.statSync(c).isFile()) {
+            filePath = c;
+            break;
+          }
+        } catch (_) {}
+      }
+    }
+    if (!filePath) return null;
+
+    try {
+      const content = fs.readFileSync(filePath, 'utf8');
+      const allLines = content.split(/\r?\n/);
+      const startL = Math.max(1, parseInt(stop.startLine || 1, 10));
+      const endL = Math.max(startL, parseInt(stop.endLine || startL, 10));
+      const sliceEnd = Math.min(allLines.length, endL, startL + maxLines - 1);
+      const padWidth = String(sliceEnd).length;
+      const numbered = [];
+      for (let ln = startL; ln <= sliceEnd; ln++) {
+        const lineTxt = allLines[ln - 1] !== undefined ? allLines[ln - 1] : '';
+        numbered.push(`${String(ln).padStart(padWidth, ' ')} │ ${lineTxt}`);
+      }
+      const hiddenCount = Math.max(0, Math.min(allLines.length, endL) - sliceEnd);
+      return {
+        code: numbered.join('\n'),
+        startLine: startL,
+        endLine: Math.min(allLines.length, endL),
+        hiddenCount,
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
   function buildCliffsNotesWebviewHtml(webview, session, sectionAnchor = '') {
     const mermaidScriptUri = webview.asWebviewUri(
       vscode.Uri.file(path.join(context.extensionPath, 'media', 'mermaid-preview.js'))
@@ -2159,7 +2230,6 @@ function activate(context) {
       (t) => t.selectedForFix && t.status !== 'fixed'
     ).length;
 
-    // Pre-compute stop targets for all stops so the flowchart can match nodes to stops client-side
     const stopsLookupPayload = allStops.map((s) => ({
       stopId: s.id,
       stopNumber: s.stopNumber,
@@ -2176,23 +2246,32 @@ function activate(context) {
       } ${s.path || ''}`.toLowerCase(),
     }));
 
+    // Concise plain-English headline + optional deep-dive background drawer
+    const rawTldr = (cn.tldr || '').trim();
+    const rawWhatAndWhy = (cn.whatAndWhy || '').trim();
+    const headlineSource = rawTldr || splitConciseAndDetail(rawWhatAndWhy, 190).shortText;
+    const hasDeepDive = Boolean(
+      (rawWhatAndWhy && rawWhatAndWhy !== headlineSource) ||
+        (cn.designTradeoffs && cn.designTradeoffs.length > 0) ||
+        (cn.keySymbols && cn.keySymbols.length > 0)
+    );
+
     const symbolsRowsHtml = (cn.keySymbols || [])
       .map((sym) => {
         const matched = findBestTourStopForQuery(session, `${sym.name || ''} ${sym.role || ''}`);
         const badgeHtml = matched
           ? `<span class="q-pill q-pill-accent" title="Matches Stop ${escapeHtmlText(
               matched.stopNumber
-            )} (${escapeHtmlText(matched.path)}:L${matched.startLine})">📍 Stop ${escapeHtmlText(
-              matched.stopNumber
-            )}</span>`
+            )}">📍 ${escapeHtmlText(matched.stopNumber)}</span>`
           : '';
         const clickAttr = matched
           ? `data-act="openStop" data-stop-id="${escapeHtmlText(matched.id)}"`
           : `data-act="jumpToQuery" data-query="${escapeHtmlText(sym.name || '')}"`;
+        const { shortText: shortRole } = splitConciseAndDetail(sym.role || '', 130);
         return `
-          <tr class="q-sym-row" ${clickAttr} title="Click to jump to definition / diff">
+          <tr class="q-sym-row" ${clickAttr} title="${escapeHtmlText(sym.role || '')}">
             <td class="q-sym-name"><code>${escapeHtmlText(sym.name || '')}</code> ${badgeHtml}</td>
-            <td class="q-sym-role">${formatInlineMd(sym.role || '')}</td>
+            <td class="q-sym-role">${formatInlineMd(shortRole)}</td>
             <td class="q-sym-action"><button type="button" class="q-btn q-btn-sm" ${clickAttr}>🔍 Diff</button></td>
           </tr>
         `;
@@ -2208,12 +2287,23 @@ function activate(context) {
         const stops = ch.stops || [];
         const chRead = stops.filter((s) => s.read).length;
         const allChRead = stops.length > 0 && chRead === stops.length;
-        const bulletsHtml = (ch.cliffsNotesBullets || [])
-          .map((b) => `<li>${formatInlineMd(b)}</li>`)
-          .join('');
+        const bullets = ch.cliffsNotesBullets || [];
+        const bulletsHtml = bullets.map((b) => `<li>${formatInlineMd(b)}</li>`).join('');
+        const { shortText: shortChSummary } = splitConciseAndDetail(ch.summary || '', 160);
+
         const stopsCardsHtml = stops
           .map((stop) => {
             const isRead = Boolean(stop.read);
+            const rawNote = stop.cliffsNotes || stop.description || '';
+            const { shortText, extraText } = splitConciseAndDetail(rawNote, 145);
+            const snippet = readStopCodeSnippet(session, stop, 14);
+            const hasMoreDetails = Boolean(
+              extraText || stop.whyItChanged || stop.callersAndInvariants || snippet
+            );
+            const fileLabel = `${path.basename(stop.path || '')}:L${stop.startLine || 1}${
+              stop.endLine && stop.endLine !== stop.startLine ? '–' + stop.endLine : ''
+            }`;
+
             return `
               <div class="q-stop-card ${isRead ? 'q-stop-read' : ''}" id="stop-card-${escapeHtmlText(
               stop.id
@@ -2225,47 +2315,75 @@ function activate(context) {
                     }" data-act="toggleStopRead" data-stop-id="${escapeHtmlText(
               stop.id
             )}" title="Click to toggle Read / Unread">
-                      ${isRead ? '✓ Read' : '○ Unread'}
+                      ${isRead ? '✓' : '○'}
                     </button>
                     <span class="q-stop-num">[${escapeHtmlText(stop.stopNumber)}]</span>
                     <a href="#" class="q-stop-link" data-act="openStop" data-stop-id="${escapeHtmlText(
                       stop.id
-                    )}">${escapeHtmlText(stop.title || path.basename(stop.path || ''))}</a>
-                    <span class="q-stop-path">${escapeHtmlText(stop.path || '')}:L${
-              stop.startLine || 1
-            }–${stop.endLine || stop.startLine || 1}</span>
+                    )}" title="${escapeHtmlText(stop.path || '')}">${escapeHtmlText(fileLabel)}</a>
+                    <span class="q-stop-inline-summary">— ${formatInlineMd(shortText)}</span>
                   </div>
                   <div class="q-stop-actions">
                     <button type="button" class="q-btn q-btn-primary q-btn-sm" data-act="openStop" data-stop-id="${escapeHtmlText(
                       stop.id
-                    )}">🔍 Open Diff</button>
-                    <button type="button" class="q-btn q-btn-sm" data-act="toggleStopRead" data-stop-id="${escapeHtmlText(
-                      stop.id
-                    )}">${isRead ? '↺ Mark Unread' : '✓ Mark Read'}</button>
+                    )}">🔍 Diff</button>
                     <button type="button" class="q-btn q-btn-sm" data-act="askAtStop" data-stop-id="${escapeHtmlText(
                       stop.id
-                    )}">💬 Ask Quasar</button>
+                    )}" title="Ask Quasar about this stop">💬 Ask</button>
                   </div>
                 </div>
-                <div class="q-stop-body">
-                  <div class="q-stop-summary">${formatInlineMd(
-                    stop.cliffsNotes || stop.description || ''
-                  )}</div>
-                  ${
-                    stop.whyItChanged
-                      ? `<div class="q-stop-meta"><strong>Why it changed:</strong> ${formatInlineMd(
-                          stop.whyItChanged
-                        )}</div>`
-                      : ''
-                  }
-                  ${
-                    stop.callersAndInvariants
-                      ? `<div class="q-stop-meta"><strong>Context &amp; Invariants:</strong> ${formatInlineMd(
-                          stop.callersAndInvariants
-                        )}</div>`
-                      : ''
-                  }
-                </div>
+                ${
+                  hasMoreDetails
+                    ? `<details class="q-stop-details">
+                        <summary>Context &amp; code snippet (${escapeHtmlText(fileLabel)})</summary>
+                        <div class="q-stop-details-body">
+                          ${
+                            extraText
+                              ? `<div class="q-stop-meta"><strong>Full note:</strong> ${formatInlineMd(
+                                  rawNote
+                                )}</div>`
+                              : ''
+                          }
+                          ${
+                            stop.whyItChanged
+                              ? `<div class="q-stop-meta"><strong>Why it changed:</strong> ${formatInlineMd(
+                                  stop.whyItChanged
+                                )}</div>`
+                              : ''
+                          }
+                          ${
+                            stop.callersAndInvariants
+                              ? `<div class="q-stop-meta"><strong>Callers &amp; invariants:</strong> ${formatInlineMd(
+                                  stop.callersAndInvariants
+                                )}</div>`
+                              : ''
+                          }
+                          ${
+                            snippet
+                              ? `<div class="q-snippet-wrap">
+                                  <div class="q-snippet-bar">
+                                    <span><code>${escapeHtmlText(stop.path || '')}</code> (L${
+                                  snippet.startLine
+                                }–${snippet.endLine})</span>
+                                    <button type="button" class="q-btn q-btn-sm" data-act="openStop" data-stop-id="${escapeHtmlText(
+                                      stop.id
+                                    )}">Open Side-by-Side Diff ↗</button>
+                                  </div>
+                                  <pre class="q-snippet-pre"><code>${escapeHtmlText(
+                                    snippet.code
+                                  )}</code></pre>
+                                  ${
+                                    snippet.hiddenCount > 0
+                                      ? `<div class="q-snippet-more">+ ${snippet.hiddenCount} more line(s) — click "Open Side-by-Side Diff" to view full hunk</div>`
+                                      : ''
+                                  }
+                                </div>`
+                              : ''
+                          }
+                        </div>
+                      </details>`
+                    : ''
+                }
               </div>
             `;
           })
@@ -2277,27 +2395,34 @@ function activate(context) {
               <div>
                 <h3 class="q-chapter-title">${escapeHtmlText(ch.title || '')}</h3>
                 ${
-                  ch.summary
-                    ? `<p class="q-chapter-summary">${formatInlineMd(ch.summary)}</p>`
+                  shortChSummary
+                    ? `<p class="q-chapter-summary">${formatInlineMd(shortChSummary)}</p>`
                     : ''
                 }
               </div>
               <div class="q-chapter-right">
-                <span class="q-pill ${allChRead ? 'q-pill-success' : ''}">${chRead} / ${
+                <span class="q-pill ${allChRead ? 'q-pill-success' : ''}">${chRead}/${
           stops.length
-        } read</span>
+        }</span>
                 ${
                   stops.length > 0
                     ? `<button type="button" class="q-btn q-btn-sm" data-act="markChapterRead" data-chapter-id="${escapeHtmlText(
                         ch.id || ''
                       )}" data-read="${allChRead ? '0' : '1'}">${
-                        allChRead ? '↺ Unread Chapter' : '✓ Mark Chapter Read'
+                        allChRead ? '↺ Unread' : '✓ Mark Read'
                       }</button>`
                     : ''
                 }
               </div>
             </div>
-            ${bulletsHtml ? `<ul class="q-chapter-bullets">${bulletsHtml}</ul>` : ''}
+            ${
+              bulletsHtml
+                ? `<details class="q-stop-details" style="margin-top:6px;">
+                    <summary>Chapter notes (${bullets.length} key points)</summary>
+                    <ul class="q-chapter-bullets">${bulletsHtml}</ul>
+                  </details>`
+                : ''
+            }
             <div class="q-stops-list">${stopsCardsHtml}</div>
           </div>
         `;
@@ -2313,12 +2438,16 @@ function activate(context) {
           t.status === 'fixed'
             ? '✅ Fixed'
             : t.status === 'uncertain'
-            ? '🤔 Calibrate Preference'
+            ? '🤔 Calibrate'
             : isExisting && ghTriage
             ? ghTriage.triageBadge
             : `${t.status === 'staged' ? '📤 Staged • ' : '📝 Draft • '}${sev}`;
         const canStage = t.kind === 'ai_candidate' || t.kind === 'user_staged';
         const isStaged = t.status === 'staged';
+        const cleanTitle = String(t.title || path.basename(t.path || '')).replace(
+          /^(?:🛠️|⚠️|✅|💬|❓|👀|🤔|🔴|🟡|🟢)\s*\[[^\]]+\]\s*/,
+          ''
+        );
         return `
           <div class="q-comment-card ${t.status === 'fixed' ? 'is-fixed' : ''}">
             <div class="q-comment-top">
@@ -2332,7 +2461,7 @@ function activate(context) {
                 }">${escapeHtmlText(badgeText)}</span>
                 <a href="#" class="q-stop-link" data-act="jumpToThread" data-thread-id="${escapeHtmlText(
                   t.id
-                )}">${escapeHtmlText(t.title || path.basename(t.path || ''))}</a>
+                )}">${escapeHtmlText(cleanTitle)}</a>
                 <span class="q-stop-path">${escapeHtmlText(
                   path.basename(t.path || '')
                 )}:L${t.startLine || 1}</span>
@@ -2340,7 +2469,7 @@ function activate(context) {
               <div class="q-stop-actions">
                 <button type="button" class="q-btn q-btn-sm" data-act="jumpToThread" data-thread-id="${escapeHtmlText(
                   t.id
-                )}">🔍 Jump to Line</button>
+                )}">🔍 Jump</button>
                 ${
                   t.status === 'uncertain'
                     ? `<button type="button" class="q-btn q-btn-primary q-btn-sm" data-act="calibrateThread" data-thread-id="${escapeHtmlText(
@@ -2352,7 +2481,7 @@ function activate(context) {
                   canStage && t.status !== 'fixed'
                     ? `<button type="button" class="q-btn q-btn-sm" data-act="toggleStageThread" data-thread-id="${escapeHtmlText(
                         t.id
-                      )}">${isStaged ? '📥 Unstage' : '📤 Stage for GitHub'}</button>`
+                      )}">${isStaged ? 'Unstage' : 'Stage'}</button>`
                     : ''
                 }
                 ${
@@ -2360,25 +2489,34 @@ function activate(context) {
                     ? `<button type="button" class="q-btn q-btn-sm ${
                         t.selectedForFix ? 'q-btn-primary' : ''
                       }" data-act="toggleFixThread" data-thread-id="${escapeHtmlText(t.id)}">${
-                        t.selectedForFix ? '🔧 Queued for Fix ✓' : '🔧 Queue for Fix'
+                        t.selectedForFix ? '🔧 Queued ✓' : '🔧 Fix'
                       }</button>`
                     : ''
                 }
                 <button type="button" class="q-btn q-btn-sm" data-act="dismissThread" data-thread-id="${escapeHtmlText(
                   t.id
-                )}" title="Remove / Dismiss Comment">🗑️</button>
+                )}" title="Remove Comment">🗑️</button>
               </div>
             </div>
             ${
-              t.whyItMatters
-                ? `<div class="q-stop-meta">${formatInlineMd(t.whyItMatters)}</div>`
-                : ''
-            }
-            ${
-              t.draftComment
-                ? `<blockquote class="q-comment-quote">${formatInlineMd(
-                    t.draftComment
-                  )}</blockquote>`
+              t.whyItMatters || t.draftComment
+                ? `<details class="q-stop-details">
+                    <summary>Comment &amp; rationale</summary>
+                    <div class="q-stop-details-body">
+                      ${
+                        t.whyItMatters
+                          ? `<div class="q-stop-meta">${formatInlineMd(t.whyItMatters)}</div>`
+                          : ''
+                      }
+                      ${
+                        t.draftComment
+                          ? `<blockquote class="q-comment-quote">${formatInlineMd(
+                              t.draftComment
+                            )}</blockquote>`
+                          : ''
+                      }
+                    </div>
+                  </details>`
                 : ''
             }
           </div>
@@ -2409,8 +2547,8 @@ function activate(context) {
       --q-bg: var(--vscode-editor-background, #0d1117);
       --q-fg: var(--vscode-editor-foreground, #e6edf3);
       --q-muted: var(--vscode-descriptionForeground, #8b949e);
-      --q-card-bg: var(--vscode-sideBar-background, rgba(128, 128, 128, 0.06));
-      --q-border: var(--vscode-panel-border, rgba(128, 128, 128, 0.24));
+      --q-card-bg: var(--vscode-sideBar-background, rgba(128, 128, 128, 0.05));
+      --q-border: var(--vscode-panel-border, rgba(128, 128, 128, 0.22));
       --q-accent: var(--vscode-textLink-foreground, #58a6ff);
       --q-success: #3fb950;
       --q-warn: #d29922;
@@ -2418,20 +2556,20 @@ function activate(context) {
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      padding: 0 24px 48px 24px;
+      padding: 0 20px 42px 20px;
       background: var(--q-bg);
       color: var(--q-fg);
       font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
-      font-size: 13.5px;
-      line-height: 1.55;
+      font-size: 13px;
+      line-height: 1.5;
     }
     a { color: var(--q-accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
     code {
       font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, Menlo, monospace);
-      font-size: 0.92em;
-      background: rgba(128, 128, 128, 0.16);
-      padding: 1.5px 5px;
+      font-size: 0.91em;
+      background: rgba(128, 128, 128, 0.15);
+      padding: 1px 4.5px;
       border-radius: 4px;
     }
     .q-sticky-top {
@@ -2439,43 +2577,43 @@ function activate(context) {
       top: 0;
       z-index: 20;
       background: var(--q-bg);
-      padding: 14px 0 10px 0;
+      padding: 12px 0 9px 0;
       border-bottom: 1px solid var(--q-border);
-      margin-bottom: 18px;
+      margin-bottom: 14px;
     }
     .q-top-row {
       display: flex;
-      align-items: flex-start;
+      align-items: center;
       justify-content: space-between;
-      gap: 12px;
+      gap: 10px;
       flex-wrap: wrap;
     }
     .q-pr-title {
-      margin: 0 0 4px 0;
-      font-size: 18px;
+      margin: 0 0 2px 0;
+      font-size: 16px;
       font-weight: 700;
     }
     .q-pr-meta {
-      font-size: 12px;
+      font-size: 11.5px;
       color: var(--q-muted);
       display: flex;
       flex-wrap: wrap;
-      gap: 10px;
+      gap: 8px;
       align-items: center;
     }
     .q-toolbar-btns {
       display: flex;
-      gap: 6px;
+      gap: 5px;
       flex-wrap: wrap;
       align-items: center;
     }
     .q-btn {
-      background: rgba(128, 128, 128, 0.14);
+      background: rgba(128, 128, 128, 0.13);
       color: var(--q-fg);
       border: 1px solid var(--q-border);
       border-radius: 6px;
-      padding: 5px 10px;
-      font-size: 12px;
+      padding: 4px 9px;
+      font-size: 11.5px;
       font-weight: 500;
       cursor: pointer;
       display: inline-flex;
@@ -2492,20 +2630,20 @@ function activate(context) {
       color: var(--q-fg);
     }
     .q-btn-sm {
-      padding: 3px 8px;
-      font-size: 11.5px;
+      padding: 2px 7px;
+      font-size: 11px;
     }
     .q-progress-row {
       display: flex;
       align-items: center;
-      gap: 12px;
-      margin-top: 10px;
+      gap: 10px;
+      margin-top: 8px;
       flex-wrap: wrap;
     }
     .q-progress-track {
       flex: 1;
-      min-width: 180px;
-      height: 7px;
+      min-width: 140px;
+      height: 6px;
       background: rgba(128, 128, 128, 0.2);
       border-radius: 999px;
       overflow: hidden;
@@ -2516,23 +2654,23 @@ function activate(context) {
       transition: width 0.25s ease;
     }
     .q-progress-label {
-      font-size: 12px;
+      font-size: 11.5px;
       font-weight: 600;
       color: var(--q-muted);
     }
     .q-nav-pills {
       display: flex;
-      gap: 6px;
+      gap: 5px;
       flex-wrap: wrap;
     }
     .q-pill {
       display: inline-flex;
       align-items: center;
-      padding: 2px 8px;
+      padding: 1.5px 7px;
       border-radius: 999px;
-      font-size: 11px;
+      font-size: 10.8px;
       font-weight: 600;
-      background: rgba(128, 128, 128, 0.16);
+      background: rgba(128, 128, 128, 0.15);
       border: 1px solid var(--q-border);
     }
     .q-pill-accent {
@@ -2551,91 +2689,154 @@ function activate(context) {
       color: var(--q-warn);
     }
     .q-section {
-      margin: 22px 0;
-      padding: 16px 18px;
+      margin: 14px 0;
+      padding: 13px 15px;
       border: 1px solid var(--q-border);
-      border-radius: 10px;
+      border-radius: 9px;
       background: var(--q-card-bg);
     }
     .q-section h2 {
-      margin: 0 0 10px 0;
-      font-size: 15.5px;
+      margin: 0 0 8px 0;
+      font-size: 14.5px;
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 8px;
     }
     .q-tldr-box {
-      padding: 10px 14px;
-      border-left: 3.5px solid var(--q-accent);
+      padding: 9px 12px;
+      border-left: 3px solid var(--q-accent);
       background: rgba(56, 139, 253, 0.08);
-      border-radius: 0 8px 8px 0;
-      margin-bottom: 10px;
+      border-radius: 0 7px 7px 0;
+      font-size: 13.5px;
       font-weight: 500;
+    }
+    details.q-stop-details, details.q-section-drawer {
+      margin-top: 6px;
+    }
+    details.q-stop-details > summary, details.q-section-drawer > summary {
+      cursor: pointer;
+      color: var(--q-muted);
+      font-size: 11.5px;
+      font-weight: 500;
+      user-select: none;
+      list-style: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    details.q-stop-details > summary::-webkit-details-marker,
+    details.q-section-drawer > summary::-webkit-details-marker {
+      display: none;
+    }
+    details.q-stop-details > summary::before,
+    details.q-section-drawer > summary::before {
+      content: '▸';
+      display: inline-block;
+      transition: transform 0.15s ease;
+      color: var(--q-accent);
+    }
+    details.q-stop-details[open] > summary::before,
+    details.q-section-drawer[open] > summary::before {
+      transform: rotate(90deg);
+    }
+    details.q-stop-details > summary:hover,
+    details.q-section-drawer > summary:hover {
+      color: var(--q-fg);
+    }
+    .q-stop-details-body {
+      margin-top: 6px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: rgba(128, 128, 128, 0.06);
+      border: 1px solid rgba(128, 128, 128, 0.15);
+    }
+    .q-snippet-wrap {
+      margin-top: 7px;
+      border: 1px solid var(--q-border);
+      border-radius: 6px;
+      overflow: hidden;
+      background: rgba(0, 0, 0, 0.22);
+    }
+    .q-snippet-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 4px 8px;
+      background: rgba(128, 128, 128, 0.1);
+      border-bottom: 1px solid var(--q-border);
+      font-size: 11px;
+      color: var(--q-muted);
+    }
+    .q-snippet-pre {
+      margin: 0;
+      padding: 8px 10px;
+      overflow-x: auto;
+      font-size: 11.5px;
+      line-height: 1.42;
+    }
+    .q-snippet-pre code {
+      background: transparent;
+      padding: 0;
+    }
+    .q-snippet-more {
+      padding: 4px 10px;
+      font-size: 11px;
+      color: var(--q-muted);
+      border-top: 1px solid rgba(128, 128, 128, 0.15);
     }
     .q-table {
       width: 100%;
       border-collapse: collapse;
-      font-size: 12.8px;
+      font-size: 12px;
+      margin-top: 6px;
     }
     .q-table th, .q-table td {
       text-align: left;
-      padding: 8px 10px;
+      padding: 6px 8px;
       border-bottom: 1px solid var(--q-border);
       vertical-align: top;
     }
-    .q-sym-row {
-      cursor: pointer;
-    }
-    .q-sym-row:hover {
-      background: rgba(88, 166, 255, 0.08);
-    }
+    .q-sym-row { cursor: pointer; }
+    .q-sym-row:hover { background: rgba(88, 166, 255, 0.08); }
     .q-chapter-card {
       border: 1px solid var(--q-border);
-      border-radius: 10px;
-      padding: 14px 16px;
-      margin-bottom: 14px;
-      background: rgba(128, 128, 128, 0.03);
+      border-radius: 8px;
+      padding: 11px 13px;
+      margin-bottom: 10px;
+      background: rgba(128, 128, 128, 0.025);
     }
     .q-chapter-header {
       display: flex;
       justify-content: space-between;
-      align-items: flex-start;
-      gap: 10px;
+      align-items: center;
+      gap: 8px;
       flex-wrap: wrap;
     }
-    .q-chapter-title {
-      margin: 0;
-      font-size: 14.5px;
-    }
+    .q-chapter-title { margin: 0; font-size: 13.8px; }
     .q-chapter-summary {
-      margin: 4px 0 0 0;
+      margin: 2px 0 0 0;
       color: var(--q-muted);
-      font-size: 12.5px;
+      font-size: 12px;
     }
-    .q-chapter-right {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-    }
+    .q-chapter-right { display: flex; gap: 6px; align-items: center; }
     .q-chapter-bullets {
-      margin: 8px 0 12px 0;
-      padding-left: 20px;
-      font-size: 12.8px;
+      margin: 6px 0 8px 0;
+      padding-left: 18px;
+      font-size: 12px;
+      color: var(--q-muted);
     }
     .q-stop-card {
       border: 1px solid var(--q-border);
-      border-radius: 8px;
-      padding: 11px 13px;
-      margin-top: 9px;
+      border-radius: 7px;
+      padding: 8px 11px;
+      margin-top: 7px;
       background: var(--q-bg);
-      transition: border-color 0.15s ease;
     }
-    .q-stop-card:hover {
-      border-color: var(--q-accent);
-    }
+    .q-stop-card:hover { border-color: var(--q-accent); }
     .q-stop-card.q-stop-read {
-      border-left: 3.5px solid var(--q-success);
-      opacity: 0.92;
+      border-left: 3px solid var(--q-success);
+      opacity: 0.88;
     }
     .q-stop-header {
       display: flex;
@@ -2643,22 +2844,23 @@ function activate(context) {
       align-items: center;
       gap: 8px;
       flex-wrap: wrap;
-      margin-bottom: 6px;
     }
     .q-stop-title-wrap {
       display: flex;
-      align-items: center;
-      gap: 7px;
+      align-items: baseline;
+      gap: 6px;
       flex-wrap: wrap;
+      flex: 1;
+      min-width: 220px;
     }
     .q-read-pill {
       border: 1px solid var(--q-border);
       background: rgba(128, 128, 128, 0.12);
       color: var(--q-muted);
       border-radius: 999px;
-      padding: 1.5px 8px;
-      font-size: 11px;
-      font-weight: 600;
+      padding: 1px 6px;
+      font-size: 10.5px;
+      font-weight: 700;
       cursor: pointer;
     }
     .q-read-pill.is-read {
@@ -2666,36 +2868,28 @@ function activate(context) {
       border-color: rgba(63, 185, 80, 0.5);
       color: var(--q-success);
     }
-    .q-stop-num {
-      font-weight: 700;
-      color: var(--q-accent);
-    }
-    .q-stop-link {
-      font-weight: 600;
+    .q-stop-num { font-weight: 700; color: var(--q-accent); font-size: 12px; }
+    .q-stop-link { font-weight: 600; font-size: 12.5px; }
+    .q-stop-inline-summary {
+      color: var(--q-fg);
+      font-size: 12.5px;
     }
     .q-stop-path {
-      font-size: 11.5px;
+      font-size: 11px;
       color: var(--q-muted);
       font-family: var(--vscode-editor-font-family, monospace);
     }
-    .q-stop-actions {
-      display: flex;
-      gap: 5px;
-      flex-wrap: wrap;
-    }
-    .q-stop-summary {
-      margin-bottom: 4px;
-    }
+    .q-stop-actions { display: flex; gap: 4px; flex-wrap: wrap; }
     .q-stop-meta {
-      font-size: 12.2px;
+      font-size: 12px;
       color: var(--q-muted);
-      margin-top: 3px;
+      margin-top: 4px;
     }
     .q-comment-card {
       border: 1px solid var(--q-border);
-      border-radius: 8px;
-      padding: 10px 13px;
-      margin-bottom: 9px;
+      border-radius: 7px;
+      padding: 8px 11px;
+      margin-bottom: 7px;
       background: var(--q-bg);
     }
     .q-comment-top {
@@ -2704,20 +2898,20 @@ function activate(context) {
       align-items: center;
       gap: 8px;
       flex-wrap: wrap;
-      margin-bottom: 5px;
     }
     .q-comment-title-group {
       display: flex;
       align-items: center;
-      gap: 7px;
+      gap: 6px;
       flex-wrap: wrap;
+      flex: 1;
     }
     .q-comment-quote {
-      margin: 6px 0 0 0;
-      padding: 6px 10px;
-      border-left: 3px solid var(--q-border);
+      margin: 5px 0 0 0;
+      padding: 5px 9px;
+      border-left: 2.5px solid var(--q-border);
       background: rgba(128, 128, 128, 0.06);
-      font-size: 12.3px;
+      font-size: 12px;
     }
   </style>
 </head>
@@ -2727,21 +2921,19 @@ function activate(context) {
       <div>
         <h1 class="q-pr-title">${escapeHtmlText(headerTitle)}</h1>
         <div class="q-pr-meta">
-          <span><strong>Branch:</strong> <code>${escapeHtmlText(
-            pr.headRefName || 'HEAD'
-          )}</code> → <code>${escapeHtmlText(pr.baseRefName || 'main')}</code></span>
+          <span><code>${escapeHtmlText(pr.headRefName || 'HEAD')}</code> → <code>${escapeHtmlText(
+      pr.baseRefName || 'main'
+    )}</code></span>
           <span>•</span>
-          <span><strong>Author:</strong> <code>@${escapeHtmlText(
-            pr.author || 'local'
-          )}</code></span>
+          <span><code>@${escapeHtmlText(pr.author || 'local')}</code></span>
           <span>•</span>
-          <span><strong>Diff:</strong> <code>+${pr.additions || 0} / -${
-      pr.deletions || 0
-    }</code> (${pr.changedFilesCount || 0} files)</span>
+          <span><code>+${pr.additions || 0} / -${pr.deletions || 0}</code> (${
+      pr.changedFilesCount || 0
+    } files)</span>
         </div>
       </div>
       <div class="q-toolbar-btns">
-        <button type="button" class="q-btn q-btn-primary" data-act="nextTourStop">▶️ Next Tour Stop</button>
+        <button type="button" class="q-btn q-btn-primary" data-act="nextTourStop">▶️ Next Stop</button>
         ${
           pr.isOwnedByUser && pr.needsBranchSwitch && pr.headRefName
             ? `<button type="button" class="q-btn q-btn-primary" data-act="runCommand" data-cmd="quasar.checkoutPrBranch">🔀 Switch to '${escapeHtmlText(
@@ -2751,41 +2943,69 @@ function activate(context) {
         }
         ${
           queuedFixCount > 0
-            ? `<button type="button" class="q-btn q-btn-primary" data-act="runCommand" data-cmd="quasar.fixSelectedComments">🔧 Fix Checked (${queuedFixCount})</button>`
+            ? `<button type="button" class="q-btn q-btn-primary" data-act="runCommand" data-cmd="quasar.fixSelectedComments">🔧 Fix (${queuedFixCount})</button>`
             : ''
         }
-        <button type="button" class="q-btn" data-act="runCommand" data-cmd="quasar.exportPendingReview">🚀 Publish Review (${stagedCount})</button>
-        <button type="button" class="q-btn" data-act="openRawMarkdown" title="Open raw cliffs_notes.md">📄 Raw MD</button>
-        <button type="button" class="q-btn" data-act="runCommand" data-cmd="quasar.closeReview" title="Close Review &amp; Clear IDE Annotations">🧹 Close Review</button>
+        <button type="button" class="q-btn" data-act="runCommand" data-cmd="quasar.exportPendingReview">🚀 Publish (${stagedCount})</button>
+        <button type="button" class="q-btn" data-act="runCommand" data-cmd="quasar.closeReview" title="Close Review">🧹 Close</button>
       </div>
     </div>
     <div class="q-progress-row">
-      <span class="q-progress-label">Tour Progress: ${readStopsCount} / ${totalStopsCount} stops read (${progressPct}%)</span>
+      <span class="q-progress-label">${readStopsCount}/${totalStopsCount} read (${progressPct}%)</span>
       <div class="q-progress-track">
         <div class="q-progress-fill" style="width: ${progressPct}%;"></div>
       </div>
       <div class="q-nav-pills">
+        <button type="button" class="q-btn q-btn-sm" id="q-toggle-all-details">▾ Expand All Details</button>
         ${
           totalStopsCount > 0
             ? `<button type="button" class="q-btn q-btn-sm" data-act="markAllRead" data-read="${
                 readStopsCount === totalStopsCount ? '0' : '1'
               }">${
-                readStopsCount === totalStopsCount ? '↺ Reset Read Progress' : '✓ Mark All Read'
+                readStopsCount === totalStopsCount ? '↺ Reset Read' : '✓ Mark All Read'
               }</button>`
             : ''
         }
-        <a href="#architecture-section" class="q-pill">🧭 Flowchart</a>
-        <a href="#symbols-section" class="q-pill">🗂️ Symbols (${(cn.keySymbols || []).length})</a>
-        <a href="#chapters-section" class="q-pill">📚 Chapters (${chapters.length})</a>
+        <a href="#chapters-section" class="q-pill">📚 Tour (${totalStopsCount})</a>
         <a href="#comments-section" class="q-pill">💬 Comments (${activeThreads.length})</a>
       </div>
     </div>
   </div>
 
   <div class="q-section" id="summary-section">
-    <h2>⚡ At-a-Glance Summary</h2>
-    ${cn.tldr ? `<div class="q-tldr-box">${formatInlineMd(cn.tldr)}</div>` : ''}
-    <div>${formatInlineMd(cn.whatAndWhy || '')}</div>
+    <h2>⚡ In Plain English</h2>
+    <div class="q-tldr-box">${formatInlineMd(headlineSource)}</div>
+    ${
+      hasDeepDive
+        ? `<details class="q-section-drawer" id="symbols-section">
+            <summary>More context, Key Symbols (${(cn.keySymbols || []).length}) &amp; Trade-offs (${
+            (cn.designTradeoffs || []).length
+          })</summary>
+            <div class="q-stop-details-body">
+              ${
+                rawWhatAndWhy && rawWhatAndWhy !== headlineSource
+                  ? `<div style="margin-bottom:10px;">${formatInlineMd(rawWhatAndWhy)}</div>`
+                  : ''
+              }
+              ${
+                tradeoffsHtml
+                  ? `<div style="margin-top:8px;"><strong>⚖️ Key Trade-offs:</strong><ul class="q-chapter-bullets">${tradeoffsHtml}</ul></div>`
+                  : ''
+              }
+              ${
+                symbolsRowsHtml
+                  ? `<div style="margin-top:8px;">
+                      <strong>🗂️ Key Symbols (click to jump to diff):</strong>
+                      <table class="q-table">
+                        <tbody>${symbolsRowsHtml}</tbody>
+                      </table>
+                    </div>`
+                  : ''
+              }
+            </div>
+          </details>`
+        : ''
+    }
   </div>
 
   ${
@@ -2797,35 +3017,17 @@ function activate(context) {
       : ''
   }
 
-  ${
-    symbolsRowsHtml
-      ? `<div class="q-section" id="symbols-section">
-          <h2><span>🗂️ Key Symbols &amp; Files (Character List)</span><span style="font-size:11.5px;font-weight:400;color:var(--q-muted);">Click any symbol to open its Tour Stop in the Diff Editor</span></h2>
-          <table class="q-table">
-            <thead><tr><th>Symbol / File</th><th>Role in This Change</th><th></th></tr></thead>
-            <tbody>${symbolsRowsHtml}</tbody>
-          </table>
-        </div>`
-      : ''
-  }
-
-  ${
-    tradeoffsHtml
-      ? `<div class="q-section" id="tradeoffs-section">
-          <h2>⚖️ Key Design Decisions &amp; Trade-offs</h2>
-          <ul class="q-chapter-bullets">${tradeoffsHtml}</ul>
-        </div>`
-      : ''
-  }
-
   <div class="q-section" id="chapters-section">
-    <h2>📚 Interactive Chapter-by-Chapter Reading Guide</h2>
+    <h2>
+      <span>📚 Guided Reading Tour</span>
+      <span style="font-size:11.5px;font-weight:400;color:var(--q-muted);">Click ▸ on any stop for context &amp; code snippet, or click 🔍 Diff</span>
+    </h2>
     ${chaptersHtml || '<p>No tour chapters available yet.</p>'}
   </div>
 
   <div class="q-section" id="comments-section">
     <h2>
-      <span>💬 Review Comments &amp; Triage (${activeThreads.length})</span>
+      <span>💬 Review Comments (${activeThreads.length})</span>
       <span>
         ${
           uncertainCount > 0
@@ -2840,11 +3042,17 @@ function activate(context) {
   ${
     coverageRowsHtml
       ? `<div class="q-section" id="coverage-section">
-          <h2>🧪 Test Coverage &amp; Hygiene Matrix</h2>
-          <table class="q-table">
-            <thead><tr><th>Behavior / Change</th><th>Verification Status</th><th>Notes</th></tr></thead>
-            <tbody>${coverageRowsHtml}</tbody>
-          </table>
+          <details class="q-section-drawer">
+            <summary><strong>🧪 Test Coverage &amp; Hygiene Matrix (${
+              (session.coverageMatrix || []).length
+            } checks)</strong></summary>
+            <div class="q-stop-details-body">
+              <table class="q-table">
+                <thead><tr><th>Behavior / Change</th><th>Status</th><th>Notes</th></tr></thead>
+                <tbody>${coverageRowsHtml}</tbody>
+              </table>
+            </div>
+          </details>
         </div>`
       : ''
   }
@@ -2903,6 +3111,18 @@ function activate(context) {
         });
       }
 
+      let allExpanded = false;
+      const toggleAllBtn = document.getElementById('q-toggle-all-details');
+      if (toggleAllBtn) {
+        toggleAllBtn.addEventListener('click', () => {
+          allExpanded = !allExpanded;
+          document.querySelectorAll('details.q-stop-details, details.q-section-drawer').forEach((d) => {
+            d.open = allExpanded;
+          });
+          toggleAllBtn.textContent = allExpanded ? '▸ Collapse All Details' : '▾ Expand All Details';
+        });
+      }
+
       document.addEventListener('click', (ev) => {
         const el = ev.target.closest('[data-act]');
         if (!el) return;
@@ -2950,6 +3170,7 @@ function activate(context) {
       if (initialAnchor) {
         const target = document.getElementById(initialAnchor);
         if (target) {
+          if (target.tagName === 'DETAILS') target.open = true;
           setTimeout(() => target.scrollIntoView({ behavior: 'smooth', block: 'start' }), 80);
         }
       }
@@ -2983,8 +3204,13 @@ function activate(context) {
       return;
     }
 
+    const targetColumn =
+      (vscode.window.activeTextEditor && vscode.window.activeTextEditor.viewColumn) ||
+      vscode.ViewColumn.Active ||
+      vscode.ViewColumn.One;
+
     if (cliffsNotesWebviewPanel) {
-      cliffsNotesWebviewPanel.reveal(vscode.ViewColumn.Beside, false);
+      cliffsNotesWebviewPanel.reveal(cliffsNotesWebviewPanel.viewColumn || targetColumn, false);
       updateCliffsNotesWebviewContent(sectionAnchor);
       return;
     }
@@ -2997,7 +3223,7 @@ function activate(context) {
     cliffsNotesWebviewPanel = vscode.window.createWebviewPanel(
       'quasarCliffsNotesGuide',
       panelTitle,
-      { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false },
+      { viewColumn: targetColumn, preserveFocus: false },
       {
         enableScripts: true,
         retainContextWhenHidden: true,
@@ -3109,7 +3335,7 @@ function activate(context) {
         const rawMd = getWindowCliffsNotesMdPath();
         if (fs.existsSync(rawMd)) {
           await vscode.window.showTextDocument(vscode.Uri.file(rawMd), {
-            viewColumn: vscode.ViewColumn.Beside,
+            viewColumn: vscode.ViewColumn.Active,
           });
         }
       } else if (msg.type === 'runCommand' && msg.command) {
@@ -4671,9 +4897,9 @@ function activate(context) {
       if (!fs.existsSync(PREFERENCES_MD_PATH)) return;
       const uri = vscode.Uri.file(PREFERENCES_MD_PATH);
       try {
-        await vscode.commands.executeCommand('markdown.showPreviewToSide', uri);
+        await vscode.commands.executeCommand('markdown.showPreview', uri);
       } catch (_) {
-        await vscode.window.showTextDocument(uri, { viewColumn: vscode.ViewColumn.Beside });
+        await vscode.window.showTextDocument(uri, { viewColumn: vscode.ViewColumn.Active });
       }
     })
   );
@@ -4714,7 +4940,7 @@ function activate(context) {
           const p = sk.snapshotPath && fs.existsSync(sk.snapshotPath) ? sk.snapshotPath : sk.sourcePath;
           if (p && fs.existsSync(p)) {
             await vscode.window.showTextDocument(vscode.Uri.file(p), {
-              viewColumn: vscode.ViewColumn.Beside,
+              viewColumn: vscode.ViewColumn.Active,
             });
           }
         } else if (skAction.action === 'reimport' && sk.sourcePath) {
