@@ -2,7 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EXT_NAME="codeium.codeium-dev-1.0.0"
+VERSION="0.1.0"
+EXT_NAME="codeium.codeium-dev-${VERSION}"
+OLD_CODEIUM_EXT_NAME="codeium.codeium-dev-1.0.0"
 OLD_EXT_NAME="antigravity.antigravity-code-review-1.0.0"
 OLD_QUASAR_EXT_NAME="quasar.quasar-1.0.0"
 PLUGIN_DEST="${HOME}/.gemini/config/plugins/quasar"
@@ -16,7 +18,7 @@ fi
 
 run_doctor() {
   echo "=================================================================="
-  echo "🔍 Quasar Installation & Prerequisite Doctor"
+  echo "🔍 Quasar v${VERSION} — Installation & Prerequisite Doctor"
   echo "=================================================================="
   local ok=1
 
@@ -49,7 +51,7 @@ run_doctor() {
   fi
 
   if [ -f "${PLUGIN_DEST}/plugin.json" ] && [ -f "${PLUGIN_DEST}/skills/quasar/SKILL.md" ]; then
-    echo "  ✅ Quasar Agent Plugin: Installed at ${PLUGIN_DEST}"
+    echo "  ✅ Quasar Agent Plugin (v${VERSION}): Installed at ${PLUGIN_DEST}"
   else
     echo "  ❌ Quasar Agent Plugin: Missing at ${PLUGIN_DEST}"
     ok=0
@@ -58,7 +60,7 @@ run_doctor() {
   local ext_found=0
   for EXT_ROOT in "${HOME}"/.*/extensions; do
     if [ -f "${EXT_ROOT}/${EXT_NAME}/extension.js" ]; then
-      echo "  ✅ Quasar Native Extension: Installed at ${EXT_ROOT}/${EXT_NAME}"
+      echo "  ✅ Quasar Native Extension (v${VERSION}): Installed at ${EXT_ROOT}/${EXT_NAME}"
       ext_found=1
     fi
   done
@@ -69,7 +71,7 @@ run_doctor() {
 
   echo "=================================================================="
   if [ "${ok}" -eq 1 ]; then
-    echo "🎉 Quasar is installed and ready!"
+    echo "🎉 Quasar v${VERSION} is installed and ready!"
     echo "👉 Next step in Antigravity / VS Code:"
     echo "   1. Press Cmd+Shift+P (macOS) or Ctrl+Shift+P (Windows/Linux)"
     echo "   2. Run: Developer: Reload Window"
@@ -86,7 +88,7 @@ if [ "${CHECK_ONLY}" -eq 1 ]; then
   exit $?
 fi
 
-echo "==> Installing Quasar plugin to ${PLUGIN_DEST}..."
+echo "==> Installing Quasar v${VERSION} plugin to ${PLUGIN_DEST}..."
 rm -rf "${OLD_PLUGIN_DEST}" 2>/dev/null || true
 mkdir -p "${PLUGIN_DEST}/skills/quasar/scripts"
 mkdir -p "${PLUGIN_DEST}/agents"
@@ -149,13 +151,13 @@ fi
 python3 "${PLUGIN_DEST}/skills/quasar/scripts/manage_preferences.py" --show >/dev/null 2>&1 || true
 
 # Package VSIX for official CLI installation
-VSIX_PATH="/tmp/quasar-1.0.0.vsix"
-python3 - "${SCRIPT_DIR}/extension" "${VSIX_PATH}" <<'PY'
+VSIX_PATH="/tmp/quasar-${VERSION}.vsix"
+python3 - "${SCRIPT_DIR}/extension" "${VSIX_PATH}" "${VERSION}" <<'PY'
 import os
 import sys
 import zipfile
 
-ext_dir, vsix_path = sys.argv[1], sys.argv[2]
+ext_dir, vsix_path, version = sys.argv[1], sys.argv[2], sys.argv[3]
 content_types = """<?xml version="1.0" encoding="utf-8"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension=".json" ContentType="application/json"/>
@@ -164,10 +166,10 @@ content_types = """<?xml version="1.0" encoding="utf-8"?>
   <Default Extension=".vsixmanifest" ContentType="text/xml"/>
 </Types>"""
 
-vsixmanifest = """<?xml version="1.0" encoding="utf-8"?>
+vsixmanifest = f"""<?xml version="1.0" encoding="utf-8"?>
 <PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011" xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">
   <Metadata>
-    <Identity Language="en-US" Id="codeium-dev" Version="1.0.0" Publisher="codeium"/>
+    <Identity Language="en-US" Id="codeium-dev" Version="{version}" Publisher="codeium"/>
     <DisplayName>Quasar</DisplayName>
     <Description xml:space="preserve">Comprehension-first, native GitHub PR &amp; local branch review tool.</Description>
     <Categories>Other,SCM Providers</Categories>
@@ -212,7 +214,7 @@ fi
 # Also sync directly into extension directories & ensure extensions.json has the entry registered
 for EXT_ROOT in "${HOME}"/.*/extensions; do
   if [ -d "${EXT_ROOT}" ] && [ -f "${EXT_ROOT}/extensions.json" ]; then
-    rm -rf "${EXT_ROOT}/${OLD_EXT_NAME}" "${EXT_ROOT}/${OLD_QUASAR_EXT_NAME}" 2>/dev/null || true
+    rm -rf "${EXT_ROOT}/${OLD_EXT_NAME}" "${EXT_ROOT}/${OLD_QUASAR_EXT_NAME}" "${EXT_ROOT}/${OLD_CODEIUM_EXT_NAME}" 2>/dev/null || true
     TARGET_EXT_DIR="${EXT_ROOT}/${EXT_NAME}"
     echo "==> Syncing native Quasar extension files to ${TARGET_EXT_DIR}..."
     mkdir -p "${TARGET_EXT_DIR}/media"
@@ -220,13 +222,13 @@ for EXT_ROOT in "${HOME}"/.*/extensions; do
     cp "${SCRIPT_DIR}/extension/extension.js" "${TARGET_EXT_DIR}/extension.js"
     cp "${SCRIPT_DIR}/extension/media/"* "${TARGET_EXT_DIR}/media/"
 
-    python3 - "${EXT_ROOT}/extensions.json" "${TARGET_EXT_DIR}" "${EXT_NAME}" <<'PY'
+    python3 - "${EXT_ROOT}/extensions.json" "${TARGET_EXT_DIR}" "${EXT_NAME}" "${VERSION}" <<'PY'
 import json
 import os
 import sys
 import time
 
-p, target_dir, ext_name = sys.argv[1], sys.argv[2], sys.argv[3]
+p, target_dir, ext_name, version = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 try:
     with open(p, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -247,7 +249,7 @@ data = [
 data.append(
     {
         "identifier": {"id": "codeium.codeium-dev"},
-        "version": "1.0.0",
+        "version": version,
         "location": {
             "$mid": 1,
             "fsPath": target_dir,

@@ -1,9 +1,14 @@
 {
   "name": "codeium-dev",
   "displayName": "Quasar",
-  "description": "Comprehension-first, zero-webview native GitHub PR & local branch review tool. Features CliffsNotes study guides, logical reading tours, native side-by-side diffs, inline Ask-Quasar comment threads, and 1-click GitHub Pending Review export.",
-  "version": "1.0.0",
+  "description": "Comprehension-first GitHub PR & local branch review tool. Features interactive CliffsNotes study guides with expandable code snippets, clickable SVG flowcharts, logical reading tours, native side-by-side diffs, inline Ask-Quasar comment threads, and 1-click GitHub Review publishing.",
+  "version": "0.1.0",
   "publisher": "codeium",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tarrinneal/quasar.git"
+  },
   "engines": {
     "vscode": "^1.80.0"
   },

@@ -1,3 +1,5 @@
 {
-  "name": "quasar"
+  "name": "quasar",
+  "version": "0.1.0",
+  "description": "Quasar comprehension-first GitHub PR and local branch code review plugin."
 }
