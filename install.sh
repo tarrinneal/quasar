@@ -275,5 +275,94 @@ done
 # Clear cached extension scanner lists so Reload Window picks up Quasar immediately
 rm -f "${HOME}/Library/Application Support/"*/CachedProfilesData/*/extensions.user.cache 2>/dev/null || true
 
+if [ "${1:-}" = "--release" ]; then
+  echo ""
+  echo "==> Publishing GitHub Release v${VERSION} via GitHub API (using ${STATE_DIR}/github_auth.json)..."
+  python3 - "${STATE_DIR}/github_auth.json" "${SCRIPT_DIR}/CHANGELOG.md" "${VSIX_PATH}" "${VERSION}" <<'PY'
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+auth_path, changelog_path, vsix_path, version = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
+if not token and os.path.isfile(auth_path):
+    with open(auth_path, "r", encoding="utf-8") as f:
+        token = (json.load(f).get("token") or "").strip()
+
+if not token:
+    print("❌ No GitHub API token found in ~/.gemini/quasar/github_auth.json or GITHUB_TOKEN.", file=sys.stderr)
+    sys.exit(1)
+
+notes = f"Quasar v{version}"
+if os.path.isfile(changelog_path):
+    with open(changelog_path, "r", encoding="utf-8") as f:
+        notes = f.read().strip()
+
+tag_name = f"v{version}"
+repo = "tarrinneal/quasar"
+headers = {
+    "Authorization": f"Bearer {token}",
+    "Accept": "application/vnd.github+json",
+    "User-Agent": "Quasar-Release-Script",
+    "X-GitHub-Api-Version": "2022-11-28",
+}
+
+def api_req(url, method="GET", payload=None, content_type="application/json"):
+    req_headers = dict(headers)
+    data = None
+    if payload is not None:
+        if isinstance(payload, (bytes, bytearray)):
+            data = payload
+        else:
+            data = json.dumps(payload).encode("utf-8")
+        req_headers["Content-Type"] = content_type
+    req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+try:
+    rel = api_req(
+        f"https://api.github.com/repos/{repo}/releases",
+        method="POST",
+        payload={
+            "tag_name": tag_name,
+            "target_commitish": "main",
+            "name": f"Quasar v{version}",
+            "body": notes,
+            "draft": False,
+            "prerelease": False,
+        },
+    )
+except urllib.error.HTTPError as e:
+    if e.code == 422:
+        rel = api_req(f"https://api.github.com/repos/{repo}/releases/tags/{tag_name}")
+        rel = api_req(
+            f"https://api.github.com/repos/{repo}/releases/{rel['id']}",
+            method="PATCH",
+            payload={"name": f"Quasar v{version}", "body": notes},
+        )
+    else:
+        raise
+
+if os.path.isfile(vsix_path):
+    asset_name = f"quasar-{version}.vsix"
+    for existing in rel.get("assets") or []:
+        if existing.get("name") == asset_name:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{repo}/releases/assets/{existing['id']}",
+                headers=headers,
+                method="DELETE",
+            )
+            urllib.request.urlopen(req, timeout=20).read()
+    upload_url = rel["upload_url"].split("{")[0] + f"?name={asset_name}"
+    with open(vsix_path, "rb") as vf:
+        api_req(upload_url, method="POST", payload=vf.read(), content_type="application/octet-stream")
+
+print(f"  ✅ Published GitHub Release: {rel.get('html_url')}")
+PY
+fi
+
 echo ""
 run_doctor
