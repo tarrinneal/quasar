@@ -1,9 +1,9 @@
 {
-  "name": "antigravity-code-review",
-  "displayName": "Antigravity Code Review",
-  "description": "Comprehension-first, zero-webview native GitHub PR review tool for Antigravity. Features CliffsNotes study guides, logical reading tours, native side-by-side diffs, inline Ask-Antigravity comment threads, and 1-click GitHub Pending Review export.",
+  "name": "codeium-dev",
+  "displayName": "Quasar",
+  "description": "Comprehension-first, zero-webview native GitHub PR & local branch review tool. Features CliffsNotes study guides, logical reading tours, native side-by-side diffs, inline Ask-Quasar comment threads, and 1-click GitHub Pending Review export.",
   "version": "1.0.0",
-  "publisher": "antigravity",
+  "publisher": "codeium",
   "engines": {
     "vscode": "^1.80.0"
   },
@@ -12,232 +12,488 @@
     "SCM Providers"
   ],
   "activationEvents": [
+    "*",
     "onStartupFinished",
-    "onView:antigravityReview.cliffsNotesTree",
-    "onView:antigravityReview.commentsTree",
-    "onView:antigravityReview.checksTree"
+    "onView:quasar.cliffsNotesTree",
+    "onView:quasar.commentsTree",
+    "onView:quasar.checksTree"
   ],
   "main": "./extension.js",
   "contributes": {
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "antigravity-code-review",
-          "title": "Antigravity Code Review",
+          "id": "quasar",
+          "title": "Quasar",
           "icon": "media/review-icon.svg"
         }
       ]
     },
     "views": {
-      "antigravity-code-review": [
+      "quasar": [
         {
-          "id": "antigravityReview.cliffsNotesTree",
+          "id": "quasar.cliffsNotesTree",
           "name": "CliffsNotes & Reading Tour",
           "icon": "media/review-icon.svg",
           "contextualTitle": "CliffsNotes & Tour"
         },
         {
-          "id": "antigravityReview.commentsTree",
+          "id": "quasar.commentsTree",
           "name": "Review Comments & Cart",
           "contextualTitle": "Review Comments"
         },
         {
-          "id": "antigravityReview.checksTree",
-          "name": "Coverage & Repo Checks",
-          "contextualTitle": "Checks & Coverage"
+          "id": "quasar.checksTree",
+          "name": "Checks & Learned Preferences",
+          "contextualTitle": "Checks & Preferences"
         }
       ]
     },
     "commands": [
       {
-        "command": "antigravityReview.loadPrFromUrl",
-        "title": "Review PR from GitHub URL...",
-        "category": "Antigravity Review",
+        "command": "quasar.openMenu",
+        "title": "Open Quasar Sidebar & Menu...",
+        "category": "Quasar",
         "icon": "$(git-pull-request)"
       },
       {
-        "command": "antigravityReview.openCliffsNotesGuide",
+        "command": "quasar.loadPrFromUrl",
+        "title": "Review PR from GitHub URL...",
+        "category": "Quasar",
+        "icon": "$(git-pull-request)"
+      },
+      {
+        "command": "quasar.reviewLocalBranch",
+        "title": "Review Local Branch or Diff...",
+        "category": "Quasar",
+        "icon": "$(git-branch)"
+      },
+      {
+        "command": "quasar.openCliffsNotesGuide",
         "title": "Open Full CliffsNotes Study Guide",
-        "category": "Antigravity Review",
+        "category": "Quasar",
         "icon": "$(book)"
       },
       {
-        "command": "antigravityReview.nextTourStop",
+        "command": "quasar.nextTourStop",
         "title": "Next CliffsNotes Tour Stop",
-        "category": "Antigravity Review",
+        "category": "Quasar",
         "icon": "$(arrow-down)"
       },
       {
-        "command": "antigravityReview.prevTourStop",
+        "command": "quasar.prevTourStop",
         "title": "Previous CliffsNotes Tour Stop",
-        "category": "Antigravity Review",
+        "category": "Quasar",
         "icon": "$(arrow-up)"
       },
       {
-        "command": "antigravityReview.openTourStop",
+        "command": "quasar.openTourStop",
         "title": "Open Tour Stop in Diff Editor",
-        "category": "Antigravity Review",
+        "category": "Quasar",
         "icon": "$(diff)"
       },
       {
-        "command": "antigravityReview.jumpToThread",
+        "command": "quasar.jumpToThread",
         "title": "Jump to Comment Thread in Diff",
-        "category": "Antigravity Review",
+        "category": "Quasar",
         "icon": "$(comment)"
       },
       {
-        "command": "antigravityReview.askInComment",
-        "title": "Ask Antigravity About This Code",
-        "category": "Antigravity Review",
+        "command": "quasar.askInComment",
+        "title": "Ask Quasar About This Code",
+        "category": "Quasar",
         "icon": "$(sparkle)"
       },
       {
-        "command": "antigravityReview.askAtLine",
-        "title": "Ask Antigravity in Comment Thread...",
-        "category": "Antigravity Review",
+        "command": "quasar.askAtLine",
+        "title": "Ask Quasar in Comment Thread...",
+        "category": "Quasar",
         "icon": "$(comment-discussion)"
       },
       {
-        "command": "antigravityReview.stageNewComment",
+        "command": "quasar.stageNewComment",
         "title": "Stage Review Comment for GitHub",
-        "category": "Antigravity Review",
+        "category": "Quasar",
         "icon": "$(check)"
       },
       {
-        "command": "antigravityReview.stageThread",
-        "title": "Stage for GitHub Pending Review",
-        "category": "Antigravity Review",
+        "command": "quasar.stageThread",
+        "title": "Stage for GitHub Review",
+        "category": "Quasar",
         "icon": "$(check)"
       },
       {
-        "command": "antigravityReview.unstageThread",
-        "title": "Unstage Comment",
-        "category": "Antigravity Review",
-        "icon": "$(History)"
+        "command": "quasar.unstageThread",
+        "title": "Unstage from GitHub Review (Keep as Draft)",
+        "category": "Quasar",
+        "icon": "$(history)"
       },
       {
-        "command": "antigravityReview.dismissThread",
-        "title": "Dismiss Candidate Comment",
-        "category": "Antigravity Review",
-        "icon": "$(close)"
+        "command": "quasar.dismissThread",
+        "title": "Remove / Dismiss Comment",
+        "category": "Quasar",
+        "icon": "$(trash)"
       },
       {
-        "command": "antigravityReview.editDraftComment",
+        "command": "quasar.editDraftComment",
         "title": "Edit Draft GitHub Comment...",
-        "category": "Antigravity Review",
+        "category": "Quasar",
         "icon": "$(edit)"
       },
       {
-        "command": "antigravityReview.exportPendingReview",
-        "title": "Export Staged Comments to GitHub Pending Review",
-        "category": "Antigravity Review",
+        "command": "quasar.calibrateFindingPreference",
+        "title": "Calibrate Preference on Uncertain Feedback...",
+        "category": "Quasar",
+        "icon": "$(question)"
+      },
+      {
+        "command": "quasar.upvoteFinding",
+        "title": "Helpful Feedback (More Like This)",
+        "category": "Quasar",
+        "icon": "$(thumbsup)"
+      },
+      {
+        "command": "quasar.downvoteFinding",
+        "title": "Not Useful Feedback (Less Like This...)",
+        "category": "Quasar",
+        "icon": "$(thumbsdown)"
+      },
+      {
+        "command": "quasar.giveMetaFeedback",
+        "title": "Teach Quasar / Give Feedback on This Feedback...",
+        "category": "Quasar",
+        "icon": "$(lightbulb-sparkle)"
+      },
+      {
+        "command": "quasar.importReviewSkill",
+        "title": "Import Premade Review Skill as Starting Point...",
+        "category": "Quasar",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "quasar.managePreferences",
+        "title": "Manage & Calibrate Reviewer Preferences...",
+        "category": "Quasar",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "quasar.openPreferencesGuide",
+        "title": "Open Learned Preferences Guide (PREFERENCES.md)",
+        "category": "Quasar",
+        "icon": "$(notebook)"
+      },
+      {
+        "command": "quasar.fixSelectedComments",
+        "title": "Fix Selected Comments with Agent...",
+        "category": "Quasar",
+        "icon": "$(wrench)"
+      },
+      {
+        "command": "quasar.toggleSelectForFix",
+        "title": "Queue / Unqueue Comment for Agent Fix",
+        "category": "Quasar",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "quasar.fixSingleComment",
+        "title": "Fix This Issue with Quasar Now...",
+        "category": "Quasar",
+        "icon": "$(wrench)"
+      },
+      {
+        "command": "quasar.configureGithubToken",
+        "title": "Configure GitHub API Key / Personal Access Token...",
+        "category": "Quasar",
+        "icon": "$(key)"
+      },
+      {
+        "command": "quasar.exportPendingReview",
+        "title": "Publish / Export Review to GitHub (as You)...",
+        "category": "Quasar",
         "icon": "$(cloud-upload)"
       },
       {
-        "command": "antigravityReview.refreshSession",
+        "command": "quasar.refreshSession",
         "title": "Refresh Review Session",
-        "category": "Antigravity Review",
+        "category": "Quasar",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "quasar.resetReview",
+        "title": "Reset / Re-Run Branch or PR Review...",
+        "category": "Quasar",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "quasar.closeReview",
+        "title": "Close Active Review & Clear IDE Annotations",
+        "category": "Quasar",
+        "icon": "$(close)"
+      },
+      {
+        "command": "quasar.checkoutPrBranch",
+        "title": "Switch Local Repository to Active PR Branch...",
+        "category": "Quasar",
+        "icon": "$(git-branch)"
+      },
+      {
+        "command": "quasar.switchPastReview",
+        "title": "Past Reviews / Switch Review Session...",
+        "category": "Quasar",
+        "icon": "$(history)"
       }
     ],
     "keybindings": [
       {
-        "command": "antigravityReview.nextTourStop",
+        "command": "quasar.nextTourStop",
         "key": "alt+down",
         "mac": "alt+down",
         "when": "editorTextFocus"
       },
       {
-        "command": "antigravityReview.prevTourStop",
+        "command": "quasar.prevTourStop",
         "key": "alt+up",
         "mac": "alt+up",
         "when": "editorTextFocus"
       }
     ],
     "menus": {
-      "view/title": [
+      "scm/title": [
         {
-          "command": "antigravityReview.loadPrFromUrl",
-          "when": "view == antigravityReview.cliffsNotesTree",
+          "command": "quasar.reviewLocalBranch",
           "group": "navigation@1"
         },
         {
-          "command": "antigravityReview.openCliffsNotesGuide",
-          "when": "view == antigravityReview.cliffsNotesTree",
+          "command": "quasar.loadPrFromUrl",
+          "group": "navigation@2"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "quasar.loadPrFromUrl",
+          "when": "view == quasar.cliffsNotesTree",
+          "group": "navigation@1"
+        },
+        {
+          "command": "quasar.reviewLocalBranch",
+          "when": "view == quasar.cliffsNotesTree",
           "group": "navigation@2"
         },
         {
-          "command": "antigravityReview.nextTourStop",
-          "when": "view == antigravityReview.cliffsNotesTree",
+          "command": "quasar.switchPastReview",
+          "when": "view == quasar.cliffsNotesTree",
           "group": "navigation@3"
         },
         {
-          "command": "antigravityReview.exportPendingReview",
-          "when": "view == antigravityReview.commentsTree",
+          "command": "quasar.openCliffsNotesGuide",
+          "when": "view == quasar.cliffsNotesTree",
+          "group": "navigation@4"
+        },
+        {
+          "command": "quasar.nextTourStop",
+          "when": "view == quasar.cliffsNotesTree",
+          "group": "navigation@5"
+        },
+        {
+          "command": "quasar.resetReview",
+          "when": "view == quasar.cliffsNotesTree",
+          "group": "navigation@6"
+        },
+        {
+          "command": "quasar.closeReview",
+          "when": "view == quasar.cliffsNotesTree",
+          "group": "navigation@7"
+        },
+        {
+          "command": "quasar.fixSelectedComments",
+          "when": "view == quasar.commentsTree",
+          "group": "navigation@0"
+        },
+        {
+          "command": "quasar.exportPendingReview",
+          "when": "view == quasar.commentsTree",
           "group": "navigation@1"
         },
         {
-          "command": "antigravityReview.refreshSession",
-          "when": "view == antigravityReview.commentsTree",
+          "command": "quasar.configureGithubToken",
+          "when": "view == quasar.commentsTree",
           "group": "navigation@2"
+        },
+        {
+          "command": "quasar.managePreferences",
+          "when": "view == quasar.commentsTree",
+          "group": "navigation@3"
+        },
+        {
+          "command": "quasar.refreshSession",
+          "when": "view == quasar.commentsTree",
+          "group": "navigation@4"
+        },
+        {
+          "command": "quasar.resetReview",
+          "when": "view == quasar.commentsTree",
+          "group": "navigation@5"
+        },
+        {
+          "command": "quasar.closeReview",
+          "when": "view == quasar.commentsTree",
+          "group": "navigation@6"
+        },
+        {
+          "command": "quasar.importReviewSkill",
+          "when": "view == quasar.checksTree",
+          "group": "navigation@1"
+        },
+        {
+          "command": "quasar.managePreferences",
+          "when": "view == quasar.checksTree",
+          "group": "navigation@2"
+        },
+        {
+          "command": "quasar.openPreferencesGuide",
+          "when": "view == quasar.checksTree",
+          "group": "navigation@3"
         }
       ],
       "view/item/context": [
         {
-          "command": "antigravityReview.stageThread",
-          "when": "view == antigravityReview.commentsTree && viewItem == thread-candidate",
+          "command": "quasar.resetReview",
+          "when": "view == quasar.cliffsNotesTree && viewItem == pr-header",
           "group": "inline@1"
         },
         {
-          "command": "antigravityReview.editDraftComment",
-          "when": "view == antigravityReview.commentsTree && (viewItem == thread-candidate || viewItem == thread-staged)",
+          "command": "quasar.closeReview",
+          "when": "view == quasar.cliffsNotesTree && viewItem == pr-header",
           "group": "inline@2"
         },
         {
-          "command": "antigravityReview.dismissThread",
-          "when": "view == antigravityReview.commentsTree && viewItem == thread-candidate",
+          "command": "quasar.calibrateFindingPreference",
+          "when": "view == quasar.commentsTree && viewItem == thread-uncertain",
+          "group": "inline@0"
+        },
+        {
+          "command": "quasar.fixSingleComment",
+          "when": "view == quasar.commentsTree && (viewItem == thread-candidate || viewItem == thread-uncertain || viewItem == thread-staged || viewItem == thread-existing)",
+          "group": "inline@0_fix"
+        },
+        {
+          "command": "quasar.stageThread",
+          "when": "view == quasar.commentsTree && (viewItem == thread-candidate || viewItem == thread-uncertain)",
+          "group": "inline@1"
+        },
+        {
+          "command": "quasar.upvoteFinding",
+          "when": "view == quasar.commentsTree && (viewItem == thread-candidate || viewItem == thread-uncertain || viewItem == thread-staged)",
+          "group": "inline@2"
+        },
+        {
+          "command": "quasar.downvoteFinding",
+          "when": "view == quasar.commentsTree && (viewItem == thread-candidate || viewItem == thread-uncertain || viewItem == thread-staged)",
           "group": "inline@3"
         },
         {
-          "command": "antigravityReview.unstageThread",
-          "when": "view == antigravityReview.commentsTree && viewItem == thread-staged",
-          "group": "inline@1"
+          "command": "quasar.giveMetaFeedback",
+          "when": "view == quasar.commentsTree && (viewItem == thread-candidate || viewItem == thread-uncertain || viewItem == thread-staged)",
+          "group": "inline@4"
+        },
+        {
+          "command": "quasar.dismissThread",
+          "when": "view == quasar.commentsTree && (viewItem == thread-candidate || viewItem == thread-uncertain || viewItem == thread-staged)",
+          "group": "inline@5"
+        },
+        {
+          "command": "quasar.toggleSelectForFix",
+          "when": "view == quasar.commentsTree && (viewItem == thread-candidate || viewItem == thread-uncertain || viewItem == thread-staged || viewItem == thread-existing)",
+          "group": "1_modify@0"
+        },
+        {
+          "command": "quasar.editDraftComment",
+          "when": "view == quasar.commentsTree && (viewItem == thread-candidate || viewItem == thread-uncertain || viewItem == thread-staged)",
+          "group": "1_modify@1"
+        },
+        {
+          "command": "quasar.unstageThread",
+          "when": "view == quasar.commentsTree && viewItem == thread-staged",
+          "group": "1_modify@2"
+        },
+        {
+          "command": "quasar.dismissThread",
+          "when": "view == quasar.commentsTree && (viewItem == thread-candidate || viewItem == thread-uncertain || viewItem == thread-staged)",
+          "group": "1_modify@3"
         }
       ],
       "comments/commentThread/title": [
         {
-          "command": "antigravityReview.stageThread",
-          "when": "commentController == antigravity-code-review && commentThread =~ /candidate|qa/",
+          "command": "quasar.calibrateFindingPreference",
+          "when": "commentController == quasar && commentThread =~ /uncertain/",
+          "group": "inline@0"
+        },
+        {
+          "command": "quasar.toggleSelectForFix",
+          "when": "commentController == quasar && commentThread =~ /candidate|uncertain|staged|qa|existing/",
+          "group": "inline@0_queue"
+        },
+        {
+          "command": "quasar.fixSingleComment",
+          "when": "commentController == quasar && commentThread =~ /candidate|uncertain|staged|qa|existing/",
+          "group": "inline@0_fix"
+        },
+        {
+          "command": "quasar.stageThread",
+          "when": "commentController == quasar && commentThread =~ /candidate|uncertain|qa/",
           "group": "inline@1"
         },
         {
-          "command": "antigravityReview.editDraftComment",
-          "when": "commentController == antigravity-code-review && commentThread =~ /candidate|staged/",
+          "command": "quasar.upvoteFinding",
+          "when": "commentController == quasar && commentThread =~ /candidate|uncertain|staged/",
           "group": "inline@2"
         },
         {
-          "command": "antigravityReview.dismissThread",
-          "when": "commentController == antigravity-code-review && commentThread =~ /candidate|qa/",
+          "command": "quasar.downvoteFinding",
+          "when": "commentController == quasar && commentThread =~ /candidate|uncertain|staged/",
           "group": "inline@3"
         },
         {
-          "command": "antigravityReview.unstageThread",
-          "when": "commentController == antigravity-code-review && commentThread =~ /staged/",
-          "group": "inline@1"
+          "command": "quasar.giveMetaFeedback",
+          "when": "commentController == quasar && commentThread =~ /candidate|uncertain|staged|qa/",
+          "group": "inline@4"
+        },
+        {
+          "command": "quasar.editDraftComment",
+          "when": "commentController == quasar && commentThread =~ /candidate|uncertain|staged/",
+          "group": "inline@5"
+        },
+        {
+          "command": "quasar.dismissThread",
+          "when": "commentController == quasar && commentThread =~ /candidate|uncertain|staged|qa/",
+          "group": "inline@6"
+        },
+        {
+          "command": "quasar.unstageThread",
+          "when": "commentController == quasar && commentThread =~ /staged/",
+          "group": "inline@7"
         }
       ],
       "comments/commentThread/context": [
         {
-          "command": "antigravityReview.askInComment",
-          "when": "commentController == antigravity-code-review",
+          "command": "quasar.askInComment",
+          "when": "commentController == quasar",
           "group": "inline@1"
         },
         {
-          "command": "antigravityReview.stageNewComment",
-          "when": "commentController == antigravity-code-review",
+          "command": "quasar.giveMetaFeedback",
+          "when": "commentController == quasar",
           "group": "inline@2"
+        },
+        {
+          "command": "quasar.stageNewComment",
+          "when": "commentController == quasar",
+          "group": "inline@3"
         }
       ]
-    }
+    },
+    "markdown.previewScripts": [
+      "./media/mermaid-preview.js"
+    ]
   }
 }

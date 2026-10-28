@@ -1,0 +1,2110 @@
+#!/usr/bin/env python3
+"""Collects GitHub PR or local branch diff context, materializes Base/Head snapshots
+for native side-by-side diffs, and initializes the Quasar session.
+
+Supports both `gh` CLI (if installed/authenticated) and direct GitHub REST API.
+
+Usage:
+  # Review a GitHub PR by URL or number:
+  python3 collect_pr_context.py --pr https://github.com/flutter/packages/pull/13265
+
+  # Review local branch against a base ref:
+  python3 collect_pr_context.py --base origin/main --repo-dir /path/to/repo
+"""
+
+import argparse
+import concurrent.futures
+import datetime
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any, Dict, List, Optional, Tuple
+
+REVIEW_STATE_DIR = os.path.expanduser("~/.gemini/quasar")
+WORKSPACES_STATE_DIR = os.path.join(REVIEW_STATE_DIR, "workspaces")
+HISTORY_STATE_DIR = os.path.join(REVIEW_STATE_DIR, "history")
+GITHUB_AUTH_PATH = os.path.join(REVIEW_STATE_DIR, "github_auth.json")
+
+
+def archive_review_session(
+    session: Dict[str, Any], md_content: Optional[str] = None
+) -> Optional[str]:
+    """Archives a review session and its CliffsNotes markdown under ~/.gemini/quasar/history/<sessionId>/."""
+    if not isinstance(session, dict):
+        return None
+    raw_id = str(session.get("sessionId") or "").strip()
+    if not raw_id:
+        pr = session.get("pr") or {}
+        if pr.get("number"):
+            raw_id = f"{pr.get('owner', 'gh')}-{pr.get('repo', 'repo')}-pr-{pr.get('number')}"
+        elif pr.get("headRefName"):
+            raw_id = f"local-{pr.get('repo', 'repo')}-{pr.get('headRefName')}"
+    safe_id = re.sub(r"[^a-zA-Z0-9._-]+", "-", raw_id).strip("-")
+    if not safe_id:
+        return None
+    hist_dir = os.path.join(HISTORY_STATE_DIR, safe_id)
+    try:
+        os.makedirs(hist_dir, exist_ok=True)
+        hist_session_path = os.path.join(hist_dir, "session.json")
+        hist_md_path = os.path.join(hist_dir, "cliffs_notes.md")
+        with open(hist_session_path, "w", encoding="utf-8") as f:
+            json.dump(session, f, indent=2)
+        if md_content is None:
+            try:
+                md_content = render_cliffs_notes_markdown(session)
+            except Exception:
+                md_content = None
+        if md_content:
+            with open(hist_md_path, "w", encoding="utf-8") as mf:
+                mf.write(md_content)
+        return hist_dir
+    except Exception:
+        return None
+
+
+def resolve_workspace_root(workspace_dir: Optional[str] = None) -> str:
+    """Resolves the canonical workspace root (walking up to the enclosing .git root if inside a repo)."""
+    cand = workspace_dir or os.environ.get("QUASAR_WORKSPACE_DIR") or os.getcwd()
+    cand = os.path.realpath(os.path.expanduser(cand))
+    if os.path.isfile(cand):
+        cand = os.path.dirname(cand)
+    cur = cand
+    while True:
+        if os.path.exists(os.path.join(cur, ".git")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return cand
+
+
+def compute_workspace_key(workspace_dir: str) -> str:
+    """Computes a deterministic per-workspace directory key matching extension.js."""
+    norm = os.path.realpath(os.path.expanduser(workspace_dir))
+    base = re.sub(r"[^a-zA-Z0-9._-]+", "-", os.path.basename(norm)).strip("-") or "workspace"
+    digest = hashlib.sha256(norm.encode("utf-8")).hexdigest()[:10]
+    return f"{base}-{digest}"
+
+
+def get_workspace_state_dir(workspace_dir: Optional[str] = None) -> str:
+    """Returns the isolated Quasar state directory for the given window/workspace."""
+    explicit_state = os.environ.get("QUASAR_STATE_DIR")
+    if explicit_state and not workspace_dir:
+        return os.path.abspath(os.path.expanduser(explicit_state))
+    ws_root = resolve_workspace_root(workspace_dir)
+    ws_key = compute_workspace_key(ws_root)
+    return os.path.join(WORKSPACES_STATE_DIR, ws_key)
+
+
+def get_session_paths(
+    workspace_dir: Optional[str] = None,
+    thread_id: Optional[str] = None,
+) -> Tuple[str, str, str]:
+    """Returns (state_dir, active_session_path, cliffs_notes_md_path) for the target workspace.
+    If thread_id is provided and not found in the default workspace session, searches all workspace sessions.
+    """
+    state_dir = get_workspace_state_dir(workspace_dir)
+    session_path = os.path.join(state_dir, "active_session.json")
+    md_path = os.path.join(state_dir, "cliffs_notes.md")
+
+    if thread_id:
+        # Check if the current workspace session already contains this thread_id
+        found_in_current = False
+        if os.path.isfile(session_path):
+            try:
+                with open(session_path, "r", encoding="utf-8") as f:
+                    sess = json.load(f)
+                if any(t.get("id") == thread_id for t in (sess.get("threads") or [])):
+                    found_in_current = True
+            except Exception:
+                pass
+        if not found_in_current and os.path.isdir(WORKSPACES_STATE_DIR):
+            for entry in os.listdir(WORKSPACES_STATE_DIR):
+                cand_dir = os.path.join(WORKSPACES_STATE_DIR, entry)
+                cand_sess = os.path.join(cand_dir, "active_session.json")
+                if not os.path.isfile(cand_sess):
+                    continue
+                try:
+                    with open(cand_sess, "r", encoding="utf-8") as f:
+                        sess = json.load(f)
+                    if any(t.get("id") == thread_id for t in (sess.get("threads") or [])):
+                        return cand_dir, cand_sess, os.path.join(cand_dir, "cliffs_notes.md")
+                except Exception:
+                    continue
+
+    return state_dir, session_path, md_path
+
+
+ACTIVE_SESSION_PATH = os.path.join(get_workspace_state_dir(), "active_session.json")
+CLIFFS_NOTES_MD_PATH = os.path.join(get_workspace_state_dir(), "cliffs_notes.md")
+
+GENERATED_PATTERNS = [
+    r"\.g\.dart$",
+    r"\.mocks\.dart$",
+    r"\.freezed\.dart$",
+    r"\.pigeon\.dart$",
+    r"/generated/",
+    r"platform_tests/.*\.(dart|kt|java|swift|mm|m|h|cc|cpp)$",
+]
+
+TEST_PATTERNS = [
+    r"_test\.(dart|kt|java|swift|cc|cpp|py|ts|js)$",
+    r"(^|/)test/",
+    r"(^|/)tests/",
+    r"(^|/)integration_test/",
+]
+
+DOC_CONFIG_PATTERNS = [
+    r"(^|/)CHANGELOG\.md$",
+    r"(^|/)pubspec\.yaml$",
+    r"(^|/)package\.json$",
+    r"(^|/)README\.md$",
+    r"(^|/)AGENTS\.md$",
+    r"\.md$",
+]
+
+
+def run_cmd(cmd: List[str], cwd: str, check: bool = True) -> subprocess.CompletedProcess:
+    res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if check and res.returncode != 0:
+        raise RuntimeError(f"Command failed ({' '.join(cmd)}): {res.stderr.strip()}")
+    return res
+
+
+def find_gh_binary() -> Optional[str]:
+    for candidate in [
+        shutil.which("gh"),
+        "/opt/homebrew/bin/gh",
+        "/usr/local/bin/gh",
+    ]:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def load_stored_github_auth() -> Dict[str, Any]:
+    if os.path.isfile(GITHUB_AUTH_PATH):
+        try:
+            with open(GITHUB_AUTH_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {}
+
+
+def get_github_token() -> Optional[str]:
+    stored = load_stored_github_auth().get("token")
+    if stored and str(stored).strip():
+        return str(stored).strip()
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        return token.strip()
+    gh = find_gh_binary()
+    if gh:
+        try:
+            res = subprocess.run([gh, "auth", "token"], capture_output=True, text=True, timeout=5)
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
+        except Exception:
+            pass
+    return None
+
+
+def repo_matches_remote(cand_dir: str, owner: str, repo: str) -> bool:
+    if not cand_dir or not os.path.isdir(os.path.join(cand_dir, ".git")):
+        return False
+    try:
+        remotes = run_cmd(["git", "remote", "-v"], cwd=cand_dir, check=False).stdout
+        if re.search(rf"[:/]{re.escape(repo)}(?:\.git)?(?:\s|$)", remotes, flags=re.IGNORECASE):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def auto_detect_repo_dir(owner: str, repo: str, provided_dir: Optional[str]) -> str:
+    if provided_dir:
+        abs_prov = os.path.abspath(os.path.expanduser(provided_dir))
+        if repo_matches_remote(abs_prov, owner, repo):
+            return abs_prov
+
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, "work", repo),
+        os.path.join(home, "work", owner, repo),
+        os.path.join(home, "dev", repo),
+        os.path.join(home, "src", repo),
+        os.path.join(home, "projects", repo),
+        os.path.join(home, repo),
+        os.path.join(home, "work", "packages"),
+    ]
+    for cand in candidates:
+        if repo_matches_remote(cand, owner, repo):
+            return os.path.abspath(cand)
+    if provided_dir and os.path.isdir(os.path.join(os.path.expanduser(provided_dir), ".git")):
+        return os.path.abspath(os.path.expanduser(provided_dir))
+    for cand in candidates:
+        if os.path.isdir(os.path.join(cand, ".git")):
+            return os.path.abspath(cand)
+    return os.path.abspath(provided_dir or os.getcwd())
+
+
+def infer_owner_repo(pr_arg: str, cwd: str) -> Tuple[str, str, int]:
+    m = re.search(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)", pr_arg)
+    if m:
+        return m.group(1), m.group(2), int(m.group(3))
+    pr_num = int(pr_arg.strip().lstrip("#"))
+    try:
+        remotes = run_cmd(["git", "remote", "-v"], cwd=cwd, check=False).stdout
+        for remote_pref in ["upstream", "origin"]:
+            for line in remotes.splitlines():
+                if line.startswith(remote_pref):
+                    rm = re.search(r"github\.com[:/]([^/]+)/([^/\s]+?)(?:\.git)?\s", line)
+                    if rm:
+                        return rm.group(1), rm.group(2), pr_num
+        rm = re.search(r"github\.com[:/]([^/]+)/([^/\s]+?)(?:\.git)?\s", remotes)
+        if rm:
+            return rm.group(1), rm.group(2), pr_num
+    except Exception:
+        pass
+    return "flutter", "packages", pr_num
+
+
+def github_api_get(url: str, accept: str = "application/vnd.github.v3+json") -> Any:
+    headers = {
+        "Accept": accept,
+        "User-Agent": "quasar",
+    }
+    token = get_github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+        if "json" in accept:
+            return json.loads(raw)
+        return raw
+
+
+def classify_file(path: str) -> str:
+    for pat in DOC_CONFIG_PATTERNS:
+        if re.search(pat, path):
+            return "docs_or_config"
+    for pat in GENERATED_PATTERNS:
+        if re.search(pat, path):
+            return "generated_or_fixture"
+    for pat in TEST_PATTERNS:
+        if re.search(pat, path):
+            return "test"
+    return "core_source"
+
+
+def parse_first_changed_line(patch: Optional[str]) -> Tuple[int, int]:
+    """Extracts (start_line, end_line) of the first hunk in the new file from a unified patch."""
+    if not patch:
+        return (1, 20)
+    m = re.search(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", patch)
+    if not m:
+        return (1, 20)
+    start = max(1, int(m.group(1)))
+    count = int(m.group(2)) if m.group(2) else 15
+    end = max(start, start + min(count, 40) - 1)
+    return (start, end)
+
+
+def parse_all_hunks(patch: Optional[str]) -> List[Dict[str, Any]]:
+    if not patch:
+        return []
+    hunks: List[Dict[str, Any]] = []
+    lines = patch.splitlines()
+    current_hunk: Optional[Dict[str, Any]] = None
+    hunk_lines: List[str] = []
+
+    for line in lines:
+        m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$", line)
+        if m:
+            if current_hunk is not None:
+                current_hunk["snippet"] = "\n".join(hunk_lines[:35])
+                hunks.append(current_hunk)
+            new_start = max(1, int(m.group(3)))
+            new_count = int(m.group(4)) if m.group(4) is not None else 1
+            header_ctx = (m.group(5) or "").strip()
+            current_hunk = {
+                "oldStart": int(m.group(1)),
+                "oldLines": int(m.group(2)) if m.group(2) is not None else 1,
+                "startLine": new_start,
+                "endLine": max(new_start, new_start + max(new_count, 1) - 1),
+                "headerContext": header_ctx,
+            }
+            hunk_lines = [line]
+        elif current_hunk is not None:
+            hunk_lines.append(line)
+
+    if current_hunk is not None:
+        current_hunk["snippet"] = "\n".join(hunk_lines[:35])
+        hunks.append(current_hunk)
+    return hunks
+
+
+def fetch_raw_file_content(
+    owner: str,
+    repo: str,
+    sha: str,
+    rel_path: str,
+    repo_dir: str,
+) -> Optional[str]:
+    if not sha:
+        return None
+    # 1. Try local git object database first (fast, offline)
+    if os.path.isdir(os.path.join(repo_dir, ".git")):
+        commit_exists = run_cmd(["git", "cat-file", "-t", sha], cwd=repo_dir, check=False).returncode == 0
+        res = run_cmd(["git", "cat-file", "-e", f"{sha}:{rel_path}"], cwd=repo_dir, check=False)
+        if res.returncode == 0:
+            show_res = run_cmd(["git", "show", f"{sha}:{rel_path}"], cwd=repo_dir, check=False)
+            if show_res.returncode == 0:
+                return show_res.stdout
+        elif commit_exists:
+            # The commit exists locally, so the file genuinely did not exist at this revision.
+            return ""
+
+    if owner == "local":
+        return None
+
+    # 2. Fallback to GitHub raw URL
+    quoted_path = urllib.parse.quote(rel_path, safe="/")
+    raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{sha}/{quoted_path}"
+    headers = {"User-Agent": "quasar"}
+    token = get_github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        req = urllib.request.Request(raw_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return ""
+        return None
+    except Exception:
+        return None
+
+
+def materialize_snapshots(
+    session_id: str,
+    owner: str,
+    repo: str,
+    base_sha: str,
+    head_sha: str,
+    files_list: List[Dict[str, Any]],
+    repo_dir: str,
+    use_working_tree_head: bool = False,
+) -> Tuple[str, str]:
+    snapshot_root = os.path.join(REVIEW_STATE_DIR, "snapshots", session_id)
+    base_root = os.path.join(snapshot_root, "base")
+    head_root = os.path.join(snapshot_root, "head")
+    os.makedirs(base_root, exist_ok=True)
+    os.makedirs(head_root, exist_ok=True)
+
+    # Try fetching the base/head refs in local git repo if missing, best-effort
+    if os.path.isdir(os.path.join(repo_dir, ".git")) and base_sha and owner != "local":
+        has_base = run_cmd(["git", "cat-file", "-t", base_sha], cwd=repo_dir, check=False).returncode == 0
+        if not has_base:
+            run_cmd(["git", "fetch", "--quiet", "origin"], cwd=repo_dir, check=False)
+
+    def process_one(f_item: Dict[str, Any]) -> None:
+        rel_path = f_item["path"]
+        prev_rel_path = f_item.get("previousPath") or rel_path
+        status = f_item.get("status", "modified")
+        base_target = os.path.join(base_root, rel_path)
+        head_target = os.path.join(head_root, rel_path)
+        os.makedirs(os.path.dirname(base_target), exist_ok=True)
+        os.makedirs(os.path.dirname(head_target), exist_ok=True)
+
+        if status == "added":
+            base_content = ""
+        else:
+            base_content = fetch_raw_file_content(owner, repo, base_sha, prev_rel_path, repo_dir)
+            if base_content is None:
+                base_content = ""
+
+        if status == "removed":
+            head_content = ""
+        elif use_working_tree_head:
+            local_file = os.path.join(repo_dir, rel_path)
+            if os.path.isfile(local_file):
+                head_content = open(local_file, "r", encoding="utf-8", errors="replace").read()
+            else:
+                head_content = fetch_raw_file_content(owner, repo, head_sha, rel_path, repo_dir) or ""
+        else:
+            head_content = fetch_raw_file_content(owner, repo, head_sha, rel_path, repo_dir)
+            if head_content is None:
+                local_file = os.path.join(repo_dir, rel_path)
+                head_content = open(local_file, "r", encoding="utf-8", errors="replace").read() if os.path.isfile(local_file) else ""
+
+        with open(base_target, "w", encoding="utf-8") as bf:
+            bf.write(base_content or "")
+        with open(head_target, "w", encoding="utf-8") as hf:
+            hf.write(head_content or "")
+
+        f_item["baseSnapshotPath"] = base_target
+        f_item["headSnapshotPath"] = head_target
+        local_candidate = os.path.join(repo_dir, rel_path)
+        if os.path.isfile(local_candidate):
+            f_item["localWorkspacePath"] = local_candidate
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(process_one, files_list))
+
+    return base_root, head_root
+
+
+def fetch_pr_via_rest(
+    owner: str, repo: str, pr_num: int
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], str]:
+    base_url = f"https://api.github.com/repos/{owner}/{repo}"
+    pr_data = github_api_get(f"{base_url}/pulls/{pr_num}")
+    files_data = github_api_get(f"{base_url}/pulls/{pr_num}/files?per_page=100")
+    issue_comments = github_api_get(f"{base_url}/issues/{pr_num}/comments?per_page=100")
+    review_comments = github_api_get(f"{base_url}/pulls/{pr_num}/comments?per_page=100")
+    reviews = github_api_get(f"{base_url}/pulls/{pr_num}/reviews?per_page=100")
+    diff_text = github_api_get(f"{base_url}/pulls/{pr_num}", accept="application/vnd.github.v3.diff")
+
+    metadata = {
+        "owner": owner,
+        "repo": repo,
+        "number": pr_data.get("number"),
+        "title": pr_data.get("title"),
+        "url": pr_data.get("html_url"),
+        "state": pr_data.get("state"),
+        "author": (pr_data.get("user") or {}).get("login"),
+        "baseRefName": (pr_data.get("base") or {}).get("ref"),
+        "baseSha": (pr_data.get("base") or {}).get("sha"),
+        "headRefName": (pr_data.get("head") or {}).get("ref"),
+        "headSha": (pr_data.get("head") or {}).get("sha"),
+        "additions": pr_data.get("additions", 0),
+        "deletions": pr_data.get("deletions", 0),
+        "changedFilesCount": pr_data.get("changed_files", len(files_data)),
+        "body": pr_data.get("body") or "",
+    }
+
+    comments: List[Dict[str, Any]] = []
+    for c in issue_comments:
+        comments.append(
+            {
+                "id": f"gh-issue-{c.get('id')}",
+                "type": "issue_comment",
+                "author": (c.get("user") or {}).get("login"),
+                "created_at": c.get("created_at"),
+                "body": (c.get("body") or "")[:1000],
+            }
+        )
+    for r in reviews:
+        if r.get("body"):
+            comments.append(
+                {
+                    "id": f"gh-review-{r.get('id')}",
+                    "type": "review",
+                    "author": (r.get("user") or {}).get("login"),
+                    "state": r.get("state"),
+                    "body": (r.get("body") or "")[:1000],
+                }
+            )
+    inline_by_raw_id: Dict[Any, Dict[str, Any]] = {}
+    orphan_replies: List[Dict[str, Any]] = []
+    for rc in review_comments:
+        raw_id = rc.get("id")
+        reply_to = rc.get("in_reply_to_id")
+        rc_author = (rc.get("user") or {}).get("login")
+        rc_body = (rc.get("body") or "")[:2000]
+        if reply_to:
+            parent = inline_by_raw_id.get(reply_to)
+            reply_entry = {
+                "id": f"gh-inline-{raw_id}",
+                "raw_id": raw_id,
+                "in_reply_to_id": reply_to,
+                "author": rc_author,
+                "created_at": rc.get("created_at"),
+                "body": rc_body,
+            }
+            if parent is not None:
+                parent.setdefault("replies", []).append(reply_entry)
+            else:
+                orphan_replies.append((reply_to, reply_entry, rc))
+        else:
+            entry = {
+                "id": f"gh-inline-{raw_id}",
+                "raw_id": raw_id,
+                "type": "inline_comment",
+                "author": rc_author,
+                "path": rc.get("path"),
+                "line": rc.get("line") or rc.get("original_line") or 1,
+                "side": rc.get("side", "RIGHT"),
+                "created_at": rc.get("created_at"),
+                "body": rc_body,
+                "replies": [],
+            }
+            inline_by_raw_id[raw_id] = entry
+            comments.append(entry)
+
+    for reply_to, reply_entry, rc in orphan_replies:
+        parent = inline_by_raw_id.get(reply_to)
+        if parent is not None:
+            parent.setdefault("replies", []).append(reply_entry)
+        else:
+            comments.append(
+                {
+                    "id": reply_entry["id"],
+                    "raw_id": reply_entry["raw_id"],
+                    "in_reply_to_id": reply_to,
+                    "type": "inline_comment",
+                    "author": reply_entry["author"],
+                    "path": rc.get("path"),
+                    "line": rc.get("line") or rc.get("original_line") or 1,
+                    "side": rc.get("side", "RIGHT"),
+                    "created_at": reply_entry["created_at"],
+                    "body": reply_entry["body"],
+                    "replies": [],
+                }
+            )
+
+    files_list = []
+    for f in files_data:
+        patch_str = f.get("patch") or ""
+        start_line, end_line = parse_first_changed_line(patch_str)
+        files_list.append(
+            {
+                "path": f.get("filename", ""),
+                "status": f.get("status", "modified"),
+                "added": f.get("additions", 0),
+                "deleted": f.get("deletions", 0),
+                "firstChangedStartLine": start_line,
+                "firstChangedEndLine": end_line,
+                "hunks": parse_all_hunks(patch_str),
+            }
+        )
+
+    return metadata, comments, files_list, diff_text
+
+
+def assess_existing_github_comment(
+    author: str,
+    body: str,
+    replies: Optional[List[Dict[str, Any]]] = None,
+    pr_author: str = "",
+    rel_path: str = "",
+    line: int = 1,
+) -> Dict[str, Any]:
+    """Classifies an existing GitHub PR inline comment so the user immediately sees whether:
+    - `recommended_fix` (`🛠️ Should Fix`): Quasar thinks the comment is good and the suggested fix should be made.
+    - `needs_attention` (`❓ Question` / `👀 Needs Look`): The comment asks a question that needs answering or raises a design discussion requiring human attention.
+    - `addressed_or_refuted` (`⚠️ Disputed` / `💬 Replied`): The PR author already replied or refuted the premise.
+    """
+    replies = replies or []
+    text = (body or "").strip()
+    lower = text.lower()
+    pr_author_norm = (pr_author or "").strip().lower()
+
+    # 1. Check if PR author already replied or refuted the comment in the thread
+    author_replies = [
+        r
+        for r in replies
+        if pr_author_norm and (r.get("author") or "").strip().lower() == pr_author_norm
+    ]
+    if author_replies:
+        last_reply_body = (author_replies[-1].get("body") or "").strip()
+        last_reply_lower = last_reply_body.lower()
+        first_reply_line = last_reply_body.splitlines()[0][:90] if last_reply_body else ""
+        if any(
+            kw in last_reply_lower
+            for kw in (
+                "mistaken",
+                "premise",
+                "intentionally",
+                "by design",
+                "does not",
+                "doesn't",
+                "not needed",
+                "false positive",
+                "incorrect",
+            )
+        ):
+            return {
+                "triageStatus": "addressed_or_refuted",
+                "triageCategory": "refuted",
+                "triageBadge": "⚠️ Disputed / No Fix",
+                "triageLabel": "⚠️ Premise Disputed by Author — Do Not Apply",
+                "triageSummary": (
+                    f"@{pr_author} replied explaining why this comment's premise does not apply"
+                    + (f' ("{first_reply_line}").' if first_reply_line else ".")
+                ),
+                "recommendedForFix": False,
+            }
+        if any(
+            kw in last_reply_lower
+            for kw in ("done", "fixed", "updated", "removed", "renamed", "addressed", "added")
+        ):
+            return {
+                "triageStatus": "addressed_or_refuted",
+                "triageCategory": "addressed",
+                "triageBadge": "✅ Addressed in Thread",
+                "triageLabel": "✅ Already Addressed by Author",
+                "triageSummary": f"@{pr_author} replied indicating this comment was already addressed.",
+                "recommendedForFix": False,
+            }
+        return {
+            "triageStatus": "addressed_or_refuted",
+            "triageCategory": "replied",
+            "triageBadge": "💬 Author Replied",
+            "triageLabel": "💬 Author Replied in Thread — Check if Resolved",
+            "triageSummary": (
+                f"@{pr_author} already replied in this thread"
+                + (f': "{first_reply_line}"' if first_reply_line else ".")
+            ),
+            "recommendedForFix": False,
+        }
+
+    # 2. Check for explicit GitHub ```suggestion block
+    if "```suggestion" in lower:
+        return {
+            "triageStatus": "recommended_fix",
+            "triageCategory": "suggestion",
+            "triageBadge": "🛠️ Good Fix (Suggestion)",
+            "triageLabel": "🛠️ Good Comment — Suggested Fix Should Be Made",
+            "triageSummary": f"@{author} provided a concrete code suggestion block (` ```suggestion `) that is ready to apply.",
+            "recommendedForFix": True,
+        }
+
+    # 3. Check for high-signal bug / edge-case / compiler warning / shadowing / collision catches
+    bug_signals = [
+        ("warning:", "compiler/analyzer warning"),
+        ("warnings-as-errors", "warnings-as-errors build hazard"),
+        ("typecheck", "typecheck warning/error"),
+        ("shadows", "variable/property shadowing bug"),
+        ("shadowing", "variable/property shadowing bug"),
+        ("same scope", "duplicate identifier collision in the same scope"),
+        ("emits both", "duplicate code/variable emission bug"),
+        ("twice in the same", "duplicate argument/identifier emission"),
+        ("never released", "resource/memory leak on error path"),
+        ("outside the try/finally", "resource cleanup outside try/finally block"),
+        ("out of sync", "binding/type synchronization bug"),
+        ("double-free", "memory lifecycle issue"),
+        ("null-safe", "null-safety issue"),
+        ("completionhandler", "parameter name collision with completionHandler"),
+    ]
+    matched_bug_reasons = [desc for pat, desc in bug_signals if pat in lower]
+    if matched_bug_reasons:
+        reason_str = ", ".join(dict.fromkeys(matched_bug_reasons[:2]))
+        return {
+            "triageStatus": "recommended_fix",
+            "triageCategory": "bug_or_edge_case",
+            "triageBadge": "🛠️ Good Catch — Should Fix",
+            "triageLabel": "🛠️ Good Comment — Suggested Fix Should Be Made",
+            "triageSummary": f"High-signal catch by @{author} identifying a valid {reason_str} in `{os.path.basename(rel_path) or rel_path}:L{line}`. Quasar recommends making this fix.",
+            "recommendedForFix": True,
+        }
+
+    # 4. Check for open architectural / design questions or broader design discussions that require human attention
+    is_design_discussion = any(
+        phrase in lower
+        for phrase in (
+            "i don't know if i like",
+            "scatters the code",
+            "go in there own file",
+            "go in their own file",
+            "in its own file",
+            "what do you think",
+            "thoughts on",
+            "how do you feel about",
+            "architectural",
+        )
+    )
+    has_question_mark = "?" in text
+    is_polite_doc_or_nit_request = any(
+        phrase in lower
+        for phrase in (
+            "can we get docs",
+            "can we add a comment",
+            "could we add a comment",
+            "needs a comment",
+            "more descriptive name",
+            "prefer this be an if",
+            "prefer an if",
+            "small nit",
+        )
+    ) or lower.startswith("nit:") or lower.startswith("nit ")
+
+    if is_design_discussion:
+        if has_question_mark:
+            return {
+                "triageStatus": "needs_attention",
+                "triageCategory": "question",
+                "triageBadge": "❓ Question — Needs Answer",
+                "triageLabel": "❓ Question — Requires Your Answer or Decision",
+                "triageSummary": f"@{author} asked an architectural/design question on `{os.path.basename(rel_path) or rel_path}` that needs an answer or design decision.",
+                "recommendedForFix": False,
+            }
+        return {
+            "triageStatus": "needs_attention",
+            "triageCategory": "discussion",
+            "triageBadge": "👀 Needs Look (Design)",
+            "triageLabel": "👀 Needs Attention — Design Discussion",
+            "triageSummary": f"@{author} raised a design/structure concern on `{os.path.basename(rel_path) or rel_path}` that requires looking at to decide whether to refactor or reply.",
+            "recommendedForFix": False,
+        }
+
+    # 5. Check for questions that ask whether something is necessary or how it works
+    if has_question_mark and not is_polite_doc_or_nit_request:
+        if "is this " in lower and "necessary" in lower:
+            return {
+                "triageStatus": "recommended_fix",
+                "triageCategory": "cleanup_question",
+                "triageBadge": "🛠️ Good Catch / ❓ Question",
+                "triageLabel": "🛠️ Good Comment — Suggested Simplification (or Reply)",
+                "triageSummary": f"@{author} asked whether this code is redundant; inspecting the context shows it can be simplified directly as suggested.",
+                "recommendedForFix": True,
+            }
+        return {
+            "triageStatus": "needs_attention",
+            "triageCategory": "question",
+            "triageBadge": "❓ Question — Needs Answer",
+            "triageLabel": "❓ Question — Requires Your Attention / Answer",
+            "triageSummary": f"@{author} asked a question on `{os.path.basename(rel_path) or rel_path}:L{line}` that needs to be looked at and answered.",
+            "recommendedForFix": False,
+        }
+
+    # 6. Actionable nits, readability improvements, and documentation/comment requests
+    if is_polite_doc_or_nit_request or any(
+        kw in lower
+        for kw in (
+            "i think this",
+            "should be",
+            "prefer ",
+            "consider ",
+            "nit",
+            "readability",
+            "comment",
+            "docs",
+            "rename",
+        )
+    ):
+        return {
+            "triageStatus": "recommended_fix",
+            "triageCategory": "actionable_improvement",
+            "triageBadge": "🛠️ Good Comment — Should Fix",
+            "triageLabel": "🛠️ Good Comment — Suggested Fix Should Be Made",
+            "triageSummary": f"Clear, actionable improvement suggested by @{author} on `{os.path.basename(rel_path) or rel_path}:L{line}`; Quasar recommends applying this fix.",
+            "recommendedForFix": True,
+        }
+
+    # Default fallback: requires looking at
+    return {
+        "triageStatus": "needs_attention",
+        "triageCategory": "review_comment",
+        "triageBadge": "👀 Needs Attention",
+        "triageLabel": "👀 Needs Attention — Review Comment",
+        "triageSummary": f"Existing review comment from @{author} that requires looking at.",
+        "recommendedForFix": False,
+    }
+
+
+def build_initial_cliffs_notes_session(
+    session_id: str,
+    repo_dir: str,
+    metadata: Dict[str, Any],
+    categorized_files: Dict[str, List[Dict[str, Any]]],
+    existing_comments: List[Dict[str, Any]],
+    base_root: str,
+    head_root: str,
+    output_dir: Optional[str],
+) -> Dict[str, Any]:
+    """Builds an immediate CliffsNotes session structure from the categorized files and hunks
+    so the native Quasar extension renders the tour right away, before or during deep agent synthesis.
+    """
+    chapters: List[Dict[str, Any]] = []
+
+    chapter_defs = [
+        (
+            "ch-core",
+            "Chapter 1: Core Source & Logic",
+            "core_source",
+            "Primary implementation and API changes that drive this PR's behavior.",
+        ),
+        (
+            "ch-tests",
+            "Chapter 2: Verification & Unit Tests",
+            "test",
+            "Unit and integration tests verifying the new behavior and edge cases.",
+        ),
+        (
+            "ch-docs",
+            "Chapter 3: Documentation, Config & Changelog",
+            "docs_or_config",
+            "Version bumps, CHANGELOG entries, and documentation updates.",
+        ),
+        (
+            "ch-generated",
+            "Chapter 4: Generated Code & Test Fixtures (Skim)",
+            "generated_or_fixture",
+            "Auto-generated bindings or platform test outputs derived from the generator changes.",
+        ),
+    ]
+
+    stop_counter = 1
+    for ch_id, ch_title, cat_key, ch_desc in chapter_defs:
+        cat_files = categorized_files.get(cat_key, [])
+        if not cat_files:
+            continue
+        stops = []
+        cliffs_bullets = [ch_desc]
+        for f_item in cat_files:
+            rel_path = f_item["path"]
+            basename = os.path.basename(rel_path)
+            hunks = f_item.get("hunks") or []
+            start_line = f_item.get("firstChangedStartLine", 1)
+            end_line = f_item.get("firstChangedEndLine", start_line + 15)
+            header_ctx = hunks[0].get("headerContext") if hunks else ""
+            stop_summary = (
+                f"{basename} ({header_ctx})"
+                if header_ctx
+                else f"{basename} (+{f_item.get('added', 0)} / -{f_item.get('deleted', 0)})"
+            )
+            cliffs_bullets.append(
+                f"`{basename}`: +{f_item.get('added', 0)}/-{f_item.get('deleted', 0)} lines ({f_item.get('status', 'modified')})"
+            )
+            stops.append(
+                {
+                    "id": f"stop-{stop_counter}",
+                    "stopNumber": f"{len(chapters) + 1}.{len(stops) + 1}",
+                    "title": f"{basename}:{start_line}-{end_line}",
+                    "description": stop_summary,
+                    "path": rel_path,
+                    "startLine": start_line,
+                    "endLine": end_line,
+                    "added": f_item.get("added", 0),
+                    "deleted": f_item.get("deleted", 0),
+                    "status": f_item.get("status", "modified"),
+                    "baseSnapshotPath": f_item.get("baseSnapshotPath", os.path.join(base_root, rel_path)),
+                    "headSnapshotPath": f_item.get("headSnapshotPath", os.path.join(head_root, rel_path)),
+                    "localWorkspacePath": f_item.get("localWorkspacePath"),
+                    "cliffsNotes": (
+                        f"Changed `{rel_path}` (+{f_item.get('added', 0)} / -{f_item.get('deleted', 0)}). "
+                        + (f"Context: `{header_ctx}`." if header_ctx else "Inspect diff hunks for behavioral changes.")
+                    ),
+                    "whyItChanged": "Part of PR #" + str(metadata.get("number") or "local"),
+                    "callersAndInvariants": "Hover or click 'Ask Quasar' on any line to trace callers or invariants.",
+                    "hunks": hunks,
+                    "read": False,
+                }
+            )
+            stop_counter += 1
+
+        chapters.append(
+            {
+                "id": ch_id,
+                "title": ch_title,
+                "category": cat_key,
+                "summary": ch_desc,
+                "cliffsNotesBullets": cliffs_bullets,
+                "stops": stops,
+            }
+        )
+
+    # Also merge consecutive same-path/same-line comments where a reply was fetched without in_reply_to_id
+    pr_author_login = (metadata.get("author") or "").strip()
+    inline_comments_raw = [
+        c for c in existing_comments if c.get("type") == "inline_comment" and c.get("path")
+    ]
+    merged_inline_comments: List[Dict[str, Any]] = []
+    for c in inline_comments_raw:
+        c_copy = dict(c)
+        c_copy["replies"] = list(c.get("replies") or [])
+        if (
+            merged_inline_comments
+            and not c_copy.get("replies")
+            and pr_author_login
+            and (c_copy.get("author") or "").strip().lower() == pr_author_login.lower()
+            and merged_inline_comments[-1].get("path") == c_copy.get("path")
+            and int(merged_inline_comments[-1].get("line") or 1) == int(c_copy.get("line") or 1)
+        ):
+            merged_inline_comments[-1]["replies"].append(
+                {
+                    "id": c_copy.get("id"),
+                    "author": c_copy.get("author"),
+                    "created_at": c_copy.get("created_at"),
+                    "body": c_copy.get("body") or "",
+                }
+            )
+            continue
+        merged_inline_comments.append(c_copy)
+
+    inline_threads: List[Dict[str, Any]] = []
+    for c in merged_inline_comments:
+        raw_body = (c.get("body") or "").strip()
+        # Strip leading markdown badge images (e.g. ![critical](...)) when building short title
+        clean_lines = [
+            re.sub(r"^!\[[^\]]*\]\([^)]+\)\s*", "", ln).strip()
+            for ln in raw_body.splitlines()
+        ]
+        non_empty_lines = [ln for ln in clean_lines if ln]
+        first_line = (non_empty_lines[0][:72] if non_empty_lines else "Review comment")
+        author = c.get("author") or "reviewer"
+        replies = c.get("replies") or []
+
+        triage = assess_existing_github_comment(
+            author=author,
+            body=raw_body,
+            replies=replies,
+            pr_author=pr_author_login,
+            rel_path=c.get("path") or "",
+            line=int(c.get("line") or 1),
+        )
+        cat = triage.get("triageCategory") or ""
+        status = triage.get("triageStatus") or "needs_attention"
+        if status == "recommended_fix":
+            left_tag = "🛠️ [Suggestion]" if cat == "suggestion" else "🛠️ [Should Fix]"
+        elif status == "addressed_or_refuted":
+            left_tag = (
+                "⚠️ [Disputed]"
+                if cat == "refuted"
+                else ("✅ [Addressed]" if cat == "addressed" else "💬 [Replied]")
+            )
+        else:
+            left_tag = "❓ [Question]" if "question" in cat else "👀 [Needs Look]"
+
+        msgs: List[Dict[str, Any]] = [
+            {
+                "author": f"@{author} (GitHub)",
+                "body": raw_body,
+                "timestamp": c.get("created_at") or "",
+            }
+        ]
+        for rep in replies:
+            rep_author = rep.get("author") or "reviewer"
+            msgs.append(
+                {
+                    "author": f"@{rep_author} (GitHub Reply)",
+                    "body": (rep.get("body") or "").strip(),
+                    "timestamp": rep.get("created_at") or "",
+                }
+            )
+        msgs.append(
+            {
+                "author": f"Quasar Triage ({triage['triageBadge']})",
+                "body": f"**{triage['triageLabel']}**\n\n{triage['triageSummary']}",
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "isTriageNote": True,
+            }
+        )
+
+        inline_threads.append(
+            {
+                "id": str(c["id"]),
+                "kind": "github_existing",
+                "severity": "EXISTING",
+                "status": "existing",
+                "selectedForFix": False,
+                "author": author,
+                "triageLeftTag": left_tag,
+                "triageStatus": triage["triageStatus"],
+                "triageCategory": triage["triageCategory"],
+                "triageBadge": triage["triageBadge"],
+                "triageLabel": triage["triageLabel"],
+                "triageSummary": triage["triageSummary"],
+                "recommendedForFix": triage["recommendedForFix"],
+                "path": c["path"],
+                "startLine": int(c.get("line") or 1),
+                "endLine": int(c.get("line") or 1),
+                "title": f"{left_tag} {first_line}",
+                "whyItMatters": f"{triage['triageLabel']} — {triage['triageSummary']}",
+                "draftComment": raw_body,
+                "messages": msgs,
+            }
+        )
+
+    pr_body_first_para = ""
+    if metadata.get("body"):
+        cleaned = re.sub(r"<!--.*?-->", "", metadata["body"], flags=re.DOTALL).strip()
+        paras = [p.strip() for p in cleaned.split("\n\n") if p.strip() and not p.strip().startswith("#")]
+        if paras:
+            pr_body_first_para = paras[0][:400]
+
+    is_local = not metadata.get("number")
+    default_tldr = (
+        pr_body_first_para
+        or (
+            f"Reviewing local branch `{metadata.get('headRefName', 'HEAD')}` against `{metadata.get('baseRefName', 'main')}` in `{metadata.get('repo', '')}`"
+            if is_local
+            else f"Reviewing PR #{metadata.get('number')}: {metadata.get('title')}"
+        )
+    )
+
+    prefs_summary: Dict[str, Any] = {}
+    try:
+        from manage_preferences import build_prompt_summary, load_preferences
+
+        prefs_summary = build_prompt_summary(load_preferences(), metadata.get("repo"))
+    except Exception:
+        prefs_summary = {}
+
+    session: Dict[str, Any] = {
+        "sessionId": session_id,
+        "updatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "analysisStatus": "analyzing",
+        "repoDir": repo_dir,
+        "baseSnapshotRoot": base_root,
+        "headSnapshotRoot": head_root,
+        "scratchDir": output_dir or REVIEW_STATE_DIR,
+        "cliffsNotesMarkdownPath": CLIFFS_NOTES_MD_PATH,
+        "pr": metadata,
+        "reviewerPreferences": prefs_summary,
+        "cliffsNotes": {
+            "tldr": default_tldr,
+            "whatAndWhy": pr_body_first_para or "Quasar is synthesizing the executive CliffsNotes for this review...",
+            "architectureDiagram": "",
+            "keySymbols": [],
+            "designTradeoffs": [],
+        },
+        "chapters": chapters,
+        "threads": inline_threads,
+        "coverageMatrix": [],
+        "repoChecks": [],
+        "dismissedChecks": [],
+    }
+    return session
+
+
+_MERMAID_RESERVED_IDS = {
+    "end",
+    "subgraph",
+    "graph",
+    "flowchart",
+    "class",
+    "classdef",
+    "style",
+    "linkstyle",
+    "click",
+    "call",
+    "default",
+    "direction",
+}
+
+
+def _safe_mermaid_id(raw_id: str, prefix: str = "node_") -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_]", "_", (raw_id or "").strip())
+    if not cleaned or cleaned[0].isdigit():
+        cleaned = f"{prefix}{cleaned}"
+    if cleaned.lower() in _MERMAID_RESERVED_IDS:
+        cleaned = f"{prefix}{cleaned}"
+    return cleaned
+
+
+def _clean_mermaid_label(label: str, is_edge: bool = False) -> str:
+    txt = str(label or "")
+    # Replace literal \n sequences, actual newlines, and HTML <br> tags with a clean separator
+    txt = re.sub(r"\\n|\r?\n", " - ", txt)
+    txt = re.sub(r"<\s*br\s*/?\s*>", " - ", txt, flags=re.IGNORECASE)
+    # Replace angle-bracket type/placeholder tokens like <Prefix> or <T> without leaving HTML tags
+    txt = re.sub(r"<([A-Za-z0-9_., /+-]+)>", r"\1", txt)
+    txt = txt.replace("<", "").replace(">", "")
+    txt = txt.replace('"', "'").replace("`", "'")
+    if is_edge:
+        # Edge labels |...| in Mermaid can fail when containing parentheses, brackets, or colons
+        txt = txt.replace("(", "- ").replace(")", "").replace("[", "").replace("]", "")
+        txt = txt.replace(":", " -").replace(";", ",")
+    txt = re.sub(r"\s+", " ", txt).strip()
+    txt = re.sub(r"(?:\s*-\s*){2,}", " - ", txt).strip(" -")
+    return txt or "Step"
+
+
+def sanitize_mermaid_diagram(diag: str) -> str:
+    """Sanitizes LLM-generated Mermaid flowchart code to prevent parser and renderer errors."""
+    if not diag or not str(diag).strip():
+        return ""
+    raw = str(diag).strip()
+    # Strip outer markdown code fences if present
+    raw = re.sub(r"^```(?:mermaid)?\s*\r?\n?", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\r?\n?```\s*$", "", raw).strip()
+
+    # Collapse multi-line double-quoted strings into single lines before line splitting
+    raw = re.sub(
+        r'"([^"]*)"',
+        lambda m: '"' + re.sub(r"\s*\r?\n\s*", " - ", m.group(1)).strip() + '"',
+        raw,
+    )
+
+    raw_lines = [ln.rstrip() for ln in raw.splitlines() if ln.strip()]
+    if not raw_lines:
+        return ""
+
+    out_lines: List[str] = []
+    first = raw_lines[0].strip()
+    if re.match(r"^(?:flowchart|graph)\b", first, flags=re.IGNORECASE):
+        parts = first.split()
+        direction = parts[1].upper() if len(parts) > 1 and parts[1].upper() in ("TD", "TB", "BT", "RL", "LR") else "LR"
+        out_lines.append(f"flowchart {direction}")
+        body_lines = raw_lines[1:]
+    else:
+        out_lines.append("flowchart LR")
+        body_lines = raw_lines
+
+    for line in body_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("%%"):
+            continue
+        indent_Match = re.match(r"^(\s*)", line)
+        indent = indent_Match.group(1) if indent_Match else "  "
+
+        if stripped.lower() == "end":
+            out_lines.append(f"{indent}end")
+            continue
+
+        if re.match(r"^direction\s+(?:TD|TB|BT|RL|LR)\b", stripped, flags=re.IGNORECASE):
+            dir_tok = stripped.split()[1].upper()
+            out_lines.append(f"{indent}direction {dir_tok}")
+            continue
+
+        # Handle subgraph declarations: subgraph ID ["Title"] or subgraph "Title" or subgraph Title
+        sg_match = re.match(r"^subgraph\s+(.+)$", stripped, flags=re.IGNORECASE)
+        if sg_match:
+            sg_rest = sg_match.group(1).strip()
+            m_bracket = re.match(r'^([A-Za-z0-9_]+)\s*\[\s*"?([^"\]]*)"?\s*\]$', sg_rest)
+            m_quoted = re.match(r'^([A-Za-z0-9_]+)\s+"([^"]+)"$', sg_rest)
+            m_only_quoted = re.match(r'^"([^"]+)"$', sg_rest)
+            if m_bracket:
+                sg_id = _safe_mermaid_id(m_bracket.group(1), prefix="sg_")
+                sg_label = _clean_mermaid_label(m_bracket.group(2))
+            elif m_quoted:
+                sg_id = _safe_mermaid_id(m_quoted.group(1), prefix="sg_")
+                sg_label = _clean_mermaid_label(m_quoted.group(2))
+            elif m_only_quoted:
+                sg_label = _clean_mermaid_label(m_only_quoted.group(1))
+                sg_id = _safe_mermaid_id(sg_label[:24], prefix="sg_")
+            else:
+                sg_label = _clean_mermaid_label(sg_rest)
+                sg_id = _safe_mermaid_id(sg_rest.split()[0], prefix="sg_")
+            out_lines.append(f'{indent}subgraph {sg_id} ["{sg_label}"]')
+            continue
+
+        # Normalize inline -- "label" --> or -- label --> into -->|"label"|
+        stmt = re.sub(
+            r'--\s*"([^"]+)"\s*-->',
+            lambda m: f'-->|"{_clean_mermaid_label(m.group(1), is_edge=True)}"|',
+            stripped,
+        )
+        stmt = re.sub(
+            r"-\.\s*\"([^\"]+)\"\s*\.->",
+            lambda m: f'-.->|"{_clean_mermaid_label(m.group(1), is_edge=True)}"|',
+            stmt,
+        )
+
+        # Normalize bidirectional arrows (<-->, <-.->, <==>) to standard arrows (Mermaid flowchart chokes on <--> with labels)
+        stmt = stmt.replace("<-->", "-->").replace("<-.->", "-.->").replace("<==>", "==>")
+
+        # Clean any |...| edge labels
+        stmt = re.sub(
+            r'\|\s*"?([^"|]*)"?\s*\|',
+            lambda m: f'|"{_clean_mermaid_label(m.group(1), is_edge=True)}"|',
+            stmt,
+        )
+
+        # Clean any node definitions ID["Label"] or ID[Label]
+        def _replace_node_def(m: re.Match) -> str:
+            n_id = _safe_mermaid_id(m.group(1), prefix="n_")
+            n_lbl = _clean_mermaid_label(m.group(2), is_edge=False)
+            return f'{n_id}["{n_lbl}"]'
+
+        stmt = re.sub(r'([A-Za-z0-9_]+)\s*\[\s*"([^"]*)"\s*\]', _replace_node_def, stmt)
+        stmt = re.sub(r'([A-Za-z0-9_]+)\s*\[\s*([^"\[\]]+)\s*\]', _replace_node_def, stmt)
+
+        # Attach any |...| edge label directly to its preceding arrow token (Mermaid requires -->|label| with no space before |)
+        stmt = re.sub(r'(-\.->|==>|--+>)\s+(\|"[^"]*"\|)', r"\1\2", stmt)
+
+        # Ensure spacing before arrow tokens and after arrow(+label) tokens
+        stmt = re.sub(
+            r'(?<!\s)((?:-\.->|==>|--+>)(?:\|"[^"]*"\|)?)',
+            r" \1",
+            stmt,
+        )
+        stmt = re.sub(
+            r'((?:-\.->|==>|--+>)(?:\|"[^"]*"\|)?)(?!\s|\|)',
+            r"\1 ",
+            stmt,
+        )
+        stmt = re.sub(r"\s+", " ", stmt).strip()
+
+        # Split chained arrows (e.g. A --> B --> C) into individual lines
+        tokens = re.split(
+            r'\s+((?:-\.->|==>|--+>)(?:\|"[^"]*"\|)?)\s+',
+            stmt,
+        )
+        if len(tokens) >= 5 and len(tokens) % 2 == 1:
+            for idx in range(0, len(tokens) - 2, 2):
+                left_tok = tokens[idx].strip()
+                arrow_tok = tokens[idx + 1].strip()
+                right_tok = tokens[idx + 2].strip()
+                if idx > 0:
+                    # Use only the node ID on the left of subsequent chained edges if it was already defined
+                    m_id = re.match(r"^([A-Za-z0-9_]+)", left_tok)
+                    if m_id:
+                        left_tok = _safe_mermaid_id(m_id.group(1), prefix="n_")
+                out_lines.append(f"{indent}{left_tok} {arrow_tok} {right_tok}")
+        else:
+            out_lines.append(f"{indent}{stmt}")
+
+    return "\n".join(out_lines)
+
+
+def render_cliffs_notes_markdown(session: Dict[str, Any]) -> str:
+    pr = session.get("pr") or {}
+    cn = session.get("cliffsNotes") or {}
+    lines: List[str] = []
+    pr_num = pr.get("number")
+    title = pr.get("title") or "Local Branch Diff"
+    url = pr.get("url") or ""
+    author = pr.get("author") or "local"
+
+    lines.append(f"# 📖 Quasar CliffsNotes: PR #{pr_num} — {title}" if pr_num else f"# 📖 Quasar CliffsNotes: {title}")
+    if url:
+        lines.append(f"**PR**: [#{pr_num}]({url}) • **Author**: `@{author}` • **Diff**: `+{pr.get('additions', 0)} / -{pr.get('deletions', 0)}` across `{pr.get('changedFilesCount', 0)}` files")
+    else:
+        head_ref = pr.get("headRefName") or "HEAD"
+        base_ref = pr.get("baseRefName") or "main"
+        repo_name = pr.get("repo") or ""
+        lines.append(
+            f"**Branch**: `{head_ref}` → `{base_ref}` • **Repo**: `{repo_name}` • **Author**: `{author}` • **Diff**: `+{pr.get('additions', 0)} / -{pr.get('deletions', 0)}` across `{pr.get('changedFilesCount', 0)}` files"
+        )
+    lines.append("")
+
+    if session.get("analysisStatus") == "analyzing":
+        lines.append("> [!NOTE]")
+        lines.append("> **Deep Analysis in Progress**: Initial file snapshots and diff tour are ready now. Quasar's specialist review lenses (`review-architect`, `review-bug-hunter`, `review-test-critic`, `review-advocate`) are synthesizing deep CliffsNotes and candidate findings...")
+        lines.append("")
+
+    lines.append("## ⚡ At-a-Glance Summary")
+    lines.append(cn.get("whatAndWhy") or cn.get("tldr") or "")
+    lines.append("")
+
+    if cn.get("architectureDiagram"):
+        lines.append("## 🧭 Architecture & Data Flow")
+        diag = sanitize_mermaid_diagram(cn["architectureDiagram"])
+        lines.append("```mermaid")
+        lines.append(diag)
+        lines.append("```")
+        lines.append("")
+
+    if cn.get("keySymbols"):
+        lines.append("## 🗂️ Key Symbols & Files (Character List)")
+        lines.append("| Symbol / File | Role in This Change |")
+        lines.append("| :--- | :--- |")
+        for sym in cn["keySymbols"]:
+            lines.append(f"| `{sym.get('name', '')}` | {sym.get('role', '')} |")
+        lines.append("")
+
+    if cn.get("designTradeoffs"):
+        lines.append("## ⚖️ Key Design Decisions & Trade-offs")
+        for td in cn["designTradeoffs"]:
+            lines.append(f"- {td}")
+        lines.append("")
+
+    lines.append("## 📚 Chapter-by-Chapter Reading Guide")
+    for ch in session.get("chapters") or []:
+        lines.append(f"### {ch.get('title')}")
+        if ch.get("summary"):
+            lines.append(f"*{ch.get('summary')}*")
+            lines.append("")
+        for b in ch.get("cliffsNotesBullets") or []:
+            lines.append(f"- {b}")
+        lines.append("")
+        for stop in ch.get("stops") or []:
+            head_path = stop.get("headSnapshotPath") or stop.get("localWorkspacePath") or stop.get("path")
+            start_l = stop.get("startLine", 1)
+            end_l = stop.get("endLine", start_l)
+            lines.append(
+                f"1. **[{stop.get('stopNumber')}] [{stop.get('title')}](file://{head_path}#L{start_l}-L{end_l})** — {stop.get('cliffsNotes') or stop.get('description')}"
+            )
+            if stop.get("whyItChanged"):
+                lines.append(f"   - *Why it changed*: {stop['whyItChanged']}")
+            if stop.get("callersAndInvariants"):
+                lines.append(f"   - *Context & Invariants*: {stop['callersAndInvariants']}")
+        lines.append("")
+
+    if session.get("coverageMatrix"):
+        lines.append("## 🧪 Test Coverage & Hygiene Matrix")
+        lines.append("| Behavior / Change | Verification Status | Notes |")
+        lines.append("| :--- | :--- | :--- |")
+        for row in session["coverageMatrix"]:
+            lines.append(f"| {row.get('behavior', '')} | {row.get('status', '')} | {row.get('notes', '')} |")
+        lines.append("")
+
+    uncertain_threads = [
+        t
+        for t in (session.get("threads") or [])
+        if t.get("status") == "uncertain"
+    ]
+    if uncertain_threads:
+        lines.append("## 🤔 Uncertain Feedback — Needs Your Preference Calibration")
+        lines.append(
+            "> Quasar found borderline or preference-dependent feedback below. Click **Calibrate Preference** on the inline comment thread (or in the **Review Comments & Cart** sidebar) to tell Quasar whether to flag or skip patterns like this in future reviews."
+        )
+        lines.append("")
+        for idx, t in enumerate(uncertain_threads, 1):
+            head_path = os.path.join(session.get("headSnapshotRoot", ""), t.get("path", ""))
+            start_l = t.get("startLine", 1)
+            end_l = t.get("endLine", start_l)
+            lines.append(f"### ❓ #{idx} [🤔 Preference Check] {t.get('title', 'Uncertain Finding')}")
+            lines.append(f"- **Location**: [{t.get('path')}:L{start_l}-{end_l}](file://{head_path}#L{start_l}-L{end_l})")
+            if t.get("uncertaintyQuestion"):
+                lines.append(f"- **Preference Question**: **{t['uncertaintyQuestion']}**")
+            if t.get("whyItMatters"):
+                lines.append(f"- **Trade-off Context**: {t['whyItMatters']}")
+            lines.append("- **Candidate Draft Comment**:")
+            lines.append(f"  > {t.get('draftComment', '')}")
+            lines.append("")
+
+    candidate_threads = [
+        t
+        for t in (session.get("threads") or [])
+        if t.get("kind") in ("ai_candidate", "user_staged") and t.get("status") not in ("uncertain", "dismissed")
+    ]
+    if candidate_threads:
+        lines.append("## 🎯 Curated Review Comments")
+        for idx, t in enumerate(candidate_threads, 1):
+            head_path = os.path.join(session.get("headSnapshotRoot", ""), t.get("path", ""))
+            start_l = t.get("startLine", 1)
+            end_l = t.get("endLine", start_l)
+            sev = t.get("severity", "DESIGN")
+            badge = "🔴 Blocking" if "BLOCK" in sev.upper() else ("🟡 Design" if "DESIGN" in sev.upper() else "🟢 Nit")
+            lines.append(f"### #{idx} [{badge}] {t.get('title', 'Review Finding')}")
+            lines.append(f"- **Location**: [{t.get('path')}:L{start_l}-{end_l}](file://{head_path}#L{start_l}-L{end_l})")
+            if t.get("whyItMatters"):
+                lines.append(f"- **CliffsNotes Context (For You)**: {t['whyItMatters']}")
+            lines.append("- **Draft Review Comment**:")
+            lines.append(f"  > {t.get('draftComment', '')}")
+            lines.append("")
+
+    existing_gh_threads = [
+        t
+        for t in (session.get("threads") or [])
+        if t.get("kind") == "github_existing" and t.get("status") != "dismissed"
+    ]
+    if existing_gh_threads:
+        lines.append("## 💬 Existing GitHub PR Comments (Triage & Recommendations)")
+        lines.append("| Assessment | Location | Comment & Quasar Triage |")
+        lines.append("| :--- | :--- | :--- |")
+        for t in existing_gh_threads:
+            head_path = os.path.join(session.get("headSnapshotRoot", ""), t.get("path", ""))
+            start_l = t.get("startLine", 1)
+            end_l = t.get("endLine", start_l)
+            badge = (
+                "✅ Fixed"
+                if t.get("status") == "fixed"
+                else (t.get("triageBadge") or "👀 Needs Attention")
+            )
+            summary_note = (
+                t.get("fixedSummary")
+                if t.get("status") == "fixed"
+                else (t.get("triageSummary") or t.get("whyItMatters") or "")
+            )
+            title_clean = (t.get("title") or "GitHub Comment").replace("|", "\\|")
+            summary_clean = summary_note.replace("|", "\\|").replace("\n", " ")
+            lines.append(
+                f"| **{badge}** | [{os.path.basename(t.get('path', ''))}:L{start_l}](file://{head_path}#L{start_l}-L{end_l}) | **{title_clean}** — {summary_clean} |"
+            )
+        lines.append("")
+
+    prefs = session.get("reviewerPreferences") or {}
+    if prefs.get("activeRulesCount", 0) > 0:
+        lines.append("## 🧠 Learned Reviewer Preferences Applied")
+        for r in prefs.get("preferRules") or []:
+            lines.append(f"- ✅ **Prefer/Flag**: {r}")
+        for r in prefs.get("avoidRules") or []:
+            lines.append(f"- 🚫 **Avoid/Skip**: {r}")
+        for r in prefs.get("customRules") or []:
+            lines.append(f"- 📌 **Guideline**: {r}")
+        lines.append("")
+
+    if session.get("dismissedChecks"):
+        lines.append("## ✅ Checked & Dismissed (Verified Safe)")
+        for item in session["dismissedChecks"]:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def is_github_pr_arg(pr_arg: Optional[str]) -> bool:
+    if not pr_arg:
+        return False
+    s = pr_arg.strip()
+    if re.search(r"github\.com/[^/]+/[^/]+/pull/\d+", s):
+        return True
+    if re.match(r"^#?\d+$", s):
+        return True
+    return False
+
+
+def resolve_local_repo_dir(provided_dir: Optional[str], branch_hint: Optional[str] = None) -> str:
+    """Finds the git repository root for a local branch review."""
+    if provided_dir:
+        expanded = os.path.abspath(os.path.expanduser(provided_dir))
+        if os.path.isdir(expanded):
+            top = run_cmd(["git", "rev-parse", "--show-toplevel"], cwd=expanded, check=False)
+            if top.returncode == 0 and top.stdout.strip():
+                return top.stdout.strip()
+
+    cwd_top = run_cmd(["git", "rev-parse", "--show-toplevel"], cwd=os.getcwd(), check=False)
+    cwd_repo = cwd_top.stdout.strip() if cwd_top.returncode == 0 and cwd_top.stdout.strip() else None
+
+    if cwd_repo and (not branch_hint or branch_hint == "HEAD"):
+        return cwd_repo
+
+    if cwd_repo and branch_hint:
+        verify = run_cmd(["git", "rev-parse", "--verify", "--quiet", branch_hint], cwd=cwd_repo, check=False)
+        if verify.returncode == 0:
+            return cwd_repo
+
+    # Search common workspace directories if branch_hint lives in another local repo
+    home = os.path.expanduser("~")
+    search_roots = [
+        os.path.join(home, "work"),
+        os.path.join(home, "dev"),
+        os.path.join(home, "src"),
+        os.path.join(home, "projects"),
+    ]
+    for root in search_roots:
+        if not os.path.isdir(root):
+            continue
+        try:
+            for entry in os.scandir(root):
+                if not entry.is_dir():
+                    continue
+                if os.path.isdir(os.path.join(entry.path, ".git")):
+                    if branch_hint and branch_hint != "HEAD":
+                        v = run_cmd(
+                            ["git", "rev-parse", "--verify", "--quiet", branch_hint],
+                            cwd=entry.path,
+                            check=False,
+                        )
+                        if v.returncode == 0:
+                            return os.path.abspath(entry.path)
+        except Exception:
+            pass
+
+    return cwd_repo or os.path.abspath(provided_dir or os.getcwd())
+
+
+def detect_base_ref(repo_dir: str, explicit_base: Optional[str], head_ref: str) -> str:
+    """Detects the best base branch (e.g. upstream/main, origin/main, main) to diff against."""
+    if explicit_base and explicit_base != "auto":
+        v = run_cmd(["git", "rev-parse", "--verify", "--quiet", explicit_base], cwd=repo_dir, check=False)
+        if v.returncode == 0:
+            return explicit_base
+
+    candidates: List[str] = []
+    for sym in ["refs/remotes/upstream/HEAD", "refs/remotes/origin/HEAD"]:
+        res = run_cmd(["git", "symbolic-ref", "--quiet", "--short", sym], cwd=repo_dir, check=False)
+        if res.returncode == 0 and res.stdout.strip():
+            candidates.append(res.stdout.strip())
+
+    for fallback in [
+        "upstream/main",
+        "origin/main",
+        "main",
+        "upstream/master",
+        "origin/master",
+        "master",
+        "origin/develop",
+        "develop",
+    ]:
+        if fallback not in candidates:
+            candidates.append(fallback)
+
+    valid_candidates: List[Tuple[int, str]] = []
+    for cand in candidates:
+        v = run_cmd(["git", "rev-parse", "--verify", "--quiet", cand], cwd=repo_dir, check=False)
+        if v.returncode != 0:
+            continue
+        mb = run_cmd(["git", "merge-base", cand, head_ref], cwd=repo_dir, check=False)
+        if mb.returncode == 0 and mb.stdout.strip():
+            cnt_res = run_cmd(
+                ["git", "rev-list", "--count", f"{mb.stdout.strip()}..{head_ref}"],
+                cwd=repo_dir,
+                check=False,
+            )
+            if cnt_res.returncode == 0 and cnt_res.stdout.strip().isdigit():
+                cnt = int(cnt_res.stdout.strip())
+                valid_candidates.append((cnt, cand))
+
+    # Prefer the base branch with the fewest positive commits since branching (most direct ancestor)
+    positive = [ item for item in valid_candidates if item[0] > 0 ]
+    if positive:
+        positive.sort(key=lambda x: x[0])
+        return positive[0][1]
+
+    if valid_candidates:
+        return valid_candidates[0][1]
+
+    return explicit_base or "HEAD~1"
+
+
+def detect_pr_ownership(metadata: Dict[str, Any], repo_dir: str) -> Tuple[bool, str]:
+    """Determines whether the active PR or branch is owned by the current user."""
+    if metadata.get("mode") == "local_branch" or not metadata.get("number"):
+        return True, "local_branch"
+
+    author = (metadata.get("author") or "").strip().lower()
+    head_ref = (metadata.get("headRefName") or "").strip()
+    head_sha = (metadata.get("headSha") or "").strip()
+
+    if repo_dir and os.path.isdir(os.path.join(repo_dir, ".git")):
+        cur_branch = run_cmd(["git", "branch", "--show-current"], cwd=repo_dir, check=False).stdout.strip()
+        if cur_branch and head_ref and cur_branch == head_ref:
+            return True, f"checked_out_branch ({cur_branch})"
+        cur_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo_dir, check=False).stdout.strip()
+        if cur_sha and head_sha and cur_sha == head_sha:
+            return True, "checked_out_head_sha"
+
+    candidate_identities = set()
+    for env_key in ["GITHUB_USER", "GH_USER", "USER", "LOGNAME"]:
+        val = (os.environ.get(env_key) or "").strip().lower()
+        if val:
+            candidate_identities.add(val)
+
+    home_user = os.path.basename(os.path.expanduser("~")).strip().lower()
+    if home_user:
+        candidate_identities.add(home_user)
+
+    if repo_dir and os.path.isdir(repo_dir):
+        for cfg_key in ["github.user", "user.name", "user.email"]:
+            val = run_cmd(["git", "config", cfg_key], cwd=repo_dir, check=False).stdout.strip().lower()
+            if val:
+                candidate_identities.add(val)
+                candidate_identities.add(re.sub(r"[^a-z0-9]", "", val))
+                if "@" in val:
+                    local_part = val.split("@", 1)[0]
+                    candidate_identities.add(local_part)
+                    candidate_identities.add(re.sub(r"[^a-z0-9]", "", local_part))
+
+    stored_login = (load_stored_github_auth().get("login") or "").strip().lower()
+    if stored_login:
+        candidate_identities.add(stored_login)
+
+    gh = find_gh_binary()
+    if gh:
+        try:
+            res = subprocess.run([gh, "api", "user", "--jq", ".login"], capture_output=True, text=True, timeout=4)
+            if res.returncode == 0 and res.stdout.strip():
+                candidate_identities.add(res.stdout.strip().lower())
+        except Exception:
+            pass
+
+    if author:
+        norm_author = re.sub(r"[^a-z0-9]", "", author)
+        if author in candidate_identities or (norm_author and norm_author in candidate_identities):
+            return True, f"author_match (@{metadata.get('author')})"
+
+    return False, "external_pr"
+
+
+def inspect_local_repo_branch_state(metadata: Dict[str, Any], repo_dir: str) -> Dict[str, Any]:
+    """Checks whether `repo_dir` is a matching local clone for this PR and what branch is currently checked out."""
+    owner = str(metadata.get("owner") or "").strip()
+    repo = str(metadata.get("repo") or "").strip()
+    pr_num = int(metadata.get("number") or 0)
+    head_ref = str(metadata.get("headBranch") or metadata.get("headRefName") or "").replace(" + working tree", "").strip()
+    is_owned = bool(metadata.get("isOwnedByUser"))
+
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return {
+            "hasMatchingLocalClone": False,
+            "localCurrentBranch": "",
+            "isOnPrBranch": False,
+            "hasUncommittedChanges": False,
+            "needsBranchSwitch": False,
+        }
+
+    is_matching_clone = True if owner == "local" or not pr_num else repo_matches_remote(repo_dir, owner, repo)
+    cur_branch = run_cmd(["git", "branch", "--show-current"], cwd=repo_dir, check=False).stdout.strip()
+    has_uncommitted = bool(
+        run_cmd(["git", "status", "--porcelain", "--untracked-files=no"], cwd=repo_dir, check=False).stdout.strip()
+    )
+    is_on_pr_branch = bool(head_ref and cur_branch and cur_branch == head_ref)
+    needs_switch = bool(
+        is_owned
+        and pr_num > 0
+        and is_matching_clone
+        and head_ref
+        and not is_on_pr_branch
+    )
+    return {
+        "hasMatchingLocalClone": is_matching_clone,
+        "localCurrentBranch": cur_branch,
+        "isOnPrBranch": is_on_pr_branch,
+        "hasUncommittedChanges": has_uncommitted,
+        "needsBranchSwitch": needs_switch,
+    }
+
+
+def checkout_pr_branch_in_repo(
+    repo_dir: str,
+    owner: str,
+    repo: str,
+    pr_num: int,
+    head_ref: str,
+    stash_if_dirty: bool = False,
+) -> Dict[str, Any]:
+    """Switches `repo_dir` to the PR's head branch (`head_ref`), fetching it if needed."""
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return {"ok": False, "error": f"No valid git repository found at {repo_dir}"}
+    if not head_ref:
+        return {"ok": False, "error": "PR has no headRefName to check out."}
+
+    prev_branch = run_cmd(["git", "branch", "--show-current"], cwd=repo_dir, check=False).stdout.strip()
+    if prev_branch == head_ref:
+        return {
+            "ok": True,
+            "alreadyOnBranch": True,
+            "previousBranch": prev_branch,
+            "checkedOutBranch": head_ref,
+            "repoDir": repo_dir,
+        }
+
+    dirty_status = run_cmd(["git", "status", "--porcelain", "--untracked-files=no"], cwd=repo_dir, check=False).stdout.strip()
+    stashed = False
+    if dirty_status and stash_if_dirty:
+        stash_res = run_cmd(
+            ["git", "stash", "push", "-m", f"Quasar auto-stash before switching to PR #{pr_num} ({head_ref})"],
+            cwd=repo_dir,
+            check=False,
+        )
+        stashed = stash_res.returncode == 0
+
+    # 1. Check if local branch already exists
+    has_local = run_cmd(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{head_ref}"], cwd=repo_dir, check=False).returncode == 0
+    if has_local:
+        co = run_cmd(["git", "checkout", head_ref], cwd=repo_dir, check=False)
+        if co.returncode == 0:
+            return {
+                "ok": True,
+                "previousBranch": prev_branch,
+                "checkedOutBranch": head_ref,
+                "stashed": stashed,
+                "repoDir": repo_dir,
+            }
+
+    # 2. Check remote tracking branches (origin/<head_ref> or upstream/<head_ref>)
+    for remote_name in ["origin", "upstream"]:
+        has_remote_ref = (
+            run_cmd(
+                ["git", "show-ref", "--verify", "--quiet", f"refs/remotes/{remote_name}/{head_ref}"],
+                cwd=repo_dir,
+                check=False,
+            ).returncode
+            == 0
+        )
+        if has_remote_ref:
+            co = run_cmd(["git", "checkout", "-b", head_ref, "--track", f"{remote_name}/{head_ref}"], cwd=repo_dir, check=False)
+            if co.returncode == 0:
+                return {
+                    "ok": True,
+                    "previousBranch": prev_branch,
+                    "checkedOutBranch": head_ref,
+                    "stashed": stashed,
+                    "repoDir": repo_dir,
+                }
+
+    # 3. Fetch PR head ref from remote (`pull/<pr_num>/head:<head_ref>`)
+    if pr_num > 0:
+        for remote_name in ["upstream", "origin"]:
+            fetch_res = run_cmd(
+                ["git", "fetch", remote_name, f"pull/{pr_num}/head:{head_ref}"],
+                cwd=repo_dir,
+                check=False,
+            )
+            if fetch_res.returncode == 0:
+                co = run_cmd(["git", "checkout", head_ref], cwd=repo_dir, check=False)
+                if co.returncode == 0:
+                    return {
+                        "ok": True,
+                        "previousBranch": prev_branch,
+                        "checkedOutBranch": head_ref,
+                        "stashed": stashed,
+                        "repoDir": repo_dir,
+                    }
+
+    # 4. Fallback to `gh pr checkout`
+    gh = find_gh_binary()
+    if gh and pr_num > 0:
+        gh_co = run_cmd([gh, "pr", "checkout", str(pr_num)], cwd=repo_dir, check=False)
+        if gh_co.returncode == 0:
+            now_branch = run_cmd(["git", "branch", "--show-current"], cwd=repo_dir, check=False).stdout.strip() or head_ref
+            return {
+                "ok": True,
+                "previousBranch": prev_branch,
+                "checkedOutBranch": now_branch,
+                "stashed": stashed,
+                "repoDir": repo_dir,
+            }
+
+    err_detail = (
+        "Uncommitted changes in working tree prevented branch checkout."
+        if dirty_status and not stashed
+        else f"Could not check out branch '{head_ref}' in {repo_dir}."
+    )
+    return {
+        "ok": False,
+        "hasUncommittedChanges": bool(dirty_status and not stashed),
+        "error": err_detail,
+        "repoDir": repo_dir,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Collect PR or branch context and initialize Quasar.")
+    parser.add_argument("--pr", help="GitHub PR number or URL (or local branch name/path)")
+    parser.add_argument("--branch", help="Local branch name or git ref to review (e.g. feature/foo or HEAD)")
+    parser.add_argument("--base", default=None, help="Base git ref when reviewing a local branch (auto-detected if omitted)")
+    parser.add_argument("--head", default=None, help="Head git ref when reviewing a local branch (defaults to --branch or HEAD)")
+    parser.add_argument("--committed-only", action="store_true", help="Only include committed changes on the branch, ignoring uncommitted working-tree edits")
+    parser.add_argument("--checkout-pr-branch", action="store_true", help="Switch the local repository to the active PR's head branch")
+    parser.add_argument("--stash-if-dirty", action="store_true", help="Auto-stash uncommitted changes if needed when switching to the PR branch")
+    parser.add_argument("--repo-dir", default=None, help="Repository root directory (auto-detected if omitted)")
+    parser.add_argument("--workspace-dir", default=None, help="Window workspace directory that owns this Quasar session (defaults to QUASAR_WORKSPACE_DIR or cwd)")
+    parser.add_argument("--output-dir", help="Optional directory to write diff and metadata files")
+    args = parser.parse_args()
+
+    os.makedirs(REVIEW_STATE_DIR, exist_ok=True)
+    ws_root = resolve_workspace_root(args.workspace_dir)
+    state_dir, active_session_path, cliffs_notes_md_path = get_session_paths(args.workspace_dir)
+    os.makedirs(state_dir, exist_ok=True)
+
+    if args.checkout_pr_branch:
+        if not os.path.isfile(active_session_path):
+            print(json.dumps({"ok": False, "error": f"No active session found at {active_session_path}"}))
+            sys.exit(1)
+        with open(active_session_path, "r", encoding="utf-8") as sf:
+            sess = json.load(sf)
+        pr_meta = sess.get("pr") or {}
+        r_dir = args.repo_dir or sess.get("repoDir") or ws_root
+        owner = str(pr_meta.get("owner") or "")
+        repo = str(pr_meta.get("repo") or "")
+        pr_num = int(pr_meta.get("number") or 0)
+        head_ref = str(pr_meta.get("headBranch") or pr_meta.get("headRefName") or "").replace(" + working tree", "").strip()
+        res = checkout_pr_branch_in_repo(
+            repo_dir=r_dir,
+            owner=owner,
+            repo=repo,
+            pr_num=pr_num,
+            head_ref=head_ref,
+            stash_if_dirty=args.stash_if_dirty,
+        )
+        if res.get("ok"):
+            pr_meta["localCurrentBranch"] = res.get("checkedOutBranch") or head_ref
+            pr_meta["isOnPrBranch"] = True
+            pr_meta["needsBranchSwitch"] = False
+            sess["pr"] = pr_meta
+            with open(active_session_path, "w", encoding="utf-8") as sf:
+                json.dump(sess, sf, indent=2)
+            ctx_path = os.path.join(state_dir, "pr_context.json")
+            if os.path.isfile(ctx_path):
+                try:
+                    with open(ctx_path, "r", encoding="utf-8") as cf:
+                        ctx_data = json.load(cf)
+                    if isinstance(ctx_data.get("pr_metadata"), dict):
+                        ctx_data["pr_metadata"]["localCurrentBranch"] = pr_meta["localCurrentBranch"]
+                        ctx_data["pr_metadata"]["isOnPrBranch"] = True
+                        ctx_data["pr_metadata"]["needsBranchSwitch"] = False
+                        with open(ctx_path, "w", encoding="utf-8") as cf:
+                            json.dump(ctx_data, cf, indent=2)
+                except Exception:
+                    pass
+        print(json.dumps(res, indent=2))
+        if not res.get("ok"):
+            sys.exit(1)
+        return
+
+    # Support passing a local branch, range, or repo path via --pr or --branch
+    pr_arg = args.pr
+    branch_arg = args.branch or args.head
+    repo_dir_arg = args.repo_dir
+    base_arg = args.base
+
+    if pr_arg and not is_github_pr_arg(pr_arg):
+        branch_arg = pr_arg.strip()
+        pr_arg = None
+
+    # Support `/path/to/repo#branch` or `/path/to/repo:branch` or `/path/to/repo`
+    if branch_arg:
+        for sep in ["#", ":"]:
+            if sep in branch_arg and os.path.isdir(os.path.expanduser(branch_arg.split(sep, 1)[0])):
+                repo_dir_arg, branch_arg = branch_arg.split(sep, 1)
+                break
+        if os.path.isdir(os.path.expanduser(branch_arg)):
+            repo_dir_arg = os.path.expanduser(branch_arg)
+            branch_arg = "HEAD"
+        # Support range syntax `base...head` or `base..head`
+        if "..." in branch_arg:
+            b_part, h_part = branch_arg.split("...", 1)
+            base_arg = base_arg or b_part.strip()
+            branch_arg = h_part.strip() or "HEAD"
+        elif ".." in branch_arg:
+            b_part, h_part = branch_arg.split("..", 1)
+            base_arg = base_arg or b_part.strip()
+            branch_arg = h_part.strip() or "HEAD"
+
+    if pr_arg:
+        owner, repo, pr_num = infer_owner_repo(pr_arg, repo_dir_arg or os.getcwd())
+        repo_dir = auto_detect_repo_dir(owner, repo, repo_dir_arg)
+        metadata, comments, files_list, diff_text = fetch_pr_via_rest(owner, repo, pr_num)
+        session_id = f"{owner}-{repo}-pr-{pr_num}"
+        base_root, head_root = materialize_snapshots(
+            session_id=session_id,
+            owner=owner,
+            repo=repo,
+            base_sha=metadata.get("baseSha") or "",
+            head_sha=metadata.get("headSha") or "",
+            files_list=files_list,
+            repo_dir=repo_dir,
+        )
+    else:
+        head_ref = (branch_arg or "HEAD").strip()
+        repo_dir = resolve_local_repo_dir(repo_dir_arg, head_ref)
+        repo_name = os.path.basename(repo_dir)
+
+        current_branch = run_cmd(["git", "branch", "--show-current"], cwd=repo_dir, check=False).stdout.strip()
+        if head_ref == "HEAD":
+            head_branch_name = current_branch or "HEAD"
+        else:
+            abbrev = run_cmd(["git", "rev-parse", "--abbrev-ref", head_ref], cwd=repo_dir, check=False)
+            head_branch_name = abbrev.stdout.strip() if abbrev.returncode == 0 and abbrev.stdout.strip() else head_ref
+
+        head_sha = run_cmd(["git", "rev-parse", head_ref], cwd=repo_dir).stdout.strip()
+        base_ref = detect_base_ref(repo_dir, base_arg, head_ref)
+        mb_res = run_cmd(["git", "merge-base", base_ref, head_sha], cwd=repo_dir, check=False)
+        merge_base_sha = (
+            mb_res.stdout.strip()
+            if mb_res.returncode == 0 and mb_res.stdout.strip()
+            else run_cmd(["git", "rev-parse", base_ref], cwd=repo_dir, check=False).stdout.strip()
+        )
+
+        has_uncommitted = bool(
+            run_cmd(["git", "status", "--porcelain", "--untracked-files=no"], cwd=repo_dir, check=False).stdout.strip()
+        )
+        head_current_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo_dir, check=False).strip() if hasattr(run_cmd(["git", "rev-parse", "HEAD"], cwd=repo_dir, check=False), "strip") else run_cmd(["git", "rev-parse", "HEAD"], cwd=repo_dir, check=False).stdout.strip()
+        is_checked_out = head_ref == "HEAD" or (current_branch and head_ref == current_branch) or (head_sha == head_current_sha and head_ref == head_branch_name)
+        use_working_tree = bool(is_checked_out and has_uncommitted and not args.committed_only)
+
+        # If merge_base equals head_sha and working tree is clean, diff against parent commit so single-commit review works
+        if merge_base_sha == head_sha and not use_working_tree:
+            parent_res = run_cmd(["git", "rev-parse", "--verify", "--quiet", f"{head_ref}~1"], cwd=repo_dir, check=False)
+            if parent_res.returncode == 0 and parent_res.stdout.strip():
+                merge_base_sha = parent_res.stdout.strip()
+                base_ref = f"{head_branch_name}~1"
+
+        diff_target_args = [merge_base_sha] if use_working_tree else [merge_base_sha, head_sha]
+        diff_text = run_cmd(["git", "diff", *diff_target_args], cwd=repo_dir).stdout
+        numstat = run_cmd(["git", "diff", "--numstat", *diff_target_args], cwd=repo_dir).stdout
+        name_status_out = run_cmd(["git", "diff", "--name-status", *diff_target_args], cwd=repo_dir).stdout
+
+        status_map: Dict[str, Tuple[str, Optional[str]]] = {}
+        for ns_line in name_status_out.strip().splitlines():
+            ns_parts = ns_line.split("\t")
+            if len(ns_parts) >= 2:
+                code = ns_parts[0].strip()
+                if code.startswith("R") and len(ns_parts) >= 3:
+                    status_map[ns_parts[2]] = ("modified", ns_parts[1])
+                elif code.startswith("A"):
+                    status_map[ns_parts[1]] = ("added", None)
+                elif code.startswith("D"):
+                    status_map[ns_parts[1]] = ("removed", None)
+                else:
+                    status_map[ns_parts[1]] = ("modified", None)
+
+        files_list = []
+        for line in numstat.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                rel_p = parts[2]
+                # Handle rename paths like `old => new` in numstat by matching name-status if needed
+                if " => " in rel_p and rel_p not in status_map:
+                    rel_p = re.sub(r"\{([^}]*) => ([^}]*)\}", r"\2", rel_p)
+                    if " => " in rel_p:
+                        rel_p = rel_p.split(" => ")[-1]
+                file_status, prev_path = status_map.get(rel_p, ("modified", None))
+                file_patch = run_cmd(["git", "diff", *diff_target_args, "--", rel_p], cwd=repo_dir, check=False).stdout
+                s_line, e_line = parse_first_changed_line(file_patch)
+                f_entry: Dict[str, Any] = {
+                    "path": rel_p,
+                    "status": file_status,
+                    "added": int(parts[0]) if parts[0].isdigit() else 0,
+                    "deleted": int(parts[1]) if parts[1].isdigit() else 0,
+                    "firstChangedStartLine": s_line,
+                    "firstChangedEndLine": e_line,
+                    "hunks": parse_all_hunks(file_patch),
+                }
+                if prev_path:
+                    f_entry["previousPath"] = prev_path
+                files_list.append(f_entry)
+
+        git_author = (
+            run_cmd(["git", "log", "-1", "--format=%an", head_sha], cwd=repo_dir, check=False).stdout.strip()
+            or run_cmd(["git", "config", "user.name"], cwd=repo_dir, check=False).stdout.strip()
+            or "local"
+        )
+        commit_log = run_cmd(
+            ["git", "log", "--no-merges", "--pretty=format:- %s (%h)", f"{merge_base_sha}..{head_sha}"],
+            cwd=repo_dir,
+            check=False,
+        ).stdout.strip()
+        latest_subject = run_cmd(
+            ["git", "log", "-1", "--pretty=format:%s", head_sha],
+            cwd=repo_dir,
+            check=False,
+        ).stdout.strip()
+
+        wt_suffix = " + working tree" if use_working_tree else ""
+        branch_title = (
+            f"{head_branch_name}{wt_suffix}: {latest_subject}"
+            if latest_subject and merge_base_sha != head_sha
+            else f"Local Branch {head_branch_name}{wt_suffix} (vs {base_ref})"
+        )
+        body_parts = []
+        if commit_log:
+            body_parts.append(f"Commits on `{head_branch_name}` (since `{base_ref}`):\n{commit_log}")
+        if use_working_tree:
+            body_parts.append("Includes uncommitted working-tree changes.")
+
+        safe_branch_slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", head_branch_name).strip("-") or "head"
+        session_id = f"local-{repo_name}-{safe_branch_slug}"
+
+        metadata = {
+            "mode": "local_branch",
+            "owner": "local",
+            "repo": repo_name,
+            "number": 0,
+            "title": branch_title,
+            "url": "",
+            "state": "local",
+            "author": git_author,
+            "baseRefName": base_ref,
+            "baseSha": merge_base_sha,
+            "headRefName": f"{head_branch_name}{wt_suffix}",
+            "headBranch": head_branch_name,
+            "headSha": head_sha,
+            "includesWorkingTree": use_working_tree,
+            "additions": sum(f["added"] for f in files_list),
+            "deletions": sum(f["deleted"] for f in files_list),
+            "changedFilesCount": len(files_list),
+            "body": "\n\n".join(body_parts),
+        }
+        comments = []
+        base_root, head_root = materialize_snapshots(
+            session_id=session_id,
+            owner="local",
+            repo=repo_name,
+            base_sha=merge_base_sha,
+            head_sha=head_sha,
+            files_list=files_list,
+            repo_dir=repo_dir,
+            use_working_tree_head=use_working_tree,
+        )
+
+    is_owned, own_reason = detect_pr_ownership(metadata, repo_dir)
+    metadata["isOwnedByUser"] = is_owned
+    metadata["ownershipReason"] = own_reason
+    metadata.update(inspect_local_repo_branch_state(metadata, repo_dir))
+
+    categorized_files: Dict[str, List[Dict[str, Any]]] = {
+        "core_source": [],
+        "test": [],
+        "generated_or_fixture": [],
+        "docs_or_config": [],
+    }
+    for f in files_list:
+        cat = classify_file(f["path"])
+        categorized_files[cat].append(f)
+
+    prefs_for_context: Dict[str, Any] = {}
+    try:
+        from manage_preferences import build_prompt_summary, load_preferences
+
+        prefs_for_context = build_prompt_summary(load_preferences(), metadata.get("repo"))
+    except Exception:
+        prefs_for_context = {}
+
+    summary: Dict[str, Any] = {
+        "mode": "pr" if pr_arg else "local_branch",
+        "session_id": session_id,
+        "workspace_dir": ws_root,
+        "state_dir": state_dir,
+        "repo_dir": repo_dir,
+        "base_snapshot_root": base_root,
+        "head_snapshot_root": head_root,
+        "pr_metadata": metadata,
+        "reviewer_preferences": prefs_for_context,
+        "existing_comments": comments,
+        "categorized_files": categorized_files,
+    }
+
+    out_dir = os.path.abspath(args.output_dir) if args.output_dir else state_dir
+    os.makedirs(out_dir, exist_ok=True)
+    context_path = os.path.join(out_dir, "pr_context.json")
+    diff_path = os.path.join(out_dir, "pr.diff")
+    with open(context_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    with open(diff_path, "w", encoding="utf-8") as f:
+        f.write(diff_text)
+    summary["saved_context_path"] = context_path
+    summary["saved_diff_path"] = diff_path
+
+    # Write active_session.json and cliffs_notes.md inside this window's isolated workspace state_dir
+    session = build_initial_cliffs_notes_session(
+        session_id=session_id,
+        repo_dir=repo_dir,
+        metadata=metadata,
+        categorized_files=categorized_files,
+        existing_comments=comments,
+        base_root=base_root,
+        head_root=head_root,
+        output_dir=out_dir,
+    )
+    session["workspaceDir"] = ws_root
+    session["stateDir"] = state_dir
+
+    # If an active session already exists in this workspace, archive it to history before overwriting
+    if os.path.isfile(active_session_path):
+        try:
+            with open(active_session_path, "r", encoding="utf-8") as old_sf:
+                old_sess = json.load(old_sf)
+            old_md = None
+            if os.path.isfile(cliffs_notes_md_path):
+                with open(cliffs_notes_md_path, "r", encoding="utf-8") as old_mf:
+                    old_md = old_mf.read()
+            archive_review_session(old_sess, old_md)
+        except Exception:
+            pass
+
+    with open(active_session_path, "w", encoding="utf-8") as sf:
+        json.dump(session, sf, indent=2)
+    md_text = render_cliffs_notes_markdown(session)
+    with open(cliffs_notes_md_path, "w", encoding="utf-8") as mf:
+        mf.write(md_text)
+    archive_review_session(session, md_text)
+
+    summary["active_session_path"] = active_session_path
+    summary["cliffs_notes_md_path"] = cliffs_notes_md_path
+    print(json.dumps(summary, indent=2))
+
+
+if __name__ == "__main__":
+    main()
