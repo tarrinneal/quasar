@@ -148,6 +148,13 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
     session = dict(existing)
     session["updatedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     session["analysisStatus"] = payload.get("analysisStatus", "ready")
+    effort = (
+        payload.get("effortLevel")
+        or payload.get("effort_level")
+        or existing.get("effortLevel")
+        or "medium"
+    )
+    session["effortLevel"] = str(effort).lower() if str(effort).lower() in ("low", "medium", "high") else "medium"
 
     if "cliffsNotes" in payload:
         cn = dict(session.get("cliffsNotes") or {})

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="0.1.0"
+VERSION="1.1.1"
 EXT_NAME="codeium.codeium-dev-${VERSION}"
 OLD_CODEIUM_EXT_NAME="codeium.codeium-dev-1.0.0"
 OLD_EXT_NAME="antigravity.antigravity-code-review-1.0.0"
@@ -214,7 +214,7 @@ fi
 # Also sync directly into extension directories & ensure extensions.json has the entry registered
 for EXT_ROOT in "${HOME}"/.*/extensions; do
   if [ -d "${EXT_ROOT}" ] && [ -f "${EXT_ROOT}/extensions.json" ]; then
-    rm -rf "${EXT_ROOT}/${OLD_EXT_NAME}" "${EXT_ROOT}/${OLD_QUASAR_EXT_NAME}" "${EXT_ROOT}/${OLD_CODEIUM_EXT_NAME}" 2>/dev/null || true
+    rm -rf "${EXT_ROOT}/${OLD_EXT_NAME}" "${EXT_ROOT}/${OLD_QUASAR_EXT_NAME}" "${EXT_ROOT}/${OLD_CODEIUM_EXT_NAME}" "${EXT_ROOT}"/codeium.codeium-dev-* 2>/dev/null || true
     TARGET_EXT_DIR="${EXT_ROOT}/${EXT_NAME}"
     echo "==> Syncing native Quasar extension files to ${TARGET_EXT_DIR}..."
     mkdir -p "${TARGET_EXT_DIR}/media"

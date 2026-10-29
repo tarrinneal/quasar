@@ -159,15 +159,85 @@ function runPostReviewScript(args, timeout = 30000) {
   });
 }
 
+const EFFORT_LEVEL_SPECS = {
+  low: {
+    id: 'low',
+    shortLabel: '⚡ Low (Fast)',
+    badge: '⚡ Low Effort',
+    icon: '$(zap)',
+    title: '$(zap) Low Effort — Fast Single-Pass (~20–35s)',
+    description: '0 subagents • Fast direct scan for CliffsNotes tour + obvious blockers only',
+    detail:
+      'Skips multi-agent waves completely. Reads the diff in a single pass for quick comprehension and high-confidence bugs.',
+  },
+  medium: {
+    id: 'medium',
+    shortLabel: '⚖️ Medium (Balanced)',
+    badge: '⚖️ Medium Effort',
+    icon: '$(Law)',
+    title: '$( pulse ) Medium Effort — Balanced (~45–75s)',
+    description: '2 fast Flash subagents (Architect + Bug Hunter) in 1 wave',
+    detail:
+      'Runs 2 parallel Flash subagents and filters directly in a single wave — much faster than High while keeping multi-lens checks.',
+  },
+  high: {
+    id: 'high',
+    shortLabel: '🔬 High (Deep)',
+    badge: '🔬 High Effort',
+    icon: '$(beaker)',
+    title: '$(beaker) High Effort — Deep 4-Lens Pipeline (~2–4m)',
+    description: 'All 4 specialist subagents (Architect, Bug Hunter, Test Critic, Advocate)',
+    detail:
+      'Full deep codebase verification across all 4 specialist lenses for maximum thoroughness on complex PRs.',
+  },
+};
+
+function normalizeEffortLevel(val) {
+  const s = String(val || '').trim().toLowerCase();
+  if (s === 'low' || s === 'medium' || s === 'high') return s;
+  return 'medium';
+}
+
+function getEffortSpec(level) {
+  return EFFORT_LEVEL_SPECS[normalizeEffortLevel(level)] || EFFORT_LEVEL_SPECS.medium;
+}
+
 function loadReviewerPreferences() {
   try {
     if (!fs.existsSync(PREFERENCES_JSON_PATH)) {
-      return { styleProfile: {}, rules: [], categoryStats: {}, feedbackHistory: [] };
+      return { defaultEffort: 'medium', styleProfile: {}, rules: [], categoryStats: {}, feedbackHistory: [] };
     }
-    return JSON.parse(fs.readFileSync(PREFERENCES_JSON_PATH, 'utf-8'));
+    const parsed = JSON.parse(fs.readFileSync(PREFERENCES_JSON_PATH, 'utf-8'));
+    parsed.defaultEffort = normalizeEffortLevel(parsed.defaultEffort);
+    return parsed;
   } catch (_) {
-    return { styleProfile: {}, rules: [], categoryStats: {}, feedbackHistory: [] };
+    return { defaultEffort: 'medium', styleProfile: {}, rules: [], categoryStats: {}, feedbackHistory: [] };
   }
+}
+
+function getDefaultEffortLevel() {
+  const prefs = loadReviewerPreferences();
+  return normalizeEffortLevel(prefs.defaultEffort);
+}
+
+function buildEffortPromptInstruction(effortLevel) {
+  const level = normalizeEffortLevel(effortLevel);
+  if (level === 'low') {
+    return (
+      `EFFORT LEVEL: LOW (FAST SINGLE-PASS — NO SUBAGENTS). ` +
+      `Do NOT call \`invoke_subagent\`. Read \`pr_context.json\` and \`pr.diff\` directly in a single fast pass, synthesize the concise CliffsNotes Study Guide and Guided Tour plus only obvious high-confidence bugs/blockers, and immediately run \`publish_review_session.py\`.`
+    );
+  }
+  if (level === 'high') {
+    return (
+      `EFFORT LEVEL: HIGH (DEEP 4-LENS PIPELINE). ` +
+      `Run the full parallel 3-subagent wave (\`review-architect\`, \`review-bug-hunter\`, \`review-test-critic\` with \`Model: "inherit"\`) followed by thorough false-positive filtering before running \`publish_review_session.py\`.`
+    );
+  }
+  return (
+    `EFFORT LEVEL: MEDIUM (BALANCED — 2 FAST FLASH SUBAGENTS). ` +
+    `Spawn only \`review-architect\` and \`review-bug-hunter\` in a single parallel \`invoke_subagent\` call using \`Model: "flash"\` (do NOT spawn \`review-test-critic\` or a second sequential \`review-advocate\` wave), filter their findings directly, and immediately run \`publish_review_session.py\`.`
+  );
 }
 
 function runManagePreferences(args) {
@@ -430,7 +500,7 @@ function detectActiveConversationId(targetWorkspaceRoot = null, env = null) {
   return candidates.length > 0 ? resolveRootConversationId(candidates[0].id, env) : null;
 }
 
-function sendPromptToQuasar(prompt, title = 'Quasar', targetWorkspaceRoot = null) {
+function sendPromptToQuasar(prompt, title = 'Quasar', targetWorkspaceRoot = null, options = {}) {
   return new Promise((resolve) => {
     const exe = getAgentApiBinary();
     const sess = loadActiveSession();
@@ -444,6 +514,14 @@ function sendPromptToQuasar(prompt, title = 'Quasar', targetWorkspaceRoot = null
       ...lsEnv,
     };
     const convId = detectActiveConversationId(effectiveWsRoot, env);
+    const effortLevel = normalizeEffortLevel(
+      (options && options.effortLevel) || (sess && sess.effortLevel) || getDefaultEffortLevel()
+    );
+    const newConvArgs = ['new-conversation', `--title=${title}`];
+    if (effortLevel === 'low') {
+      newConvArgs.push('--model=flash');
+    }
+    newConvArgs.push(prompt);
 
     const runAgentApi = (args, cb) => {
       execFile(exe, args, { timeout: 15000, env }, (err, stdout, stderr) => {
@@ -476,11 +554,11 @@ function sendPromptToQuasar(prompt, title = 'Quasar', targetWorkspaceRoot = null
           resolve(res);
         } else {
           // Fallback to starting a new conversation if send-message to convId failed
-          runAgentApi(['new-conversation', `--title=${title}`, prompt], resolve);
+          runAgentApi(newConvArgs, resolve);
         }
       });
     } else {
-      runAgentApi(['new-conversation', `--title=${title}`, prompt], resolve);
+      runAgentApi(newConvArgs, resolve);
     }
   });
 }
@@ -831,6 +909,9 @@ class CliffsNotesTreeProvider {
     }
 
     if (!session) {
+      const defaultEffort = getDefaultEffortLevel();
+      const effortSpec = getEffortSpec(defaultEffort);
+
       const prItem = new vscode.TreeItem(
         'Review GitHub PR from URL...',
         vscode.TreeItemCollapsibleState.None
@@ -851,7 +932,21 @@ class CliffsNotesTreeProvider {
       };
       branchItem.iconPath = new vscode.ThemeIcon('git-branch');
 
-      const emptyRootItems = [prItem, branchItem];
+      const effortItem = new vscode.TreeItem(
+        `Effort Level: ${effortSpec.badge}`,
+        vscode.TreeItemCollapsibleState.None
+      );
+      effortItem.description = `${effortSpec.timeEstimate} • click to change`;
+      effortItem.tooltip = new vscode.MarkdownString(
+        `### ${effortSpec.badge} Effort (${effortSpec.timeEstimate})\n\n${effortSpec.detail}\n\n*Click to change default review effort level.*`
+      );
+      effortItem.command = {
+        command: 'quasar.selectEffortLevel',
+        title: 'Set Review Effort Level',
+      };
+      effortItem.iconPath = new vscode.ThemeIcon(effortSpec.icon);
+
+      const emptyRootItems = [prItem, branchItem, effortItem];
       if (pastReviews.length > 0) {
         const pastNode = new vscode.TreeItem(
           `Past Reviews (${pastReviews.length})`,
@@ -869,13 +964,14 @@ class CliffsNotesTreeProvider {
       const rootItems = [];
       const pr = session.pr || {};
       const isLocal = !pr.number;
+      const sessionEffortSpec = getEffortSpec(session.effortLevel || getDefaultEffortLevel());
       const prLabel = pr.number
         ? `PR #${pr.number}: ${pr.title || ''}`
         : pr.title || `Branch: ${pr.headRefName || 'HEAD'}`;
       const headerItem = new vscode.TreeItem(prLabel, vscode.TreeItemCollapsibleState.None);
       headerItem.description = isLocal
-        ? `${pr.headRefName || 'HEAD'} → ${pr.baseRefName || 'main'} • +${pr.additions || 0}/-${pr.deletions || 0}`
-        : `@${pr.author || 'author'} • +${pr.additions || 0}/-${pr.deletions || 0}`;
+        ? `${sessionEffortSpec.badge} • ${pr.headRefName || 'HEAD'} → ${pr.baseRefName || 'main'} • +${pr.additions || 0}/-${pr.deletions || 0}`
+        : `${sessionEffortSpec.badge} • @${pr.author || 'author'} • +${pr.additions || 0}/-${pr.deletions || 0}`;
       headerItem.iconPath = new vscode.ThemeIcon(
         session.analysisStatus === 'analyzing'
           ? 'sync~spin'
@@ -3616,12 +3712,75 @@ function activate(context) {
     }
   }
 
+  async function pickEffortLevelForReview(contextLabel = '') {
+    const currentDefault = getDefaultEffortLevel();
+    const order = [
+      currentDefault,
+      ...['low', 'medium', 'high'].filter((lvl) => lvl !== currentDefault),
+    ];
+    const items = order.map((lvl) => {
+      const spec = getEffortSpec(lvl);
+      const isDefault = lvl === currentDefault;
+      return {
+        label: isDefault ? `${spec.title} (Current Default)` : spec.title,
+        description: spec.description,
+        detail: spec.detail,
+        effort: lvl,
+      };
+    });
+    const picked = await vscode.window.showQuickPick(items, {
+      title: contextLabel
+        ? `Quasar Review Effort (${contextLabel})`
+        : 'Quasar: Choose Review Effort Level',
+      placeHolder: 'Press Enter for current default, or choose Low (Fast), Medium (Balanced), or High (Deep)',
+    });
+    if (!picked) return null;
+    if (picked.effort !== currentDefault) {
+      await runManagePreferences(['--set-effort', picked.effort]);
+      refreshAllUI(false);
+    }
+    return picked.effort;
+  }
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.selectEffortLevel', async () => {
+      const currentDefault = getDefaultEffortLevel();
+      const items = ['low', 'medium', 'high'].map((lvl) => {
+        const spec = getEffortSpec(lvl);
+        const isCurrent = lvl === currentDefault;
+        return {
+          label: isCurrent ? `$(check) ${spec.title} (Active Default)` : spec.title,
+          description: spec.description,
+          detail: spec.detail,
+          effort: lvl,
+        };
+      });
+      const picked = await vscode.window.showQuickPick(items, {
+        title: 'Quasar: Set Default Review Effort Level',
+        placeHolder: 'Low = fast single-pass (0 subagents) • Medium = 2 fast Flash subagents • High = 4 deep lenses',
+      });
+      if (!picked) return;
+      await runManagePreferences(['--set-effort', picked.effort]);
+      const session = loadActiveSession();
+      if (session) {
+        session.effortLevel = picked.effort;
+        saveActiveSession(session);
+      }
+      refreshAllUI(false);
+      const chosenSpec = getEffortSpec(picked.effort);
+      vscode.window.showInformationMessage(
+        `Quasar default effort set to ${chosenSpec.shortLabel} (${chosenSpec.description}).`
+      );
+    })
+  );
+
   // 0. Quick Menu & Sidebar Launcher (bound to always-visible Status Bar item)
   context.subscriptions.push(
     vscode.commands.registerCommand('quasar.openMenu', async () => {
       await focusReviewSidebar();
       const session = loadActiveSession();
       const prefs = loadReviewerPreferences();
+      const defaultEffortSpec = getEffortSpec(prefs.defaultEffort);
       const rulesCount = (prefs.rules || []).length;
       const uncertainCount = session
         ? (session.threads || []).filter((t) => t.status === 'uncertain').length
@@ -3631,13 +3790,18 @@ function activate(context) {
       const items = [
         {
           label: '$(git-branch) Review Local Branch or Working-Tree Diff...',
-          description: 'Pick a local git branch, commit range, or uncommitted changes',
+          description: `Pick a local git branch, commit range, or uncommitted changes (${defaultEffortSpec.shortLabel})`,
           command: 'quasar.reviewLocalBranch',
         },
         {
           label: '$(git-pull-request) Review GitHub PR from URL or Number...',
-          description: 'Paste a GitHub PR link or PR number',
+          description: `Paste a GitHub PR link or PR number (${defaultEffortSpec.shortLabel})`,
           command: 'quasar.loadPrFromUrl',
+        },
+        {
+          label: `$(zap) Review Effort Level: ${defaultEffortSpec.shortLabel} (Change...)`,
+          description: defaultEffortSpec.description,
+          command: 'quasar.selectEffortLevel',
         },
         {
           label: `$(history) Past Reviews / Switch Review Session (${pastReviews.length} saved)...`,
@@ -3704,7 +3868,7 @@ function activate(context) {
         items.push(
           {
             label: '$(book) Open Full CliffsNotes Study Guide',
-            description: 'Open markdown preview beside editor',
+            description: 'Open Interactive CliffsNotes Study Guide in editor',
             command: 'quasar.openCliffsNotesGuide',
           },
           {
@@ -3740,7 +3904,18 @@ function activate(context) {
 
   // 1. Load PR from GitHub URL (or local branch name/path)
   context.subscriptions.push(
-    vscode.commands.registerCommand('quasar.loadPrFromUrl', async (providedUrl) => {
+    vscode.commands.registerCommand('quasar.loadPrFromUrl', async (providedArg) => {
+      const providedUrl =
+        typeof providedArg === 'string'
+          ? providedArg
+          : providedArg && providedArg.url
+          ? providedArg.url
+          : null;
+      const providedEffort =
+        providedArg && typeof providedArg === 'object' && providedArg.effort
+          ? normalizeEffortLevel(providedArg.effort)
+          : null;
+
       const prUrl =
         providedUrl ||
         (await vscode.window.showInputBox({
@@ -3751,6 +3926,10 @@ function activate(context) {
       if (!prUrl || !prUrl.trim()) return;
 
       const trimmedUrl = prUrl.trim();
+      const effortLevel = providedEffort || (await pickEffortLevelForReview(trimmedUrl));
+      if (!effortLevel) return;
+      const effortSpec = getEffortSpec(effortLevel);
+
       const collectScript = path.join(PLUGIN_SCRIPTS_DIR, 'collect_pr_context.py');
       const workspaceRepo = await detectWorkspaceRepoDir();
       const windowWsRoot = getWindowWorkspaceRoot();
@@ -3760,7 +3939,7 @@ function activate(context) {
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: `Quasar: Loading ${trimmedUrl}...`,
+          title: `Quasar (${effortSpec.shortLabel}): Loading ${trimmedUrl}...`,
           cancellable: false,
         },
         (progress) =>
@@ -3770,6 +3949,8 @@ function activate(context) {
               collectScript,
               '--pr',
               trimmedUrl,
+              '--effort',
+              effortLevel,
               '--workspace-dir',
               windowWsRoot,
             ];
@@ -3788,11 +3969,14 @@ function activate(context) {
                 }
                 refreshAllUI(true);
                 progress.report({
-                  message: 'Initial tour ready! Dispatching Quasar multi-lens CliffsNotes synthesis...',
+                  message: `Initial tour ready! Dispatching Quasar (${effortSpec.shortLabel})...`,
                 });
+                const effortInstruction = buildEffortPromptInstruction(effortLevel);
                 await sendPromptToQuasar(
-                  `Review ${trimmedUrl} using the quasar skill for workspace "${windowWsRoot}" (context initialized in "${windowStateDir}/pr_context.json") and publish the CliffsNotes session via \`publish_review_session.py --workspace-dir "${windowWsRoot}"\`.`,
-                  `Quasar: ${trimmedUrl}`
+                  `Review ${trimmedUrl} using the quasar skill for workspace "${windowWsRoot}" (context initialized in "${windowStateDir}/pr_context.json"). ${effortInstruction} Publish the CliffsNotes session via \`publish_review_session.py --workspace-dir "${windowWsRoot}"\`.`,
+                  `Quasar (${effortSpec.shortLabel}): ${trimmedUrl}`,
+                  null,
+                  { effortLevel }
                 );
                 resolve();
               }
@@ -3847,6 +4031,10 @@ function activate(context) {
       let targetBranch = providedArgs && (providedArgs.branch || (typeof providedArgs === 'string' ? providedArgs : null));
       let targetBase = providedArgs && providedArgs.base ? providedArgs.base : null;
       let committedOnly = Boolean(providedArgs && providedArgs.committedOnly);
+      const providedEffort =
+        providedArgs && typeof providedArgs === 'object' && providedArgs.effort
+          ? normalizeEffortLevel(providedArgs.effort)
+          : null;
 
       while (!targetBranch) {
         const repoName = path.basename(repoDir);
@@ -3966,8 +4154,13 @@ function activate(context) {
         targetBase = pickedBase.base;
       }
 
-      const collectScript = path.join(PLUGIN_SCRIPTS_DIR, 'collect_pr_context.py');
       const repoName = path.basename(repoDir);
+      const effortLevel =
+        providedEffort || (await pickEffortLevelForReview(`${repoName}@${targetBranch}`));
+      if (!effortLevel) return;
+      const effortSpec = getEffortSpec(effortLevel);
+
+      const collectScript = path.join(PLUGIN_SCRIPTS_DIR, 'collect_pr_context.py');
       const windowWsRoot = getWindowWorkspaceRoot();
       const windowStateDir = getWindowStateDir();
       await focusReviewSidebar();
@@ -3975,7 +4168,7 @@ function activate(context) {
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: `Quasar: Loading branch ${targetBranch} in ${repoName}...`,
+          title: `Quasar (${effortSpec.shortLabel}): Loading branch ${targetBranch} in ${repoName}...`,
           cancellable: false,
         },
         (progress) =>
@@ -3989,6 +4182,8 @@ function activate(context) {
               windowWsRoot,
               '--branch',
               targetBranch,
+              '--effort',
+              effortLevel,
             ];
             if (targetBase && targetBase !== 'auto') {
               scriptArgs.push('--base', targetBase);
@@ -4011,12 +4206,15 @@ function activate(context) {
                 }
                 refreshAllUI(true);
                 progress.report({
-                  message: 'Initial tour ready! Dispatching Quasar multi-lens CliffsNotes synthesis...',
+                  message: `Initial tour ready! Dispatching Quasar (${effortSpec.shortLabel})...`,
                 });
                 const baseDesc = targetBase && targetBase !== 'auto' ? ` (base: ${targetBase})` : '';
+                const effortInstruction = buildEffortPromptInstruction(effortLevel);
                 await sendPromptToQuasar(
-                  `Review local branch "${targetBranch}"${baseDesc} in repository "${repoDir}" using the quasar skill for workspace "${windowWsRoot}". Context and snapshots are already initialized in "${windowStateDir}/active_session.json" (and "${windowStateDir}/pr_context.json" / "${windowStateDir}/pr.diff"). Run Phase 2 (parallel review lenses) and Phase 3 (\`publish_review_session.py --workspace-dir "${windowWsRoot}"\`).`,
-                  `Quasar: ${repoName}@${targetBranch}`
+                  `Review local branch "${targetBranch}"${baseDesc} in repository "${repoDir}" using the quasar skill for workspace "${windowWsRoot}". Context and snapshots are already initialized in "${windowStateDir}/active_session.json" (and "${windowStateDir}/pr_context.json" / "${windowStateDir}/pr.diff"). ${effortInstruction} Run Phase 2 and Phase 3 (\`publish_review_session.py --workspace-dir "${windowWsRoot}"\`).`,
+                  `Quasar (${effortSpec.shortLabel}): ${repoName}@${targetBranch}`,
+                  null,
+                  { effortLevel }
                 );
                 resolve();
               }

@@ -2,6 +2,19 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [1.1.1] - 2026-10-28
+
+### Added
+- **Configurable Review Effort Levels (`Low`, `Medium`, `High`)**:
+  - **⚡ Low Effort (Fast Single-Pass)**: Zero subagents, direct single-pass diff synthesis using `flash` for fast CliffsNotes tours and obvious high-confidence blockers (~20–35s).
+  - **⚖️ Medium Effort (Balanced — Default)**: Spawns 2 parallel `flash` subagents (`review-architect` + `review-bug-hunter`) in a single wave and filters directly without a second sequential subagent wave (~45–75s).
+  - **🔬 High Effort (Deep 4-Lens Pipeline)**: Runs the full parallel 3-subagent wave (`review-architect`, `review-bug-hunter`, `review-test-critic`) plus thorough false-positive verification for complex PRs.
+  - Added quick-pick effort selector when launching PR or local branch reviews, a `Quasar: Set Review Effort Level (Low / Medium / High)...` command (`quasar.selectEffortLevel`), sidebar/header effort badges, and persistent `defaultEffort` preference in `~/.gemini/quasar/preferences.json`.
+
+### Changed
+- **Single-Column Study Guide View**:
+  - Opening the Interactive CliffsNotes Study Guide now opens in the current active editor column (`vscode.ViewColumn.Active`) instead of forcing a side-by-side split window (`vscode.ViewColumn.Beside`).
+
 ## [0.1.0] - Initial Release
 
 ### Added

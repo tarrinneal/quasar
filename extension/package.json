@@ -2,7 +2,7 @@
   "name": "codeium-dev",
   "displayName": "Quasar",
   "description": "Comprehension-first GitHub PR & local branch review tool. Features interactive CliffsNotes study guides with expandable code snippets, clickable SVG flowcharts, logical reading tours, native side-by-side diffs, inline Ask-Quasar comment threads, and 1-click GitHub Review publishing.",
-  "version": "0.1.0",
+  "version": "1.1.1",
   "publisher": "codeium",
   "license": "MIT",
   "repository": {
@@ -72,6 +72,12 @@
         "title": "Review Local Branch or Diff...",
         "category": "Quasar",
         "icon": "$(git-branch)"
+      },
+      {
+        "command": "quasar.selectEffortLevel",
+        "title": "Set Review Effort Level (Low / Medium / High)...",
+        "category": "Quasar",
+        "icon": "$(zap)"
       },
       {
         "command": "quasar.openCliffsNotesGuide",

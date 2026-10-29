@@ -38,6 +38,7 @@ def default_preferences() -> Dict[str, Any]:
     return {
         "version": 2,
         "updatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "defaultEffort": "medium",
         "styleProfile": {
             "commentTone": "constructive, collaborative questions rather than prescriptive demands",
             "nitThreshold": "only high-signal polish that improves readability or prevents bugs",
@@ -68,6 +69,8 @@ def load_preferences() -> Dict[str, Any]:
             data = json.load(f)
         base = default_preferences()
         base.update(data)
+        if base.get("defaultEffort") not in ("low", "medium", "high"):
+            base["defaultEffort"] = "medium"
         base.setdefault("seedSkills", [])
         base.setdefault("rules", [])
         return base
@@ -504,6 +507,7 @@ def build_prompt_summary(prefs: Dict[str, Any], repo_name: Optional[str] = None)
     seed_rules = [r for r in applicable_rules if r.get("origin") == "seed_skill"]
 
     return {
+        "defaultEffort": prefs.get("defaultEffort") if prefs.get("defaultEffort") in ("low", "medium", "high") else "medium",
         "styleProfile": prefs.get("styleProfile") or {},
         "seedSkills": [
             {
@@ -753,6 +757,7 @@ def main() -> None:
     parser.add_argument("--set-tone", help="Update preferred comment tone in styleProfile")
     parser.add_argument("--set-nit-threshold", help="Update preferred nit threshold in styleProfile")
     parser.add_argument("--set-verbosity", help="Update preferred comment verbosity in styleProfile")
+    parser.add_argument("--set-effort", choices=["low", "medium", "high"], help="Update default review effort level (low, medium, high)")
     args = parser.parse_args()
 
     if args.discover_skills:
@@ -791,6 +796,8 @@ def main() -> None:
             if not (r.get("origin") == "seed_skill" and (r.get("seedSkillSlug") or "").lower() == slug)
         ]
 
+    if args.set_effort:
+        prefs["defaultEffort"] = args.set_effort.strip().lower()
     if args.set_tone:
         prefs.setdefault("styleProfile", {})["commentTone"] = args.set_tone.strip()
     if args.set_nit_threshold:

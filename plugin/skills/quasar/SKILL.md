@@ -26,6 +26,7 @@ Run `collect_pr_context.py` immediately, passing `--workspace-dir <ACTIVE_WORKSP
 # 1. When given a GitHub PR URL or number:
 python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/collect_pr_context.py \
   --pr <PR_URL_OR_NUMBER> \
+  [--effort <low|medium|high>] \
   --workspace-dir <ACTIVE_WORKSPACE_PATH> \
   --output-dir <SCRATCH_DIR>
 
@@ -34,12 +35,14 @@ python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/collect_pr_context
   --branch <BRANCH_NAME_OR_HEAD> \
   [--base <BASE_REF_OR_AUTO>] \
   [--repo-dir <REPO_ROOT>] \
+  [--effort <low|medium|high>] \
   --workspace-dir <ACTIVE_WORKSPACE_PATH> \
   [--committed-only] \
   --output-dir <SCRATCH_DIR>
 ```
 
-Inspect `reviewer_preferences` inside `pr_context.json` (or view `~/.gemini/quasar/PREFERENCES.md` if it exists) so you know:
+Inspect `effort_level` (`"low"`, `"medium"`, or `"high"`) and `reviewer_preferences` inside `pr_context.json` (or view `~/.gemini/quasar/PREFERENCES.md` if it exists) so you know:
+- Which **Effort Level** to run (`"low"`, `"medium"`, or `"high"` — if the user explicitly asked for `"low effort"` / `"quick"`, `"medium effort"`, or `"high effort"` / `"deep"` in their prompt, pass `--effort <level>` to `collect_pr_context.py` or honor their requested level).
 - What patterns the reviewer **prefers to flag** (`preferRules`)
 - What patterns the reviewer **wants suppressed/skipped** (`avoidRules`)
 - Their preferred **comment tone, verbosity, and phrasing examples** (`styleProfile` & `recentEditedDrafts`).
@@ -48,7 +51,6 @@ Inspect `reviewer_preferences` inside `pr_context.json` (or view `~/.gemini/quas
 When the user provides a GitHub PR link or number, inspect `pr_metadata` in `pr_context.json`:
 - If `pr_metadata.isOwnedByUser` is `true` and `pr_metadata.needsBranchSwitch` is `true` (meaning the PR belongs to the user, a matching local git repository was found at `repo_dir`, and it is currently checked out on `pr_metadata.localCurrentBranch` instead of the PR's head branch `pr_metadata.headRefName`):
   - **Ask the user** (using `ask_question`) whether they would like you to switch their local git repository (`repo_dir`) from `<localCurrentBranch>` to the PR branch `<headRefName>` (offering options: `(Recommended) Yes, switch to branch '<headRefName>'` and `No, stay on '<localCurrentBranch>'`).
-  - You can launch the Phase 2 subagents first so analysis runs concurrently in the background while waiting for the user's answer, or ask immediately.
   - If the user chooses to switch to `<headRefName>`, run:
     ```bash
     python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/collect_pr_context.py \
@@ -59,22 +61,30 @@ When the user provides a GitHub PR link or number, inspect `pr_metadata` in `pr_
 
 ---
 
-## Phase 2: Parallel Multi-Lens Subagents & Preference-Aware Filtering
+## Phase 2: Effort-Scaled Analysis (`low`, `medium`, `high`) & Preference-Aware Filtering
 
-For medium or large PRs, spawn the three specialist review subagents **in parallel** using a single `invoke_subagent` call (`Model: "inherit"`). Pass each subagent the active `reviewer_preferences` summary (or instruct them to read `~/.gemini/quasar/PREFERENCES.md`):
+Choose the analysis pipeline below that matches `effort_level` (`"low"`, `"medium"`, or `"high"`):
 
-1. **`review-architect`** (`Role: "Architecture & API Reviewer"`):
-   - Pass the PR title/description, list of changed `core_source` files, `<SCRATCH_DIR>/pr.diff`, and `reviewer_preferences`.
-   - Ask it to build the architectural mental model, identify key symbols ("Character List"), evaluate API boundaries & backwards compatibility, and suggest the logical top-down reading order.
-2. **`review-bug-hunter`** (`Role: "Bug & Edge-Case Hunter"`):
-   - Pass the changed `core_source` files, `<SCRATCH_DIR>/pr.diff`, and `reviewer_preferences`.
-   - Ask it to trace execution paths, nullability, state mutations, resource lifecycle, and language-boundary/generator edge cases.
-3. **`review-test-critic`** (`Role: "Test & Verification Critic"`):
-   - Pass the changed `core_source`, `test`, `generated_or_fixture`, and `docs_or_config` files, plus `reviewer_preferences`.
-   - Ask it to build a coverage matrix, evaluate test falsifiability, verify generated file sync, and check repo hygiene (`CHANGELOG.md`, `pubspec.yaml`).
+### ⚡ Option A: `low` Effort (Fast / Quick Scan — Single-Pass, 0 Subagents)
+- **Do NOT spawn any subagents (`invoke_subagent`)**.
+- Read `<SCRATCH_DIR>/pr_context.json` and `<SCRATCH_DIR>/pr.diff` directly in a single fast pass (only view individual files if a diff hunk is ambiguous).
+- Build a concise CliffsNotes Study Guide (`tldr`, `architectureDiagram`, logical `chapters` & `stops`), triage any `existing_comments`, and include only **obvious, high-confidence bugs or blockers** (skipping deep cross-file hunting and minor nits).
+- Proceed immediately to **Phase 3** (`publish_review_session.py`).
 
-### Filtering False Positives, Flagging Uncertain Preferences, & Triaging Existing GitHub Comments (`review-advocate`)
-Once the lenses report back, verify every candidate finding against the actual codebase callers/callees, `existing_comments`, and `reviewer_preferences` (either via `review-advocate` or direct inspection):
+### ⚖️ Option B: `medium` Effort (Balanced — Default — 2 Fast `flash` Subagents in 1 Wave)
+- Spawn **2 subagents in parallel** in a single `invoke_subagent` call with **`Model: "flash"`**:
+  1. **`review-architect`** (`Model: "flash"`, `Role: "Architecture & API Reviewer"`): Pass the PR title/description, changed `core_source` files, `<SCRATCH_DIR>/pr.diff`, and `reviewer_preferences`.
+  2. **`review-bug-hunter`** (`Model: "flash"`, `Role: "Bug & Edge-Case Hunter"`): Pass the changed `core_source` files, `<SCRATCH_DIR>/pr.diff`, and `reviewer_preferences`.
+- **Do NOT spawn a second sequential `review-advocate` wave** in `medium` effort — once the 2 `flash` subagents report back, verify and filter their findings directly in the main agent and proceed immediately to **Phase 3**.
+
+### 🔬 Option C: `high` Effort (Deep / Thorough — Full 4-Lens Pipeline)
+- Spawn all **3 specialist review subagents in parallel** using a single `invoke_subagent` call (`Model: "inherit"`). Pass each subagent the active `reviewer_preferences` summary (or instruct them to read `~/.gemini/quasar/PREFERENCES.md`):
+  1. **`review-architect`** (`Model: "inherit"`, `Role: "Architecture & API Reviewer"`): Build the architectural mental model, identify key symbols ("Character List"), evaluate API boundaries & backwards compatibility, and suggest the logical top-down reading order.
+  2. **`review-bug-hunter`** (`Model: "inherit"`, `Role: "Bug & Edge-Case Hunter"`): Trace execution paths, nullability, state mutations, resource lifecycle, and language-boundary/generator edge cases.
+  3. **`review-test-critic`** (`Model: "inherit"`, `Role: "Test & Verification Critic"`): Build a coverage matrix, evaluate test falsifiability, verify generated file sync, and check repo hygiene (`CHANGELOG.md`, `pubspec.yaml`).
+
+### Filtering False Positives, Flagging Uncertain Preferences, & Triaging Existing GitHub Comments
+Verify every candidate finding against the actual codebase callers/callees, `existing_comments`, and `reviewer_preferences` (in `high` effort you may invoke `review-advocate` or verify directly; in `low`/`medium` effort always filter directly):
 - **Drop** any finding that is guaranteed safe by upstream checks/types, pre-existing untouched code, already commented on, or suppressed by `avoidRules` in `reviewer_preferences`.
 - **Keep (`"status": "candidate"`)** verified bugs, regressions, and design issues that clearly align with high-signal review standards or `preferRules`.
 - **Triage Existing GitHub Comments (`"existingCommentAssessments"`)**: For each inline comment in `existing_comments`, evaluate it against the codebase and classify it so the user immediately sees whether Quasar thinks the suggested fix should be made or if it requires human attention:

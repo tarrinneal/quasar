@@ -1915,6 +1915,7 @@ def main() -> None:
     parser.add_argument("--stash-if-dirty", action="store_true", help="Auto-stash uncommitted changes if needed when switching to the PR branch")
     parser.add_argument("--repo-dir", default=None, help="Repository root directory (auto-detected if omitted)")
     parser.add_argument("--workspace-dir", default=None, help="Window workspace directory that owns this Quasar session (defaults to QUASAR_WORKSPACE_DIR or cwd)")
+    parser.add_argument("--effort", choices=["low", "medium", "high"], default=None, help="Review effort level: low (fast single-pass), medium (balanced 2-flash-subagents), or high (full 4-lens deep pipeline)")
     parser.add_argument("--output-dir", help="Optional directory to write diff and metadata files")
     args = parser.parse_args()
 
@@ -2177,9 +2178,14 @@ def main() -> None:
     except Exception:
         prefs_for_context = {}
 
+    effort_level = (args.effort or prefs_for_context.get("defaultEffort") or "medium").lower()
+    if effort_level not in ("low", "medium", "high"):
+        effort_level = "medium"
+
     summary: Dict[str, Any] = {
         "mode": "pr" if pr_arg else "local_branch",
         "session_id": session_id,
+        "effort_level": effort_level,
         "workspace_dir": ws_root,
         "state_dir": state_dir,
         "repo_dir": repo_dir,
@@ -2213,6 +2219,7 @@ def main() -> None:
         head_root=head_root,
         output_dir=out_dir,
     )
+    session["effortLevel"] = effort_level
     session["workspaceDir"] = ws_root
     session["stateDir"] = state_dir
 
