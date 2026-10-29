@@ -2,6 +2,15 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [1.1.2] - 2026-10-28
+
+### Fixed
+- **Conversation Routing for Review Actions (`Fix`, `Ask Quasar`, `Calibrate`)**:
+  - Pinned the review session's owning `conversationId` in `active_session.json` (`publish_review_session.py` & `detectActiveConversationId`) so follow-up actions always route to the exact conversation that ran the review instead of another recent conversation tab in the workspace.
+  - Tightened workspace path boundary matching when scanning conversation transcripts.
+- **Effort Selector UI Polish**:
+  - Fixed `$(pulse)` codicon rendering for Medium Effort in QuickPick, normalized sidebar `ThemeIcon` IDs, and added `timeEstimate` labels in the sidebar tree.
+
 ## [1.1.1] - 2026-10-28
 
 ### Added

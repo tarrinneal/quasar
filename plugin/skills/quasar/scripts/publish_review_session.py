@@ -399,6 +399,15 @@ def main() -> None:
 
     merged = merge_session(existing, payload)
     merged["stateDir"] = state_dir
+    for cand_path in (args.input, args.artifact_out, merged.get("scratchDir")):
+        if cand_path:
+            m_conv = re.search(
+                r"/brain/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:/|$)",
+                os.path.abspath(str(cand_path)),
+            )
+            if m_conv:
+                merged["conversationId"] = m_conv.group(1)
+                break
     with open(active_session_path, "w", encoding="utf-8") as f:
         json.dump(merged, f, indent=2)
 

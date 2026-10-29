@@ -424,17 +424,37 @@ function resolveRootConversationId(candId, env) {
   return candId;
 }
 
+function extractSessionConversationId(sess) {
+  if (!sess || typeof sess !== 'object') return null;
+  if (sess.conversationId && typeof sess.conversationId === 'string') {
+    return sess.conversationId.trim();
+  }
+  for (const field of ['scratchDir', 'cliffsNotesMarkdownPath']) {
+    const val = sess[field];
+    if (typeof val === 'string') {
+      const m = val.match(/\/brain\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:\/|$)/);
+      if (m && m[1]) return m[1];
+    }
+  }
+  return null;
+}
+
 /**
  * Finds the most recent active Antigravity root conversation ID belonging to the target workspace
- * (or THIS window's workspace), falling back to the most recent root conversation.
+ * (or THIS window's workspace), preferring the conversation ID recorded on the active Quasar session.
  */
-function detectActiveConversationId(targetWorkspaceRoot = null, env = null) {
+function detectActiveConversationId(targetWorkspaceRoot = null, env = null, preferredSession = null) {
+  const sess = preferredSession || loadActiveSession();
+  const sessConvId = extractSessionConversationId(sess);
+  if (sessConvId) {
+    return resolveRootConversationId(sessConvId, env);
+  }
+
   let wsRoot = targetWorkspaceRoot ? resolveWorkspaceRootSync(targetWorkspaceRoot) : null;
   if (!wsRoot || wsRoot.startsWith(REVIEW_STATE_DIR)) {
     wsRoot = getWindowWorkspaceRoot();
   }
   if (!wsRoot || wsRoot.startsWith(REVIEW_STATE_DIR)) {
-    const sess = loadActiveSession();
     if (sess && (sess.repoDir || sess.workspaceDir)) {
       wsRoot = resolveWorkspaceRootSync(sess.repoDir || sess.workspaceDir);
     }
@@ -477,7 +497,11 @@ function detectActiveConversationId(targetWorkspaceRoot = null, env = null) {
       fs.closeSync(fd);
       const headText = buf.slice(0, bytesRead).toString('utf8');
       const isRootUserConv = headText.includes('<ADDITIONAL_METADATA>');
-      const matchesWs = Boolean(wsRoot && !wsRoot.startsWith(REVIEW_STATE_DIR) && headText.includes(wsRoot));
+      const matchesWs = Boolean(
+        wsRoot &&
+          !wsRoot.startsWith(REVIEW_STATE_DIR) &&
+          (headText.includes(`${wsRoot}/`) || headText.includes(`${wsRoot}"`) || headText.includes(`${wsRoot}\n`))
+      );
       inspected.push({ ...cand, isRootUserConv, matchesWs });
     } catch (_) {}
   }
@@ -516,7 +540,7 @@ function sendPromptToQuasar(prompt, title = 'Quasar', targetWorkspaceRoot = null
       ...getQuasarScriptEnv(),
       ...lsEnv,
     };
-    const convId = detectActiveConversationId(effectiveWsRoot, env);
+    const convId = detectActiveConversationId(effectiveWsRoot, env, sess);
     const effortLevel = normalizeEffortLevel(
       (options && options.effortLevel) || (sess && sess.effortLevel) || getDefaultEffortLevel()
     );
