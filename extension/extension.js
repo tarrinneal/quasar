@@ -164,7 +164,8 @@ const EFFORT_LEVEL_SPECS = {
     id: 'low',
     shortLabel: '⚡ Low (Fast)',
     badge: '⚡ Low Effort',
-    icon: '$(zap)',
+    icon: 'zap',
+    timeEstimate: '~20–35s',
     title: '$(zap) Low Effort — Fast Single-Pass (~20–35s)',
     description: '0 subagents • Fast direct scan for CliffsNotes tour + obvious blockers only',
     detail:
@@ -174,8 +175,9 @@ const EFFORT_LEVEL_SPECS = {
     id: 'medium',
     shortLabel: '⚖️ Medium (Balanced)',
     badge: '⚖️ Medium Effort',
-    icon: '$(Law)',
-    title: '$( pulse ) Medium Effort — Balanced (~45–75s)',
+    icon: 'pulse',
+    timeEstimate: '~45–75s',
+    title: '$(pulse) Medium Effort — Balanced (~45–75s)',
     description: '2 fast Flash subagents (Architect + Bug Hunter) in 1 wave',
     detail:
       'Runs 2 parallel Flash subagents and filters directly in a single wave — much faster than High while keeping multi-lens checks.',
@@ -184,7 +186,8 @@ const EFFORT_LEVEL_SPECS = {
     id: 'high',
     shortLabel: '🔬 High (Deep)',
     badge: '🔬 High Effort',
-    icon: '$(beaker)',
+    icon: 'beaker',
+    timeEstimate: '~2–4m',
     title: '$(beaker) High Effort — Deep 4-Lens Pipeline (~2–4m)',
     description: 'All 4 specialist subagents (Architect, Bug Hunter, Test Critic, Advocate)',
     detail:
