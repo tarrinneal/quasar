@@ -13,6 +13,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import sys
 from typing import Any, Dict, List, Optional
 
@@ -22,6 +23,7 @@ from collect_pr_context import (
     assess_existing_github_comment,
     get_session_paths,
     render_cliffs_notes_markdown,
+    resolve_target_window,
     sanitize_mermaid_diagram,
 )
 
@@ -148,6 +150,22 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
     session = dict(existing)
     session["updatedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     session["analysisStatus"] = payload.get("analysisStatus", "ready")
+    if payload.get("windowId") or existing.get("windowId") or os.environ.get("QUASAR_WINDOW_ID"):
+        session["windowId"] = (
+            payload.get("windowId")
+            or existing.get("windowId")
+            or os.environ.get("QUASAR_WINDOW_ID")
+        )
+    if payload.get("windowPid") or existing.get("windowPid") or os.environ.get("QUASAR_WINDOW_PID"):
+        try:
+            session["windowPid"] = int(
+                payload.get("windowPid")
+                or existing.get("windowPid")
+                or os.environ.get("QUASAR_WINDOW_PID")
+                or 0
+            )
+        except Exception:
+            pass
     effort = (
         payload.get("effortLevel")
         or payload.get("effort_level")
@@ -155,6 +173,13 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
         or "medium"
     )
     session["effortLevel"] = str(effort).lower() if str(effort).lower() in ("low", "medium", "high") else "medium"
+    comments_only = bool(
+        payload.get(
+            "commentsOnly",
+            payload.get("comments_only", existing.get("commentsOnly", False)),
+        )
+    )
+    session["commentsOnly"] = comments_only
 
     if "cliffsNotes" in payload:
         cn = dict(session.get("cliffsNotes") or {})
@@ -205,6 +230,8 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
                 }
             )
         session["chapters"] = normalized_chapters
+    elif comments_only:
+        session["chapters"] = []
 
     # Map any explicit AI assessments for existing GitHub comments (from existingCommentAssessments or findings)
     assessments_by_id: Dict[str, Dict[str, Any]] = {}
@@ -356,6 +383,16 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
 
     session["threads"] = existing_threads + new_threads
 
+    if comments_only and "cliffsNotes" not in payload:
+        cn = dict(session.get("cliffsNotes") or {})
+        cn["tldr"] = (
+            f"Comments-Only Review — {len(new_threads)} new finding(s) and "
+            f"{len([t for t in existing_threads if t.get('kind') == 'github_existing'])} existing GitHub comment(s) ready to publish or fix."
+        )
+        cn["whatAndWhy"] = "Study guide generation was skipped (Comments-Only mode)."
+        cn["architectureDiagram"] = ""
+        session["cliffsNotes"] = cn
+
     try:
         from manage_preferences import build_prompt_summary, load_preferences
 
@@ -378,12 +415,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Publish synthesized Quasar session.")
     parser.add_argument("--input", required=True, help="Path to JSON file with synthesized CliffsNotes & findings")
     parser.add_argument("--workspace-dir", default=None, help="Window workspace directory that owns this Quasar session")
+    parser.add_argument("--comments-only", action="store_true", help="Publish in Comments-Only mode (skip study guide & reading tour)")
     parser.add_argument("--artifact-out", help="Optional path to also copy the generated cliffs_notes.md")
     args = parser.parse_args()
 
     os.makedirs(REVIEW_STATE_DIR, exist_ok=True)
     with open(args.input, "r", encoding="utf-8") as f:
         payload = json.load(f)
+    if args.comments_only:
+        payload["commentsOnly"] = True
 
     target_ws = args.workspace_dir or payload.get("workspaceDir") or payload.get("workspace_dir")
     state_dir, active_session_path, cliffs_notes_md_path = get_session_paths(target_ws)
@@ -397,8 +437,27 @@ def main() -> None:
         except Exception:
             existing = {}
 
+    # Also check sibling pr_context.json in input scratch directory for window_id/window_pid stamped at review start
+    sibling_ctx_path = os.path.join(os.path.dirname(os.path.abspath(args.input)), "pr_context.json")
+    if os.path.isfile(sibling_ctx_path):
+        try:
+            with open(sibling_ctx_path, "r", encoding="utf-8") as cf:
+                sibling_ctx = json.load(cf)
+            if not payload.get("windowId") and sibling_ctx.get("window_id"):
+                payload["windowId"] = sibling_ctx["window_id"]
+            if not payload.get("windowPid") and sibling_ctx.get("window_pid"):
+                payload["windowPid"] = sibling_ctx["window_pid"]
+        except Exception:
+            pass
+
     merged = merge_session(existing, payload)
     merged["stateDir"] = state_dir
+    if not merged.get("windowId"):
+        win_id, win_pid = resolve_target_window(state_dir, existing)
+        if win_id:
+            merged["windowId"] = win_id
+        if win_pid:
+            merged["windowPid"] = win_pid
     for cand_path in (args.input, args.artifact_out, merged.get("scratchDir")):
         if cand_path:
             m_conv = re.search(
@@ -429,6 +488,7 @@ def main() -> None:
                 "stateDir": state_dir,
                 "activeSessionPath": active_session_path,
                 "cliffsNotesMarkdownPath": cliffs_notes_md_path,
+                "commentsOnly": bool(merged.get("commentsOnly", False)),
                 "chaptersCount": len(merged.get("chapters") or []),
                 "threadsCount": len(merged.get("threads") or []),
             },

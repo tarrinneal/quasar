@@ -70,19 +70,11 @@ def archive_review_session(
 
 
 def resolve_workspace_root(workspace_dir: Optional[str] = None) -> str:
-    """Resolves the canonical workspace root (walking up to the enclosing .git root if inside a repo)."""
+    """Resolves the canonical workspace folder path for the active window (without collapsing monorepo subfolders)."""
     cand = workspace_dir or os.environ.get("QUASAR_WORKSPACE_DIR") or os.getcwd()
     cand = os.path.realpath(os.path.expanduser(cand))
     if os.path.isfile(cand):
         cand = os.path.dirname(cand)
-    cur = cand
-    while True:
-        if os.path.exists(os.path.join(cur, ".git")):
-            return cur
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            break
-        cur = parent
     return cand
 
 
@@ -141,6 +133,56 @@ def get_session_paths(
                     continue
 
     return state_dir, session_path, md_path
+
+
+def is_pid_alive(pid: Any) -> bool:
+    try:
+        num = int(pid or 0)
+        if num <= 0:
+            return False
+        os.kill(num, 0)
+        return True
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def resolve_target_window(
+    state_dir: str,
+    existing: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[str], Optional[int]]:
+    """Resolves the owning (windowId, windowPid) for a session so multi-window workspaces never collide."""
+    env_wid = (os.environ.get("QUASAR_WINDOW_ID") or "").strip()
+    env_pid_raw = (os.environ.get("QUASAR_WINDOW_PID") or "").strip()
+    env_pid = int(env_pid_raw) if env_pid_raw.isdigit() else None
+    if env_wid:
+        return env_wid, env_pid
+
+    if isinstance(existing, dict) and existing.get("windowId"):
+        ex_pid = existing.get("windowPid")
+        if not ex_pid or is_pid_alive(ex_pid):
+            return str(existing["windowId"]), int(ex_pid) if ex_pid else None
+
+    reg_path = os.path.join(state_dir, "windows.json")
+    if os.path.isfile(reg_path):
+        try:
+            with open(reg_path, "r", encoding="utf-8") as f:
+                entries = json.load(f)
+            if isinstance(entries, list):
+                alive = [
+                    w
+                    for w in entries
+                    if isinstance(w, dict) and w.get("windowId") and is_pid_alive(w.get("pid"))
+                ]
+                if alive:
+                    alive.sort(key=lambda w: int(w.get("lastFocusedAt") or 0), reverse=True)
+                    top = alive[0]
+                    return str(top["windowId"]), int(top.get("pid") or 0) or None
+        except Exception:
+            pass
+
+    return None, None
 
 
 ACTIVE_SESSION_PATH = os.path.join(get_workspace_state_dir(), "active_session.json")
@@ -826,38 +868,43 @@ def build_initial_cliffs_notes_session(
     base_root: str,
     head_root: str,
     output_dir: Optional[str],
+    comments_only: bool = False,
 ) -> Dict[str, Any]:
     """Builds an immediate CliffsNotes session structure from the categorized files and hunks
     so the native Quasar extension renders the tour right away, before or during deep agent synthesis.
     """
     chapters: List[Dict[str, Any]] = []
 
-    chapter_defs = [
-        (
-            "ch-core",
-            "Chapter 1: Core Source & Logic",
-            "core_source",
-            "Primary implementation and API changes that drive this PR's behavior.",
-        ),
-        (
-            "ch-tests",
-            "Chapter 2: Verification & Unit Tests",
-            "test",
-            "Unit and integration tests verifying the new behavior and edge cases.",
-        ),
-        (
-            "ch-docs",
-            "Chapter 3: Documentation, Config & Changelog",
-            "docs_or_config",
-            "Version bumps, CHANGELOG entries, and documentation updates.",
-        ),
-        (
-            "ch-generated",
-            "Chapter 4: Generated Code & Test Fixtures (Skim)",
-            "generated_or_fixture",
-            "Auto-generated bindings or platform test outputs derived from the generator changes.",
-        ),
-    ]
+    chapter_defs = (
+        []
+        if comments_only
+        else [
+            (
+                "ch-core",
+                "Chapter 1: Core Source & Logic",
+                "core_source",
+                "Primary implementation and API changes that drive this PR's behavior.",
+            ),
+            (
+                "ch-tests",
+                "Chapter 2: Verification & Unit Tests",
+                "test",
+                "Unit and integration tests verifying the new behavior and edge cases.",
+            ),
+            (
+                "ch-docs",
+                "Chapter 3: Documentation, Config & Changelog",
+                "docs_or_config",
+                "Version bumps, CHANGELOG entries, and documentation updates.",
+            ),
+            (
+                "ch-generated",
+                "Chapter 4: Generated Code & Test Fixtures (Skim)",
+                "generated_or_fixture",
+                "Auto-generated bindings or platform test outputs derived from the generator changes.",
+            ),
+        ]
+    )
 
     stop_counter = 1
     for ch_id, ch_title, cat_key, ch_desc in chapter_defs:
@@ -1904,6 +1951,462 @@ def checkout_pr_branch_in_repo(
     }
 
 
+def create_tutorial_sandbox_session(
+    ws_root: str,
+    state_dir: str,
+    active_session_path: str,
+    cliffs_notes_md_path: str,
+    comments_only: bool = False,
+) -> Dict[str, Any]:
+    """Creates an instant, self-contained interactive sandbox PR review session for learning Quasar."""
+    session_id = "quasar-tutorial-sandbox"
+    sandbox_root = os.path.join(REVIEW_STATE_DIR, "tutorial_sandbox")
+    repo_dir = os.path.join(sandbox_root, "repo")
+    snap_dir = os.path.join(SNAPSHOTS_DIR, session_id)
+    base_root = os.path.join(snap_dir, "base")
+    head_root = os.path.join(snap_dir, "head")
+
+    for d in (
+        os.path.join(repo_dir, "src"),
+        os.path.join(repo_dir, "tests"),
+        os.path.join(base_root, "src"),
+        os.path.join(base_root, "tests"),
+        os.path.join(head_root, "src"),
+        os.path.join(head_root, "tests"),
+    ):
+        os.makedirs(d, exist_ok=True)
+
+    base_checkout_ts = """export interface CartItem {
+  sku: string;
+  priceCents: number;
+  quantity: number;
+}
+
+export function calculateSubtotal(items: CartItem[]): number {
+  return items.reduce((sum, item) => sum + item.priceCents * item.quantity, 0);
+}
+
+export function applyPromoDiscount(
+  items: CartItem[]
+): { totalCents: number; discountRatio: number } {
+  const subtotal = calculateSubtotal(items);
+  return {
+    totalCents: subtotal,
+    discountRatio: 0,
+  };
+}
+"""
+
+    head_checkout_ts = """export interface CartItem {
+  sku: string;
+  priceCents: number;
+  quantity: number;
+}
+
+export interface PromoRule {
+  code: string;
+  discountCents: number;
+  expiresIso?: string;
+}
+
+const promoCache = new Map<string, PromoRule>();
+
+export function calculateSubtotal(items: CartItem[]): number {
+  // Sort items highest-price first before summing
+  items.sort((a, b) => b.priceCents - a.priceCents);
+  return items.reduce((sum, item) => sum + item.priceCents * item.quantity, 0);
+}
+
+export function applyPromoDiscount(
+  items: CartItem[],
+  promo?: PromoRule
+): { totalCents: number; discountRatio: number } {
+  const subtotal = calculateSubtotal(items);
+  const discount = promo ? Math.min(subtotal, promo.discountCents) : 0;
+  const discountRatio = discount / subtotal;
+  return {
+    totalCents: Math.max(0, subtotal - discount),
+    discountRatio,
+  };
+}
+
+function parseCouponExpiry(expiresIso?: string): number {
+  return expiresIso ? Date.parse(expiresIso) : Number.POSITIVE_INFINITY;
+}
+
+export function lookupActivePromo(rawCode: string, nowMs = Date.now()): PromoRule | undefined {
+  const rule = promoCache.get(rawCode);
+  if (!rule) return undefined;
+  if (parseCouponExpiry(rule.expiresIso) < nowMs) {
+    promoCache.delete(rawCode);
+    return undefined;
+  }
+  return rule;
+}
+
+export function registerPromoRule(rule: PromoRule): void {
+  promoCache.set(rule.code.trim().toUpperCase(), rule);
+}
+"""
+
+    base_test_ts = """import { applyPromoDiscount } from '../src/checkout_service';
+
+describe('checkout_service', () => {
+  it('computes subtotal without promo', () => {
+    const res = applyPromoDiscount([{ sku: 'coffee', priceCents: 500, quantity: 2 }]);
+    expect(res.totalCents).toBe(1000);
+  });
+});
+"""
+
+    head_test_ts = """import { applyPromoDiscount, lookupActivePromo, registerPromoRule } from '../src/checkout_service';
+
+describe('checkout_service promo codes', () => {
+  it('applies fixed promo discount to cart subtotal', () => {
+    registerPromoRule({ code: 'SAVE200', discountCents: 200 });
+    const promo = lookupActivePromo('SAVE200');
+    const res = applyPromoDiscount(
+      [{ sku: 'coffee', priceCents: 500, quantity: 2 }],
+      promo
+    );
+    expect(res.totalCents).toBe(800);
+    expect(res.discountRatio).toBeCloseTo(0.2);
+  });
+
+  it('evicts expired promo rules on lookup', () => {
+    registerPromoRule({
+      code: 'EXPIRED10',
+      discountCents: 100,
+      expiresIso: '2020-01-01T00:00:00Z',
+    });
+    expect(lookupActivePromo('EXPIRED10')).toBeUndefined();
+  });
+});
+"""
+
+    with open(os.path.join(base_root, "src", "checkout_service.ts"), "w", encoding="utf-8") as f:
+        f.write(base_checkout_ts)
+    with open(os.path.join(base_root, "tests", "checkout_service.test.ts"), "w", encoding="utf-8") as f:
+        f.write(base_test_ts)
+    for target_root in (head_root, repo_dir):
+        with open(os.path.join(target_root, "src", "checkout_service.ts"), "w", encoding="utf-8") as f:
+            f.write(head_checkout_ts)
+        with open(os.path.join(target_root, "tests", "checkout_service.test.ts"), "w", encoding="utf-8") as f:
+            f.write(head_test_ts)
+
+    # Initialize git repo in sandbox repo_dir if not yet initialized so git status/diff works
+    if not os.path.isdir(os.path.join(repo_dir, ".git")):
+        run_cmd(["git", "init"], cwd=repo_dir, check=False)
+        run_cmd(["git", "add", "."], cwd=repo_dir, check=False)
+        run_cmd(
+            ["git", "-c", "user.name=Quasar Tutorial", "-c", "user.email=tutorial@quasar.local", "commit", "-m", "feat(checkout): promo code discount & cache"],
+            cwd=repo_dir,
+            check=False,
+        )
+
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    prefs_summary: Dict[str, Any] = {}
+    try:
+        from manage_preferences import build_prompt_summary, load_preferences
+
+        prefs_summary = build_prompt_summary(load_preferences(), "quasar-sandbox")
+    except Exception:
+        prefs_summary = {}
+
+    chapters = (
+        []
+        if comments_only
+        else [
+            {
+                "id": "ch-tutorial-1",
+                "title": "Chapter 1: Promo Calculation & Cache Lookup",
+                "summary": "Adds promo discount math and an in-memory promo rule cache with expiration.",
+                "cliffsNotesBullets": [
+                    "Try clicking Stop 1.1 or 1.2 below (or pressing Alt+Down) to open the side-by-side diff.",
+                    "Hover over any changed function in the diff editor to see native CliffsNotes hover cards.",
+                ],
+                "stops": [
+                    {
+                        "id": "stop-1-1",
+                        "stopNumber": "1.1",
+                        "title": "checkout_service.ts:15-32",
+                        "description": "Subtotal sorting & promo discount ratio math",
+                        "path": "src/checkout_service.ts",
+                        "startLine": 15,
+                        "endLine": 32,
+                        "baseSnapshotPath": os.path.join(base_root, "src", "checkout_service.ts"),
+                        "headSnapshotPath": os.path.join(head_root, "src", "checkout_service.ts"),
+                        "localWorkspacePath": os.path.join(repo_dir, "src", "checkout_service.ts"),
+                        "cliffsNotes": "Computes cart subtotal and applies promo discount, returning totalCents and discountRatio.",
+                        "whyItChanged": "Supports fixed-amount promotional discounts during checkout.",
+                        "callersAndInvariants": "Called by CheckoutController. Contains 2 intentional bugs for you to test in this tutorial!",
+                        "read": False,
+                    },
+                    {
+                        "id": "stop-1-2",
+                        "stopNumber": "1.2",
+                        "title": "checkout_service.ts:34-50",
+                        "description": "In-memory promo cache registration & expiry check",
+                        "path": "src/checkout_service.ts",
+                        "startLine": 34,
+                        "endLine": 50,
+                        "baseSnapshotPath": os.path.join(base_root, "src", "checkout_service.ts"),
+                        "headSnapshotPath": os.path.join(head_root, "src", "checkout_service.ts"),
+                        "localWorkspacePath": os.path.join(repo_dir, "src", "checkout_service.ts"),
+                        "cliffsNotes": "Registers uppercase promo rules in `promoCache` and evicts expired rules on lookup.",
+                        "whyItChanged": "Avoids repeated promo table lookups for active codes.",
+                        "callersAndInvariants": "`registerPromoRule` normalizes keys with `.trim().toUpperCase()`, but `lookupActivePromo` does not.",
+                        "read": False,
+                    },
+                ],
+            },
+            {
+                "id": "ch-tutorial-2",
+                "title": "Chapter 2: Unit Tests & Verification",
+                "summary": "Tests basic promo discount application and expired rule eviction.",
+                "cliffsNotesBullets": [
+                    "Covers happy-path discount math and expired promo eviction.",
+                    "Leaves zero-subtotal carts and lowercase promo codes untested.",
+                ],
+                "stops": [
+                    {
+                        "id": "stop-2-1",
+                        "stopNumber": "2.1",
+                        "title": "checkout_service.test.ts:1-24",
+                        "description": "Unit tests for SAVE200 and EXPIRED10 promo codes",
+                        "path": "tests/checkout_service.test.ts",
+                        "startLine": 1,
+                        "endLine": 24,
+                        "baseSnapshotPath": os.path.join(base_root, "tests", "checkout_service.test.ts"),
+                        "headSnapshotPath": os.path.join(head_root, "tests", "checkout_service.test.ts"),
+                        "localWorkspacePath": os.path.join(repo_dir, "tests", "checkout_service.test.ts"),
+                        "cliffsNotes": "Adds Jest unit tests for `applyPromoDiscount` and `lookupActivePromo`.",
+                        "whyItChanged": "Verifies new promo code behavior.",
+                        "callersAndInvariants": "Includes an uncertain preference question on line 14 for you to calibrate!",
+                        "read": False,
+                    }
+                ],
+            },
+        ]
+    )
+
+    threads = [
+        {
+            "id": "tutorial-finding-1",
+            "kind": "ai_candidate",
+            "severity": "BLOCKING",
+            "status": "staged",
+            "selectedForFix": True,
+            "uncertain": False,
+            "path": "src/checkout_service.ts",
+            "startLine": 25,
+            "endLine": 31,
+            "title": "Division by zero (NaN) when cart subtotal is $0",
+            "whyItMatters": "When `subtotal === 0` (e.g. an empty cart or free sample item), `discount / subtotal` on line 27 evaluates to `0 / 0 = NaN`. Try clicking '💬 Ask Agent to Change Comment' to make this comment shorter, or '🔧 Fix with Agent' to patch the file!",
+            "draftComment": "If `subtotal` is `0` (for example on an empty cart or 100%-free sample item), `discount / subtotal` on line 27 evaluates to `NaN`. Should we guard with `const discountRatio = subtotal > 0 ? discount / subtotal : 0;`?",
+            "messages": [
+                {
+                    "author": "Quasar",
+                    "body": (
+                        "**Division by zero (NaN) when cart subtotal is $0**\n\n"
+                        "*CliffsNotes Context*: When `subtotal === 0` (e.g. an empty cart or free sample item), `discount / subtotal` on line 27 evaluates to `0 / 0 = NaN`.\n\n"
+                        "💡 **Tutorial Tip**: Click **💬 Ask Agent to Change Comment** above (or type in the reply box below) and tell Quasar: *\"Make this shorter and don't include a code snippet\"* — or click **🔧 Fix This Issue with Quasar Now** to watch the agent fix `src/checkout_service.ts`!\n\n"
+                        "---\n"
+                        "**Draft GitHub Comment**:\n"
+                        "> If `subtotal` is `0` (for example on an empty cart or 100%-free sample item), `discount / subtotal` on line 27 evaluates to `NaN`. Should we guard with `const discountRatio = subtotal > 0 ? discount / subtotal : 0;`?"
+                    ),
+                    "timestamp": now_iso,
+                }
+            ],
+        },
+        {
+            "id": "tutorial-finding-2",
+            "kind": "ai_candidate",
+            "severity": "NIT",
+            "status": "uncertain",
+            "selectedForFix": False,
+            "uncertain": True,
+            "preferenceCategory": "test_strictness",
+            "uncertaintyQuestion": "Do you want Quasar to flag missing direct unit tests for private helper functions (like `parseCouponExpiry`) when the public API is already tested?",
+            "preferenceOptions": [
+                "Flag this & similar cases in future reviews",
+                "Skip this pattern in future reviews",
+                "Keep this comment once, don't save a rule",
+            ],
+            "path": "tests/checkout_service.test.ts",
+            "startLine": 14,
+            "endLine": 23,
+            "title": "No direct unit test for malformed dates in private parseCouponExpiry",
+            "whyItMatters": "💡 Tutorial Tip: Click '🤔 Calibrate Preference' (or 👍 / 👎) on this thread to teach Quasar whether you care about unit tests for private helpers.",
+            "draftComment": "Consider adding a test case where `expiresIso` is an invalid date string to verify how `parseCouponExpiry` behaves.",
+            "messages": [
+                {
+                    "author": "Quasar",
+                    "body": (
+                        "### 🤔 Preference Check: No direct unit test for malformed dates in private parseCouponExpiry\n\n"
+                        "**Question for You**: *Do you want Quasar to flag missing direct unit tests for private helper functions (like `parseCouponExpiry`) when the public API is already tested?*\n\n"
+                        "*Context & Trade-off*: 💡 **Tutorial Tip**: Click **🤔 Calibrate Preference** (or 👍 / 👎) in the toolbar above to teach Quasar your personal preference!\n\n"
+                        "---\n"
+                        "**Candidate GitHub Comment (if kept)**:\n"
+                        "> Consider adding a test case where `expiresIso` is an invalid date string to verify how `parseCouponExpiry` behaves."
+                    ),
+                    "timestamp": now_iso,
+                }
+            ],
+        },
+        {
+            "id": "tutorial-finding-3",
+            "kind": "github_existing",
+            "severity": "EXISTING",
+            "status": "existing",
+            "selectedForFix": False,
+            "author": "teammate_alex",
+            "triageLeftTag": "🛠️ [Should Fix]",
+            "triageStatus": "recommended_fix",
+            "triageCategory": "actionable_improvement",
+            "triageBadge": "🛠️ Good Catch — Should Fix",
+            "triageLabel": "🛠️ Good Comment — Suggested Fix Should Be Made",
+            "triageSummary": "@teammate_alex spotted that `registerPromoRule` uppercases the key while `lookupActivePromo` uses raw `rawCode`.",
+            "recommendedForFix": True,
+            "path": "src/checkout_service.ts",
+            "startLine": 38,
+            "endLine": 45,
+            "title": "🛠️ [Should Fix] Normalize rawCode.trim().toUpperCase() in lookupActivePromo",
+            "whyItMatters": "🛠️ Good Comment — Suggested Fix Should Be Made — @teammate_alex spotted that `registerPromoRule` uppercases the key while `lookupActivePromo` uses raw `rawCode`.",
+            "draftComment": "`registerPromoRule` stores keys with `rule.code.trim().toUpperCase()`, so calling `lookupActivePromo('save200')` in lowercase will miss the cache. We should normalize `rawCode.trim().toUpperCase()` here too.",
+            "messages": [
+                {
+                    "author": "@teammate_alex (GitHub)",
+                    "body": "`registerPromoRule` stores keys with `rule.code.trim().toUpperCase()`, so calling `lookupActivePromo('save200')` in lowercase will miss the cache. We should normalize `rawCode.trim().toUpperCase()` here too.",
+                    "timestamp": now_iso,
+                },
+                {
+                    "author": "Quasar Triage (🛠️ Good Catch — Should Fix)",
+                    "body": "**🛠️ Good Comment — Suggested Fix Should Be Made**\n\n@teammate_alex spotted that `registerPromoRule` uppercases the key while `lookupActivePromo` uses raw `rawCode`.",
+                    "timestamp": now_iso,
+                    "isTriageNote": True,
+                },
+            ],
+        },
+        {
+            "id": "tutorial-finding-4",
+            "kind": "ai_candidate",
+            "severity": "DESIGN",
+            "status": "staged",
+            "selectedForFix": False,
+            "uncertain": False,
+            "path": "src/checkout_service.ts",
+            "startLine": 15,
+            "endLine": 19,
+            "title": "In-place array sort mutates caller's CartItem[]",
+            "whyItMatters": "`items.sort(...)` mutates the input array passed by the caller, which can reorder items in the UI cart unexpectedly.",
+            "draftComment": "`items.sort(...)` mutates the caller's `items` array in-place (and sorting isn't needed for addition). Can we remove the sort here?",
+            "messages": [
+                {
+                    "author": "Quasar",
+                    "body": (
+                        "**In-place array sort mutates caller's CartItem[]**\n\n"
+                        "*CliffsNotes Context*: `items.sort(...)` mutates the input array passed by the caller, which can reorder items in the UI cart unexpectedly.\n\n"
+                        "---\n"
+                        "**Draft GitHub Comment**:\n"
+                        "> `items.sort(...)` mutates the caller's `items` array in-place (and sorting isn't needed for addition). Can we remove the sort here?"
+                    ),
+                    "timestamp": now_iso,
+                }
+            ],
+        },
+    ]
+
+    win_id = os.environ.get("QUASAR_WINDOW_ID") or ""
+    win_pid = int(os.environ.get("QUASAR_WINDOW_PID") or 0) if (os.environ.get("QUASAR_WINDOW_PID") or "").isdigit() else 0
+
+    session: Dict[str, Any] = {
+        "sessionId": session_id,
+        "isTutorial": True,
+        "windowId": win_id,
+        "windowPid": win_pid,
+        "updatedAt": now_iso,
+        "analysisStatus": "ready",
+        "effortLevel": "medium",
+        "commentsOnly": comments_only,
+        "workspaceDir": ws_root,
+        "stateDir": state_dir,
+        "repoDir": repo_dir,
+        "baseSnapshotRoot": base_root,
+        "headSnapshotRoot": head_root,
+        "scratchDir": state_dir,
+        "cliffsNotesMarkdownPath": cliffs_notes_md_path,
+        "pr": {
+            "mode": "tutorial",
+            "owner": "quasar-demo",
+            "repo": "checkout-service",
+            "number": 42,
+            "title": "🎓 [Interactive Tutorial] feat(checkout): Promo code discounts & cache",
+            "url": "",
+            "state": "OPEN",
+            "author": "you",
+            "baseRefName": "main",
+            "baseSha": "base-tutorial",
+            "headRefName": "feat/promo-codes",
+            "headBranch": "feat/promo-codes",
+            "headSha": "head-tutorial",
+            "isOwnedByUser": True,
+            "needsBranchSwitch": False,
+            "additions": 48,
+            "deletions": 6,
+            "changedFilesCount": 2,
+            "body": "Interactive Quasar Sandbox Tutorial PR! Use this live playground to try Guided Tour stops, Ask Agent to Change Comment, Calibrate Preferences, Fix with Agent, and Comments-Only Mode.",
+        },
+        "reviewerPreferences": prefs_summary,
+        "cliffsNotes": {
+            "tldr": (
+                "Comments-Only Tutorial Mode — Study guide skipped; use Review Comments & Cart to revise, fix, or stage comments."
+                if comments_only
+                else "Adds fixed-amount promo code discounts and an expiring in-memory promo lookup cache to `checkout_service.ts`."
+            ),
+            "whatAndWhy": (
+                "Study guide skipped (Comments-Only mode)."
+                if comments_only
+                else "Introduces `PromoRule`, updates `applyPromoDiscount` to compute discounted totals and ratios, and adds `registerPromoRule` / `lookupActivePromo` with expiration eviction. Intentionally includes a divide-by-zero bug, an in-place array mutation, an unnormalized cache key, and a preference question so you can test every Quasar feature hands-on."
+            ),
+            "architectureDiagram": (
+                ""
+                if comments_only
+                else 'flowchart LR\n  A["registerPromoRule ( checkout_service.ts )"] --> B["promoCache ( checkout_service.ts )"]\n  B --> C["lookupActivePromo ( checkout_service.ts )"]\n  C --> D["applyPromoDiscount ( checkout_service.ts )"]\n  D --> E["calculateSubtotal ( checkout_service.ts )"]'
+            ),
+            "keySymbols": [
+                {"name": "applyPromoDiscount", "role": "Computes subtotal, clamps promo discount, and returns totalCents + discountRatio."},
+                {"name": "lookupActivePromo", "role": "Fetches a PromoRule from promoCache and evicts expired entries."},
+                {"name": "calculateSubtotal", "role": "Sums item prices * quantities across the cart."},
+            ],
+            "designTradeoffs": [
+                "In-memory `promoCache` is fast for single-instance services, though case-sensitivity between `registerPromoRule` and `lookupActivePromo` must stay consistent."
+            ],
+        },
+        "chapters": chapters,
+        "threads": threads,
+        "coverageMatrix": [
+            {"behavior": "Valid promo discount (`SAVE200`)", "status": "✅ Covered", "notes": "Verified in `checkout_service.test.ts:L4-L12`"},
+            {"behavior": "Expired promo eviction (`EXPIRED10`)", "status": "✅ Covered", "notes": "Verified in `checkout_service.test.ts:L14-L22`"},
+            {"behavior": "Zero-subtotal cart (`subtotal === 0`)", "status": "❌ Missing", "notes": "Triggers `NaN` in `applyPromoDiscount` (Finding #1)"},
+        ],
+        "repoChecks": [
+            {"name": "Sandbox Git Repository", "passed": True, "detail": f"Ready at {repo_dir} for live 'Fix with Agent' testing"}
+        ],
+        "dismissedChecks": [
+            "Checked negative promo discount leading to negative total — guarded by `Math.max(0, subtotal - discount)` on line 29."
+        ],
+    }
+
+    with open(active_session_path, "w", encoding="utf-8") as sf:
+        json.dump(session, sf, indent=2)
+    md_text = render_cliffs_notes_markdown(session)
+    with open(cliffs_notes_md_path, "w", encoding="utf-8") as mf:
+        mf.write(md_text)
+    archive_review_session(session, md_text)
+    return session
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Collect PR or branch context and initialize Quasar.")
     parser.add_argument("--pr", help="GitHub PR number or URL (or local branch name/path)")
@@ -1916,6 +2419,9 @@ def main() -> None:
     parser.add_argument("--repo-dir", default=None, help="Repository root directory (auto-detected if omitted)")
     parser.add_argument("--workspace-dir", default=None, help="Window workspace directory that owns this Quasar session (defaults to QUASAR_WORKSPACE_DIR or cwd)")
     parser.add_argument("--effort", choices=["low", "medium", "high"], default=None, help="Review effort level: low (fast single-pass), medium (balanced 2-flash-subagents), or high (full 4-lens deep pipeline)")
+    parser.add_argument("--comments-only", action="store_true", help="Comments-Only mode: skip CliffsNotes study guide and reading tour generation, and only produce comments to send to GitHub or fix")
+    parser.add_argument("--full-guide", action="store_true", help="Full Guide mode: generate full CliffsNotes study guide, reading tour, and comments (overrides defaultCommentsOnly)")
+    parser.add_argument("--tutorial", action="store_true", help="Initialize the interactive Quasar Sandbox PR Tutorial session")
     parser.add_argument("--output-dir", help="Optional directory to write diff and metadata files")
     args = parser.parse_args()
 
@@ -1923,6 +2429,29 @@ def main() -> None:
     ws_root = resolve_workspace_root(args.workspace_dir)
     state_dir, active_session_path, cliffs_notes_md_path = get_session_paths(args.workspace_dir)
     os.makedirs(state_dir, exist_ok=True)
+
+    if args.tutorial:
+        session = create_tutorial_sandbox_session(
+            ws_root=ws_root,
+            state_dir=state_dir,
+            active_session_path=active_session_path,
+            cliffs_notes_md_path=cliffs_notes_md_path,
+            comments_only=bool(args.comments_only),
+        )
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "mode": "tutorial",
+                    "session_id": session["sessionId"],
+                    "active_session_path": active_session_path,
+                    "cliffs_notes_md_path": cliffs_notes_md_path,
+                    "repo_dir": session["repoDir"],
+                },
+                indent=2,
+            )
+        )
+        return
 
     if args.checkout_pr_branch:
         if not os.path.isfile(active_session_path):
@@ -2182,12 +2711,24 @@ def main() -> None:
     if effort_level not in ("low", "medium", "high"):
         effort_level = "medium"
 
+    if args.comments_only:
+        comments_only = True
+    elif args.full_guide:
+        comments_only = False
+    else:
+        comments_only = bool(prefs_for_context.get("defaultCommentsOnly", False))
+
+    win_id, win_pid = resolve_target_window(state_dir)
+
     summary: Dict[str, Any] = {
         "mode": "pr" if pr_arg else "local_branch",
         "session_id": session_id,
         "effort_level": effort_level,
+        "comments_only": comments_only,
         "workspace_dir": ws_root,
         "state_dir": state_dir,
+        "window_id": win_id,
+        "window_pid": win_pid,
         "repo_dir": repo_dir,
         "base_snapshot_root": base_root,
         "head_snapshot_root": head_root,
@@ -2218,8 +2759,28 @@ def main() -> None:
         base_root=base_root,
         head_root=head_root,
         output_dir=out_dir,
+        comments_only=comments_only,
     )
     session["effortLevel"] = effort_level
+    session["commentsOnly"] = comments_only
+    if win_id:
+        session["windowId"] = win_id
+    if win_pid:
+        session["windowPid"] = win_pid
+    m_conv = re.search(
+        r"/brain/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:/|$)",
+        os.path.abspath(str(out_dir)),
+    )
+    if m_conv:
+        session["conversationId"] = m_conv.group(1)
+    if comments_only:
+        session["cliffsNotes"] = {
+            "tldr": "Comments-Only Review — Study guide skipped; see Review Comments & Cart to stage comments for GitHub or queue them for Agent fixes.",
+            "whatAndWhy": "Quasar is analyzing the diff in Comments-Only mode to produce verified review comments...",
+            "architectureDiagram": "",
+            "keySymbols": [],
+            "designTradeoffs": [],
+        }
     session["workspaceDir"] = ws_root
     session["stateDir"] = state_dir
 

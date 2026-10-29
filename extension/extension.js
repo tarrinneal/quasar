@@ -22,12 +22,29 @@ const PLUGIN_SCRIPTS_DIR = path.join(
   'scripts'
 );
 
+// Unique per-window identity for this VS Code window's extension host process
+const THIS_WINDOW_PID = process.pid;
+const THIS_WINDOW_ID =
+  (vscode.env && vscode.env.sessionId) ||
+  `win-${THIS_WINDOW_PID}-${crypto.randomBytes(4).toString('hex')}`;
+
 // Per-window fallback identifier when a window has no workspace folders open
 const EMPTY_WINDOW_FALLBACK_ROOT = path.join(
   REVIEW_STATE_DIR,
   'empty-windows',
-  `window-${process.pid}-${crypto.randomBytes(4).toString('hex')}`
+  `window-${THIS_WINDOW_PID}-${crypto.randomBytes(4).toString('hex')}`
 );
+
+function isPidAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
 
 function resolveWorkspaceRootSync(dirPath) {
   if (!dirPath) return null;
@@ -42,15 +59,6 @@ function resolveWorkspaceRootSync(dirPath) {
       cand = path.dirname(cand);
     }
   } catch (_) {}
-  let cur = cand;
-  while (true) {
-    if (fs.existsSync(path.join(cur, '.git'))) {
-      return cur;
-    }
-    const parent = path.dirname(cur);
-    if (parent === cur) break;
-    cur = parent;
-  }
   return cand;
 }
 
@@ -58,23 +66,6 @@ function getWindowWorkspaceRoot() {
   const folders = vscode.workspace.workspaceFolders;
   if (folders && folders.length > 0 && folders[0].uri && folders[0].uri.fsPath) {
     return resolveWorkspaceRootSync(folders[0].uri.fsPath);
-  }
-  // If no workspace folder is open, check if an open editor belongs to a local git repo outside ~/.gemini/quasar
-  const docs = [];
-  if (vscode.window.activeTextEditor && vscode.window.activeTextEditor.document) {
-    docs.push(vscode.window.activeTextEditor.document);
-  }
-  for (const doc of vscode.workspace.textDocuments || []) {
-    docs.push(doc);
-  }
-  for (const doc of docs) {
-    if (!doc || !doc.uri || doc.uri.scheme !== 'file') continue;
-    const fsPath = doc.uri.fsPath;
-    if (!fsPath || fsPath.startsWith(REVIEW_STATE_DIR)) continue;
-    const root = resolveWorkspaceRootSync(fsPath);
-    if (root && fs.existsSync(path.join(root, '.git'))) {
-      return root;
-    }
   }
   return EMPTY_WINDOW_FALLBACK_ROOT;
 }
@@ -116,7 +107,61 @@ function getQuasarScriptEnv() {
     ...process.env,
     QUASAR_WORKSPACE_DIR: wsRoot,
     QUASAR_STATE_DIR: stateDir,
+    QUASAR_WINDOW_ID: THIS_WINDOW_ID,
+    QUASAR_WINDOW_PID: String(THIS_WINDOW_PID),
   };
+}
+
+function touchWindowRegistration(isFocused = false) {
+  try {
+    const stateDir = getWindowStateDir();
+    fs.mkdirSync(stateDir, { recursive: true });
+    const regPath = path.join(stateDir, 'windows.json');
+    let entries = [];
+    if (fs.existsSync(regPath)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(regPath, 'utf-8'));
+        if (Array.isArray(parsed)) entries = parsed;
+      } catch (_) {}
+    }
+    const now = Date.now();
+    entries = entries.filter(
+      (w) => w && w.windowId && w.windowId !== THIS_WINDOW_ID && isPidAlive(w.pid)
+    );
+    entries.push({
+      windowId: THIS_WINDOW_ID,
+      pid: THIS_WINDOW_PID,
+      lastFocusedAt: isFocused ? now : now - 1,
+    });
+    fs.writeFileSync(regPath, JSON.stringify(entries, null, 2), 'utf-8');
+  } catch (_) {}
+}
+
+function canClaimUnownedSession() {
+  if (vscode.window.state && vscode.window.state.focused) {
+    return true;
+  }
+  try {
+    const regPath = path.join(getWindowStateDir(), 'windows.json');
+    if (!fs.existsSync(regPath)) {
+      return Boolean(vscode.window.state && vscode.window.state.focused);
+    }
+    const parsed = JSON.parse(fs.readFileSync(regPath, 'utf-8'));
+    if (!Array.isArray(parsed)) {
+      return Boolean(vscode.window.state && vscode.window.state.focused);
+    }
+    const alive = parsed.filter((w) => w && w.windowId && isPidAlive(w.pid));
+    if (alive.length === 1 && alive[0].windowId === THIS_WINDOW_ID) {
+      return true;
+    }
+    if (alive.length > 1) {
+      alive.sort((a, b) => (b.lastFocusedAt || 0) - (a.lastFocusedAt || 0));
+      return alive[0].windowId === THIS_WINDOW_ID;
+    }
+    return false;
+  } catch (_) {
+    return Boolean(vscode.window.state && vscode.window.state.focused);
+  }
 }
 
 function loadStoredGithubAuth() {
@@ -208,13 +253,14 @@ function getEffortSpec(level) {
 function loadReviewerPreferences() {
   try {
     if (!fs.existsSync(PREFERENCES_JSON_PATH)) {
-      return { defaultEffort: 'medium', styleProfile: {}, rules: [], categoryStats: {}, feedbackHistory: [] };
+      return { defaultEffort: 'medium', defaultCommentsOnly: false, styleProfile: {}, rules: [], categoryStats: {}, feedbackHistory: [] };
     }
     const parsed = JSON.parse(fs.readFileSync(PREFERENCES_JSON_PATH, 'utf-8'));
     parsed.defaultEffort = normalizeEffortLevel(parsed.defaultEffort);
+    parsed.defaultCommentsOnly = Boolean(parsed.defaultCommentsOnly);
     return parsed;
   } catch (_) {
-    return { defaultEffort: 'medium', styleProfile: {}, rules: [], categoryStats: {}, feedbackHistory: [] };
+    return { defaultEffort: 'medium', defaultCommentsOnly: false, styleProfile: {}, rules: [], categoryStats: {}, feedbackHistory: [] };
   }
 }
 
@@ -223,8 +269,38 @@ function getDefaultEffortLevel() {
   return normalizeEffortLevel(prefs.defaultEffort);
 }
 
-function buildEffortPromptInstruction(effortLevel) {
+function getDefaultCommentsOnly() {
+  const prefs = loadReviewerPreferences();
+  return Boolean(prefs.defaultCommentsOnly);
+}
+
+function buildEffortPromptInstruction(effortLevel, commentsOnly = false) {
   const level = normalizeEffortLevel(effortLevel);
+  if (commentsOnly) {
+    const modePrefix =
+      `REVIEW MODE: COMMENTS ONLY (NO STUDY GUIDE OR READING TOUR). ` +
+      `Do NOT generate \`cliffsNotes\` (\`tldr\`, \`whatAndWhy\`, \`architectureDiagram\`, \`keySymbols\`, \`designTradeoffs\`) and do NOT generate reading tour \`chapters\` or \`stops\`. ` +
+      `Focus 100% on producing verified review comments (\`findings\`) and triaging \`existingCommentAssessments\` to send to GitHub or fix with the agent. `;
+    if (level === 'low') {
+      return (
+        modePrefix +
+        `EFFORT LEVEL: LOW (FAST SINGLE-PASS — NO SUBAGENTS). ` +
+        `Do NOT call \`invoke_subagent\`. Read \`pr_context.json\` and \`pr.diff\` directly in a single fast pass, produce only high-confidence review comments (\`findings\`) and \`existingCommentAssessments\`, and immediately run \`publish_review_session.py --comments-only\`.`
+      );
+    }
+    if (level === 'high') {
+      return (
+        modePrefix +
+        `EFFORT LEVEL: HIGH (DEEP COMMENTS-ONLY PIPELINE). ` +
+        `Spawn \`review-bug-hunter\`, \`review-test-critic\`, and \`review-architect\` (instructing \`review-architect\` to skip the reading tour/mental model and only return API/design findings) in parallel with \`Model: "inherit"\`, filter false positives, and run \`publish_review_session.py --comments-only\`.`
+      );
+    }
+    return (
+      modePrefix +
+      `EFFORT LEVEL: MEDIUM (BALANCED COMMENTS-ONLY — FAST FLASH SUBAGENTS). ` +
+      `Spawn \`review-bug-hunter\` and \`review-architect\` (instructing \`review-architect\` to skip the reading tour/mental model and only return API/design findings) in a single parallel \`invoke_subagent\` call using \`Model: "flash"\`, filter their findings directly, and immediately run \`publish_review_session.py --comments-only\`.`
+    );
+  }
   if (level === 'low') {
     return (
       `EFFORT LEVEL: LOW (FAST SINGLE-PASS — NO SUBAGENTS). ` +
@@ -596,8 +672,10 @@ function loadActiveSession() {
     if (!fs.existsSync(sessionPath)) return null;
     const raw = fs.readFileSync(sessionPath, 'utf-8');
     const session = JSON.parse(raw);
-    // Verify session belongs to this window's state directory or workspace
-    if (session && session.workspaceDir) {
+    if (!session || typeof session !== 'object') return null;
+
+    // Verify session belongs to this window's workspace root
+    if (session.workspaceDir) {
       const myRoot = getWindowWorkspaceRoot();
       if (
         myRoot &&
@@ -607,6 +685,42 @@ function loadActiveSession() {
         return null;
       }
     }
+
+    // Strict per-window ownership check: keep the review locked to the window that activated it
+    if (session.windowId) {
+      if (session.windowId !== THIS_WINDOW_ID) {
+        if (session.windowPid && isPidAlive(session.windowPid)) {
+          // Another live window owns this session; do not leak into this window
+          return null;
+        }
+        // Previous owning window exited or reloaded; only re-adopt if this window is the active claimant
+        if (!canClaimUnownedSession()) {
+          return null;
+        }
+        session.windowId = THIS_WINDOW_ID;
+        session.windowPid = THIS_WINDOW_PID;
+        try {
+          fs.writeFileSync(sessionPath, JSON.stringify(session, null, 2), 'utf-8');
+        } catch (_) {}
+      } else if (session.windowPid !== THIS_WINDOW_PID) {
+        session.windowPid = THIS_WINDOW_PID;
+        try {
+          fs.writeFileSync(sessionPath, JSON.stringify(session, null, 2), 'utf-8');
+        } catch (_) {}
+      }
+    } else {
+      // Session was written by an external agent script without QUASAR_WINDOW_ID;
+      // only the active/focused window on this workspace claims and locks it.
+      if (!canClaimUnownedSession()) {
+        return null;
+      }
+      session.windowId = THIS_WINDOW_ID;
+      session.windowPid = THIS_WINDOW_PID;
+      try {
+        fs.writeFileSync(sessionPath, JSON.stringify(session, null, 2), 'utf-8');
+      } catch (_) {}
+    }
+
     return session;
   } catch (_) {
     return null;
@@ -698,6 +812,8 @@ function saveActiveSession(session) {
     session.updatedAt = new Date().toISOString();
     session.workspaceDir = session.workspaceDir || getWindowWorkspaceRoot();
     session.stateDir = stateDir;
+    session.windowId = THIS_WINDOW_ID;
+    session.windowPid = THIS_WINDOW_PID;
     fs.writeFileSync(getWindowActiveSessionPath(), JSON.stringify(session, null, 2), 'utf-8');
     archiveSessionToHistory(session, getWindowCliffsNotesMdPath());
   } catch (err) {
@@ -715,11 +831,12 @@ function matchesSessionPath(docFsPath, relPath, session) {
   const headPath = session.headSnapshotRoot ? path.resolve(session.headSnapshotRoot, relPath) : '';
   const basePath = session.baseSnapshotRoot ? path.resolve(session.baseSnapshotRoot, relPath) : '';
   const repoPath = session.repoDir ? path.resolve(session.repoDir, relPath) : '';
+  const wsPath = session.workspaceDir ? path.resolve(session.workspaceDir, relPath) : '';
   return (
     normalizedDoc === headPath ||
     normalizedDoc === basePath ||
     normalizedDoc === repoPath ||
-    normalizedDoc.endsWith(path.sep + relPath)
+    normalizedDoc === wsPath
   );
 }
 
@@ -959,21 +1076,37 @@ class CliffsNotesTreeProvider {
       };
       branchItem.iconPath = new vscode.ThemeIcon('git-branch');
 
+      const defaultCommentsOnly = getDefaultCommentsOnly();
+      const modeBadge = defaultCommentsOnly ? '💬 Comments Only' : '📖 Full Guide + Comments';
       const effortItem = new vscode.TreeItem(
-        `Effort Level: ${effortSpec.badge}`,
+        `Effort & Mode: ${effortSpec.badge} • ${modeBadge}`,
         vscode.TreeItemCollapsibleState.None
       );
       effortItem.description = `${effortSpec.timeEstimate} • click to change`;
       effortItem.tooltip = new vscode.MarkdownString(
-        `### ${effortSpec.badge} Effort (${effortSpec.timeEstimate})\n\n${effortSpec.detail}\n\n*Click to change default review effort level.*`
+        `### ${effortSpec.badge} Effort • ${modeBadge} (${effortSpec.timeEstimate})\n\n${effortSpec.detail}\n\n*Click to switch between **Full Study Guide + Comments** and **Comments Only** mode, or change effort level.*`
       );
       effortItem.command = {
         command: 'quasar.selectEffortLevel',
-        title: 'Set Review Effort Level',
+        title: 'Set Review Mode & Effort Level',
       };
-      effortItem.iconPath = new vscode.ThemeIcon(effortSpec.icon);
+      effortItem.iconPath = new vscode.ThemeIcon(defaultCommentsOnly ? 'comment-discussion' : effortSpec.icon);
 
-      const emptyRootItems = [prItem, branchItem, effortItem];
+      const tutorialItem = new vscode.TreeItem(
+        'Interactive Tutorial: Try Quasar in a Sandbox PR...',
+        vscode.TreeItemCollapsibleState.None
+      );
+      tutorialItem.description = 'Instant hands-on playground';
+      tutorialItem.tooltip = new vscode.MarkdownString(
+        `### 🎓 Interactive Quasar Sandbox Tutorial\n\nLoads a pre-built sandbox PR (\`checkout_service.ts\`) in 1 second so you can try:\n- **Guided Tour & Interactive Flowchart**\n- **💬 Ask Agent to Change Comment** (revise verbosity/suggestions)\n- **🤔 Calibrate Preference** (teach Quasar your review style)\n- **🔧 Fix with Agent** (watch the agent patch code & sync the diff)\n- **💬 Comments-Only Mode** vs **📖 Full Study Guide**`
+      );
+      tutorialItem.command = {
+        command: 'quasar.startTutorial',
+        title: 'Start Interactive Tutorial',
+      };
+      tutorialItem.iconPath = new vscode.ThemeIcon('mortar-board');
+
+      const emptyRootItems = [prItem, branchItem, effortItem, tutorialItem];
       if (pastReviews.length > 0) {
         const pastNode = new vscode.TreeItem(
           `Past Reviews (${pastReviews.length})`,
@@ -991,17 +1124,21 @@ class CliffsNotesTreeProvider {
       const rootItems = [];
       const pr = session.pr || {};
       const isLocal = !pr.number;
+      const isCommentsOnly = Boolean(session.commentsOnly);
       const sessionEffortSpec = getEffortSpec(session.effortLevel || getDefaultEffortLevel());
+      const modeLabel = isCommentsOnly ? '💬 Comments Only' : sessionEffortSpec.badge;
       const prLabel = pr.number
         ? `PR #${pr.number}: ${pr.title || ''}`
         : pr.title || `Branch: ${pr.headRefName || 'HEAD'}`;
       const headerItem = new vscode.TreeItem(prLabel, vscode.TreeItemCollapsibleState.None);
       headerItem.description = isLocal
-        ? `${sessionEffortSpec.badge} • ${pr.headRefName || 'HEAD'} → ${pr.baseRefName || 'main'} • +${pr.additions || 0}/-${pr.deletions || 0}`
-        : `${sessionEffortSpec.badge} • @${pr.author || 'author'} • +${pr.additions || 0}/-${pr.deletions || 0}`;
+        ? `${modeLabel} • ${pr.headRefName || 'HEAD'} → ${pr.baseRefName || 'main'} • +${pr.additions || 0}/-${pr.deletions || 0}`
+        : `${modeLabel} • @${pr.author || 'author'} • +${pr.additions || 0}/-${pr.deletions || 0}`;
       headerItem.iconPath = new vscode.ThemeIcon(
         session.analysisStatus === 'analyzing'
           ? 'sync~spin'
+          : isCommentsOnly
+          ? 'comment-discussion'
           : isLocal
           ? 'git-branch'
           : 'book'
@@ -1013,14 +1150,18 @@ class CliffsNotesTreeProvider {
             : `**Author**: \`@${pr.author || 'unknown'}\`  |  `) +
           `**Changes**: \`+${pr.additions || 0} / -${pr.deletions || 0}\`\n\n` +
           `${(session.cliffsNotes && session.cliffsNotes.tldr) || ''}\n\n` +
-          `*Click to open the full CliffsNotes Study Guide beside your editor.*`
+          (isCommentsOnly
+            ? `*Comments-Only mode active — see **Review Comments & Cart** below to stage comments for GitHub or fix them with the Agent.*`
+            : `*Click to open the full CliffsNotes Study Guide beside your editor.*`)
       );
       headerItem.tooltip = mdTooltip;
       headerItem.contextValue = 'pr-header';
-      headerItem.command = {
-        command: 'quasar.openCliffsNotesGuide',
-        title: 'Open CliffsNotes Study Guide',
-      };
+      if (!isCommentsOnly) {
+        headerItem.command = {
+          command: 'quasar.openCliffsNotesGuide',
+          title: 'Open CliffsNotes Study Guide',
+        };
+      }
       rootItems.push(headerItem);
 
       if (pr.isOwnedByUser && pr.needsBranchSwitch && pr.headRefName) {
@@ -1044,15 +1185,34 @@ class CliffsNotesTreeProvider {
         rootItems.push(switchItem);
       }
 
-      // At-a-Glance CliffsNotes Summary node
-      const summaryNode = new vscode.TreeItem(
-        'At-a-Glance CliffsNotes',
-        vscode.TreeItemCollapsibleState.Expanded
-      );
-      summaryNode.iconPath = new vscode.ThemeIcon('sparkle');
-      summaryNode.contextValue = 'cliffs-summary-root';
-      summaryNode.nodeType = 'summary-root';
-      rootItems.push(summaryNode);
+      if (isCommentsOnly) {
+        const activeCount = (session.threads || []).filter(
+          (t) => t.status !== 'dismissed' && t.status !== 'fixed'
+        ).length;
+        const commentsOnlyNode = new vscode.TreeItem(
+          session.analysisStatus === 'analyzing'
+            ? '💬 Generating Review Comments (Study Guide Skipped)...'
+            : `💬 Comments-Only Mode (${activeCount} active comment${activeCount === 1 ? '' : 's'})`,
+          vscode.TreeItemCollapsibleState.None
+        );
+        commentsOnlyNode.description = 'Publish to GitHub or Fix below';
+        commentsOnlyNode.iconPath = new vscode.ThemeIcon('comment-discussion');
+        commentsOnlyNode.tooltip = new vscode.MarkdownString(
+          `### 💬 Comments-Only Review Mode\n\n` +
+            `CliffsNotes Study Guide and reading tour generation were skipped so you can go straight to publishing review comments to GitHub or fixing them with the agent.`
+        );
+        rootItems.push(commentsOnlyNode);
+      } else {
+        // At-a-Glance CliffsNotes Summary node
+        const summaryNode = new vscode.TreeItem(
+          'At-a-Glance CliffsNotes',
+          vscode.TreeItemCollapsibleState.Expanded
+        );
+        summaryNode.iconPath = new vscode.ThemeIcon('sparkle');
+        summaryNode.contextValue = 'cliffs-summary-root';
+        summaryNode.nodeType = 'summary-root';
+        rootItems.push(summaryNode);
+      }
 
       // Chapters
       for (const ch of session.chapters || []) {
@@ -1966,6 +2126,25 @@ class ChecksTreeProvider {
 // ============================================================================
 function activate(context) {
   fs.mkdirSync(REVIEW_STATE_DIR, { recursive: true });
+  touchWindowRegistration(Boolean(vscode.window.state && vscode.window.state.focused));
+  if (typeof vscode.window.onDidChangeWindowState === 'function') {
+    context.subscriptions.push(
+      vscode.window.onDidChangeWindowState((e) => {
+        if (e && e.focused) {
+          touchWindowRegistration(true);
+        }
+      })
+    );
+  }
+  if (typeof vscode.window.onDidChangeActiveTextEditor === 'function') {
+    context.subscriptions.push(
+      vscode.window.onDidChangeActiveTextEditor(() => {
+        if (vscode.window.state && vscode.window.state.focused) {
+          touchWindowRegistration(true);
+        }
+      })
+    );
+  }
 
   const cliffsProvider = new CliffsNotesTreeProvider();
   const commentsProvider = new CommentsTreeProvider();
@@ -2014,8 +2193,8 @@ function activate(context) {
     'Quasar'
   );
   commentController.options = {
-    prompt: 'Ask Quasar about these lines, teach Quasar your preference, or stage a comment for GitHub...',
-    placeHolder: 'e.g. "Is this null-safe?", "Stop flagging private helpers", or "nit: Prefer final here"',
+    prompt: 'Comment to have the agent change this Quasar comment, ask about these lines, or teach a preference...',
+    placeHolder: 'e.g. "Make this shorter", "Change to suggest WeakReference instead", or "Is this null-safe?"',
   };
   context.subscriptions.push(commentController);
 
@@ -2113,6 +2292,8 @@ function activate(context) {
           author: { name: m.author || 'Quasar' },
           body: md,
           mode: vscode.CommentMode.Preview,
+          threadId: t.id,
+          contextValue: 'quasar-comment',
         };
       });
 
@@ -2593,6 +2774,20 @@ function activate(context) {
                 <button type="button" class="q-btn q-btn-sm" data-act="jumpToThread" data-thread-id="${escapeHtmlText(
                   t.id
                 )}">🔍 Jump</button>
+                ${
+                  t.status !== 'fixed'
+                    ? `<button type="button" class="q-btn q-btn-sm" data-act="commentOnThread" data-thread-id="${escapeHtmlText(
+                        t.id
+                      )}" title="Comment on this Quasar comment to have the agent change or revise it">💬 Change</button>`
+                    : ''
+                }
+                ${
+                  canStage && t.status !== 'fixed'
+                    ? `<button type="button" class="q-btn q-btn-sm" data-act="editThread" data-thread-id="${escapeHtmlText(
+                        t.id
+                      )}" title="Directly edit the draft GitHub comment text">✏️ Edit</button>`
+                    : ''
+                }
                 ${
                   t.status === 'uncertain'
                     ? `<button type="button" class="q-btn q-btn-primary q-btn-sm" data-act="calibrateThread" data-thread-id="${escapeHtmlText(
@@ -3095,6 +3290,42 @@ function activate(context) {
     </div>
   </div>
 
+  ${
+    session.isTutorial
+      ? `<div class="q-section" style="border: 1px solid var(--q-accent); background: rgba(79, 140, 255, 0.06);">
+          <h2>
+            <span>🎓 Interactive Quasar Sandbox Tutorial (5 Quick Steps)</span>
+            <button type="button" class="q-btn q-btn-sm" data-act="runCommand" data-cmd="quasar.startTutorial">↺ Reset Sandbox</button>
+          </h2>
+          <p style="margin: 0 0 10px 0; font-size: 12.5px; color: var(--q-muted);">
+            This sandbox PR (<code>src/checkout_service.ts</code>) is backed by a real local git repository so you can test every Quasar workflow safely:
+          </p>
+          <div style="display: grid; gap: 8px; font-size: 12.5px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; padding:7px 10px; border-radius:6px; background:var(--q-card-bg); border:1px solid var(--q-border);">
+              <span><strong>1. Guided Diff Tour &amp; Flowchart</strong> — Click any flowchart box below or open Stop 1.1 to inspect the side-by-side diff and hover cards.</span>
+              <button type="button" class="q-btn q-btn-sm q-btn-primary" data-act="openStop" data-stop-id="stop-1-1">🔍 Open Stop 1.1</button>
+            </div>
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; padding:7px 10px; border-radius:6px; background:var(--q-card-bg); border:1px solid var(--q-border);">
+              <span><strong>2. Ask Agent to Change a Comment</strong> — Tell Quasar to make Finding #1 shorter, remove its code suggestion, or change its severity.</span>
+              <button type="button" class="q-btn q-btn-sm q-btn-primary" data-act="commentOnThread" data-thread-id="tutorial-finding-1">💬 Change Comment #1</button>
+            </div>
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; padding:7px 10px; border-radius:6px; background:var(--q-card-bg); border:1px solid var(--q-border);">
+              <span><strong>3. Calibrate Your Reviewer Preferences</strong> — Answer the preference check on Finding #2 so Quasar learns what you want flagged or skipped.</span>
+              <button type="button" class="q-btn q-btn-sm" data-act="calibrateThread" data-thread-id="tutorial-finding-2">🤔 Calibrate Preference</button>
+            </div>
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; padding:7px 10px; border-radius:6px; background:var(--q-card-bg); border:1px solid var(--q-border);">
+              <span><strong>4. Fix Selected Comments with Agent</strong> — Have the agent patch the divide-by-zero bug in the sandbox repo and mark Finding #1 <code>✅ Fixed</code>.</span>
+              <button type="button" class="q-btn q-btn-sm" data-act="runCommand" data-cmd="quasar.fixSelectedComments">🔧 Fix Checked Comment</button>
+            </div>
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; padding:7px 10px; border-radius:6px; background:var(--q-card-bg); border:1px solid var(--q-border);">
+              <span><strong>5. Switch Review Mode (Full Guide vs. Comments Only)</strong> — Try toggling between Full Study Guide mode and Comments-Only mode.</span>
+              <button type="button" class="q-btn q-btn-sm" data-act="runCommand" data-cmd="quasar.selectEffortLevel">⚡ Mode &amp; Effort</button>
+            </div>
+          </div>
+        </div>`
+      : ''
+  }
+
   <div class="q-section" id="summary-section">
     <h2>⚡ In Plain English</h2>
     <div class="q-tldr-box">${formatInlineMd(headlineSource)}</div>
@@ -3275,6 +3506,10 @@ function activate(context) {
           vscode.postMessage({ type: 'nextTourStop' });
         } else if (act === 'jumpToThread') {
           vscode.postMessage({ type: 'jumpToThread', threadId: el.getAttribute('data-thread-id') });
+        } else if (act === 'commentOnThread') {
+          vscode.postMessage({ type: 'commentOnThread', threadId: el.getAttribute('data-thread-id') });
+        } else if (act === 'editThread') {
+          vscode.postMessage({ type: 'editThread', threadId: el.getAttribute('data-thread-id') });
         } else if (act === 'toggleStageThread') {
           vscode.postMessage({ type: 'toggleStageThread', threadId: el.getAttribute('data-thread-id') });
         } else if (act === 'toggleFixThread') {
@@ -3319,8 +3554,7 @@ function activate(context) {
 
   async function openInteractiveCliffsNotesPanel(sectionAnchor = '') {
     const session = loadActiveSession();
-    const mdPath = getWindowCliffsNotesMdPath();
-    if (!session && !fs.existsSync(mdPath)) {
+    if (!session) {
       vscode.window.showInformationMessage(
         'No active CliffsNotes guide in this window yet. Load a PR URL or local branch first.'
       );
@@ -3418,6 +3652,12 @@ function activate(context) {
       } else if (msg.type === 'jumpToThread') {
         const t = (curSession.threads || []).find((th) => th.id === msg.threadId);
         if (t) await vscode.commands.executeCommand('quasar.jumpToThread', t);
+      } else if (msg.type === 'commentOnThread') {
+        const t = (curSession.threads || []).find((th) => th.id === msg.threadId);
+        if (t) await vscode.commands.executeCommand('quasar.commentOnComment', { threadId: t.id });
+      } else if (msg.type === 'editThread') {
+        const t = (curSession.threads || []).find((th) => th.id === msg.threadId);
+        if (t) await vscode.commands.executeCommand('quasar.editDraftComment', { threadId: t.id });
       } else if (msg.type === 'toggleStageThread') {
         const t = (curSession.threads || []).find((th) => th.id === msg.threadId);
         if (t) {
@@ -3596,12 +3836,22 @@ function activate(context) {
       }
 
       if (isNewSession || justFinishedAnalysis) {
-        const stops = getAllTourStops(session);
-        if (stops.length > 0) {
-          openTourStopInDiff(stops[0], true);
-        }
-        if (justFinishedAnalysis) {
-          openInteractiveCliffsNotesPanel().catch(() => {});
+        if (session.commentsOnly) {
+          const activeThreads = (session.threads || []).filter((t) => t.status !== 'dismissed');
+          if (activeThreads.length > 0 && typeof jumpToThreadInDiff === 'function') {
+            jumpToThreadInDiff(activeThreads[0]);
+          }
+          if (justFinishedAnalysis) {
+            vscode.commands.executeCommand('quasar.commentsTree.focus').catch(() => {});
+          }
+        } else {
+          const stops = getAllTourStops(session);
+          if (stops.length > 0) {
+            openTourStopInDiff(stops[0], true);
+          }
+          if (justFinishedAnalysis) {
+            openInteractiveCliffsNotesPanel().catch(() => {});
+          }
         }
       }
     }
@@ -3739,31 +3989,75 @@ function activate(context) {
     }
   }
 
-  async function pickEffortLevelForReview(contextLabel = '') {
-    const currentDefault = getDefaultEffortLevel();
-    const order = [
-      currentDefault,
-      ...['low', 'medium', 'high'].filter((lvl) => lvl !== currentDefault),
-    ];
-    const items = order.map((lvl) => {
-      const spec = getEffortSpec(lvl);
-      const isDefault = lvl === currentDefault;
-      return {
-        label: isDefault ? `${spec.title} (Current Default)` : spec.title,
-        description: spec.description,
-        detail: spec.detail,
-        effort: lvl,
-      };
+  function buildReviewModeAndEffortChoices(currentEffort, currentCommentsOnly) {
+    const allChoices = [];
+    for (const commentsOnly of [false, true]) {
+      for (const lvl of ['low', 'medium', 'high']) {
+        const spec = getEffortSpec(lvl);
+        const isDefault = lvl === currentEffort && commentsOnly === currentCommentsOnly;
+        if (commentsOnly) {
+          allChoices.push({
+            label: `${isDefault ? '$(check) ' : ''}💬 Comments Only — ${spec.shortLabel}${
+              isDefault ? ' (Current Default)' : ''
+            }`,
+            description: `${spec.timeEstimate} • Skip study guide & tour; just produce comments to send to GitHub or fix`,
+            detail: `No CliffsNotes webview or reading tour stops. Produces verified review comments (${spec.description}).`,
+            effort: lvl,
+            commentsOnly: true,
+            isDefault,
+          });
+        } else {
+          allChoices.push({
+            label: `${isDefault ? '$(check) ' : ''}${spec.title}${
+              isDefault ? ' (Current Default)' : ''
+            }`,
+            description: `📖 Full Study Guide + Comments • ${spec.description}`,
+            detail: spec.detail,
+            effort: lvl,
+            commentsOnly: false,
+            isDefault,
+          });
+        }
+      }
+    }
+    // Sort so Current Default is always first, followed by the user's preferred mode
+    allChoices.sort((a, b) => {
+      if (a.isDefault !== b.isDefault) return a.isDefault ? -1 : 1;
+      if (a.commentsOnly !== b.commentsOnly) {
+        return a.commentsOnly === currentCommentsOnly ? -1 : 1;
+      }
+      return 0;
     });
+    return allChoices;
+  }
+
+  let lastPickedCommentsOnly = getDefaultCommentsOnly();
+
+  async function pickEffortLevelForReview(contextLabel = '') {
+    const currentDefaultEffort = getDefaultEffortLevel();
+    const currentDefaultCommentsOnly = getDefaultCommentsOnly();
+    const items = buildReviewModeAndEffortChoices(
+      currentDefaultEffort,
+      currentDefaultCommentsOnly
+    );
     const picked = await vscode.window.showQuickPick(items, {
       title: contextLabel
-        ? `Quasar Review Effort (${contextLabel})`
-        : 'Quasar: Choose Review Effort Level',
-      placeHolder: 'Press Enter for current default, or choose Low (Fast), Medium (Balanced), or High (Deep)',
+        ? `Quasar Review Mode & Effort (${contextLabel})`
+        : 'Quasar: Choose Review Mode & Effort Level',
+      placeHolder:
+        'Press Enter for current default, or choose Full Study Guide vs 💬 Comments Only (Low / Medium / High)',
     });
     if (!picked) return null;
-    if (picked.effort !== currentDefault) {
-      await runManagePreferences(['--set-effort', picked.effort]);
+    lastPickedCommentsOnly = Boolean(picked.commentsOnly);
+    const prefArgs = [];
+    if (picked.effort !== currentDefaultEffort) {
+      prefArgs.push('--set-effort', picked.effort);
+    }
+    if (Boolean(picked.commentsOnly) !== currentDefaultCommentsOnly) {
+      prefArgs.push('--set-comments-only', picked.commentsOnly ? 'true' : 'false');
+    }
+    if (prefArgs.length > 0) {
+      await runManagePreferences(prefArgs);
       refreshAllUI(false);
     }
     return picked.effort;
@@ -3771,32 +4065,85 @@ function activate(context) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('quasar.selectEffortLevel', async () => {
-      const currentDefault = getDefaultEffortLevel();
-      const items = ['low', 'medium', 'high'].map((lvl) => {
-        const spec = getEffortSpec(lvl);
-        const isCurrent = lvl === currentDefault;
-        return {
-          label: isCurrent ? `$(check) ${spec.title} (Active Default)` : spec.title,
-          description: spec.description,
-          detail: spec.detail,
-          effort: lvl,
-        };
-      });
+      const currentDefaultEffort = getDefaultEffortLevel();
+      const currentDefaultCommentsOnly = getDefaultCommentsOnly();
+      const items = buildReviewModeAndEffortChoices(
+        currentDefaultEffort,
+        currentDefaultCommentsOnly
+      );
       const picked = await vscode.window.showQuickPick(items, {
-        title: 'Quasar: Set Default Review Effort Level',
-        placeHolder: 'Low = fast single-pass (0 subagents) • Medium = 2 fast Flash subagents • High = 4 deep lenses',
+        title: 'Quasar: Set Default Review Mode & Effort Level',
+        placeHolder:
+          'Choose 📖 Full Study Guide + Comments or 💬 Comments Only (Low / Medium / High)',
       });
       if (!picked) return;
-      await runManagePreferences(['--set-effort', picked.effort]);
+      lastPickedCommentsOnly = Boolean(picked.commentsOnly);
+      await runManagePreferences([
+        '--set-effort',
+        picked.effort,
+        '--set-comments-only',
+        picked.commentsOnly ? 'true' : 'false',
+      ]);
       const session = loadActiveSession();
       if (session) {
         session.effortLevel = picked.effort;
+        session.commentsOnly = Boolean(picked.commentsOnly);
         saveActiveSession(session);
+        if (session.isTutorial) {
+          const collectScript = path.join(PLUGIN_SCRIPTS_DIR, 'collect_pr_context.py');
+          const windowWsRoot = getWindowWorkspaceRoot();
+          const tutArgs = [collectScript, '--tutorial', '--workspace-dir', windowWsRoot];
+          if (picked.commentsOnly) tutArgs.push('--comments-only');
+          execFile('python3', tutArgs, { timeout: 15000, env: getQuasarScriptEnv() }, () => {
+            refreshAllUI(false);
+          });
+        }
       }
       refreshAllUI(false);
       const chosenSpec = getEffortSpec(picked.effort);
+      const modeName = picked.commentsOnly ? '💬 Comments Only' : '📖 Full Guide + Comments';
       vscode.window.showInformationMessage(
-        `Quasar default effort set to ${chosenSpec.shortLabel} (${chosenSpec.description}).`
+        `Quasar default set to ${modeName} • ${chosenSpec.shortLabel} (${chosenSpec.description}).`
+      );
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.startTutorial', async () => {
+      const collectScript = path.join(PLUGIN_SCRIPTS_DIR, 'collect_pr_context.py');
+      const windowWsRoot = getWindowWorkspaceRoot();
+      await focusReviewSidebar();
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: '🎓 Quasar: Preparing Interactive Sandbox PR Tutorial...',
+          cancellable: false,
+        },
+        () =>
+          new Promise((resolve) => {
+            execFile(
+              'python3',
+              [collectScript, '--tutorial', '--workspace-dir', windowWsRoot],
+              { timeout: 20000, env: getQuasarScriptEnv() },
+              async (err) => {
+                if (err) {
+                  vscode.window.showErrorMessage(
+                    `Failed to start Quasar tutorial: ${err.message}`
+                  );
+                  resolve();
+                  return;
+                }
+                lastSessionId = null;
+                lastAnalysisStatus = 'analyzing';
+                refreshAllUI(true);
+                await openInteractiveCliffsNotesPanel();
+                vscode.window.showInformationMessage(
+                  '🎓 Quasar Sandbox Tutorial loaded! Follow the 5 steps at the top of the Study Guide or click Stop 1.1 in the diff editor.'
+                );
+                resolve();
+              }
+            );
+          })
       );
     })
   );
@@ -3808,6 +4155,7 @@ function activate(context) {
       const session = loadActiveSession();
       const prefs = loadReviewerPreferences();
       const defaultEffortSpec = getEffortSpec(prefs.defaultEffort);
+      const defaultModeLabel = prefs.defaultCommentsOnly ? '💬 Comments Only' : '📖 Full Guide';
       const rulesCount = (prefs.rules || []).length;
       const uncertainCount = session
         ? (session.threads || []).filter((t) => t.status === 'uncertain').length
@@ -3817,18 +4165,23 @@ function activate(context) {
       const items = [
         {
           label: '$(git-branch) Review Local Branch or Working-Tree Diff...',
-          description: `Pick a local git branch, commit range, or uncommitted changes (${defaultEffortSpec.shortLabel})`,
+          description: `Pick a local git branch, commit range, or uncommitted changes (${defaultEffortSpec.shortLabel} • ${defaultModeLabel})`,
           command: 'quasar.reviewLocalBranch',
         },
         {
           label: '$(git-pull-request) Review GitHub PR from URL or Number...',
-          description: `Paste a GitHub PR link or PR number (${defaultEffortSpec.shortLabel})`,
+          description: `Paste a GitHub PR link or PR number (${defaultEffortSpec.shortLabel} • ${defaultModeLabel})`,
           command: 'quasar.loadPrFromUrl',
         },
         {
-          label: `$(zap) Review Effort Level: ${defaultEffortSpec.shortLabel} (Change...)`,
-          description: defaultEffortSpec.description,
+          label: `$(zap) Review Mode & Effort: ${defaultModeLabel} • ${defaultEffortSpec.shortLabel} (Change...)`,
+          description: 'Switch between Full Study Guide and Comments Only, or change effort level',
           command: 'quasar.selectEffortLevel',
+        },
+        {
+          label: '$(mortar-board) Interactive Tutorial: Try Quasar in a Sandbox PR...',
+          description: 'Instant hands-on playground to try Tour Stops, Change Comment, Fix with Agent & Calibration',
+          command: 'quasar.startTutorial',
         },
         {
           label: `$(history) Past Reviews / Switch Review Session (${pastReviews.length} saved)...`,
@@ -3942,6 +4295,10 @@ function activate(context) {
         providedArg && typeof providedArg === 'object' && providedArg.effort
           ? normalizeEffortLevel(providedArg.effort)
           : null;
+      const providedCommentsOnly =
+        providedArg && typeof providedArg === 'object' && typeof providedArg.commentsOnly === 'boolean'
+          ? providedArg.commentsOnly
+          : null;
 
       const prUrl =
         providedUrl ||
@@ -3955,7 +4312,12 @@ function activate(context) {
       const trimmedUrl = prUrl.trim();
       const effortLevel = providedEffort || (await pickEffortLevelForReview(trimmedUrl));
       if (!effortLevel) return;
+      const commentsOnly =
+        providedCommentsOnly !== null ? providedCommentsOnly : Boolean(lastPickedCommentsOnly);
       const effortSpec = getEffortSpec(effortLevel);
+      const modeTitleTag = commentsOnly
+        ? `Comments Only • ${effortSpec.shortLabel}`
+        : effortSpec.shortLabel;
 
       const collectScript = path.join(PLUGIN_SCRIPTS_DIR, 'collect_pr_context.py');
       const workspaceRepo = await detectWorkspaceRepoDir();
@@ -3966,7 +4328,7 @@ function activate(context) {
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: `Quasar (${effortSpec.shortLabel}): Loading ${trimmedUrl}...`,
+          title: `Quasar (${modeTitleTag}): Loading ${trimmedUrl}...`,
           cancellable: false,
         },
         (progress) =>
@@ -3978,6 +4340,7 @@ function activate(context) {
               trimmedUrl,
               '--effort',
               effortLevel,
+              commentsOnly ? '--comments-only' : '--full-guide',
               '--workspace-dir',
               windowWsRoot,
             ];
@@ -3996,14 +4359,17 @@ function activate(context) {
                 }
                 refreshAllUI(true);
                 progress.report({
-                  message: `Initial tour ready! Dispatching Quasar (${effortSpec.shortLabel})...`,
+                  message: `Snapshots ready! Dispatching Quasar (${modeTitleTag})...`,
                 });
-                const effortInstruction = buildEffortPromptInstruction(effortLevel);
+                const effortInstruction = buildEffortPromptInstruction(effortLevel, commentsOnly);
+                const publishFlags = commentsOnly
+                  ? `--comments-only --workspace-dir "${windowWsRoot}"`
+                  : `--workspace-dir "${windowWsRoot}"`;
                 await sendPromptToQuasar(
-                  `Review ${trimmedUrl} using the quasar skill for workspace "${windowWsRoot}" (context initialized in "${windowStateDir}/pr_context.json"). ${effortInstruction} Publish the CliffsNotes session via \`publish_review_session.py --workspace-dir "${windowWsRoot}"\`.`,
-                  `Quasar (${effortSpec.shortLabel}): ${trimmedUrl}`,
+                  `Review ${trimmedUrl} using the quasar skill for workspace "${windowWsRoot}" (context initialized in "${windowStateDir}/pr_context.json"). ${effortInstruction} Publish the session via \`publish_review_session.py ${publishFlags}\`.`,
+                  `Quasar (${modeTitleTag}): ${trimmedUrl}`,
                   null,
-                  { effortLevel }
+                  { effortLevel, commentsOnly }
                 );
                 resolve();
               }
@@ -4182,10 +4548,19 @@ function activate(context) {
       }
 
       const repoName = path.basename(repoDir);
+      const providedCommentsOnly =
+        providedArgs && typeof providedArgs === 'object' && typeof providedArgs.commentsOnly === 'boolean'
+          ? providedArgs.commentsOnly
+          : null;
       const effortLevel =
         providedEffort || (await pickEffortLevelForReview(`${repoName}@${targetBranch}`));
       if (!effortLevel) return;
+      const commentsOnly =
+        providedCommentsOnly !== null ? providedCommentsOnly : Boolean(lastPickedCommentsOnly);
       const effortSpec = getEffortSpec(effortLevel);
+      const modeTitleTag = commentsOnly
+        ? `Comments Only • ${effortSpec.shortLabel}`
+        : effortSpec.shortLabel;
 
       const collectScript = path.join(PLUGIN_SCRIPTS_DIR, 'collect_pr_context.py');
       const windowWsRoot = getWindowWorkspaceRoot();
@@ -4195,7 +4570,7 @@ function activate(context) {
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: `Quasar (${effortSpec.shortLabel}): Loading branch ${targetBranch} in ${repoName}...`,
+          title: `Quasar (${modeTitleTag}): Loading branch ${targetBranch} in ${repoName}...`,
           cancellable: false,
         },
         (progress) =>
@@ -4211,6 +4586,7 @@ function activate(context) {
               targetBranch,
               '--effort',
               effortLevel,
+              commentsOnly ? '--comments-only' : '--full-guide',
             ];
             if (targetBase && targetBase !== 'auto') {
               scriptArgs.push('--base', targetBase);
@@ -4233,15 +4609,18 @@ function activate(context) {
                 }
                 refreshAllUI(true);
                 progress.report({
-                  message: `Initial tour ready! Dispatching Quasar (${effortSpec.shortLabel})...`,
+                  message: `Snapshots ready! Dispatching Quasar (${modeTitleTag})...`,
                 });
                 const baseDesc = targetBase && targetBase !== 'auto' ? ` (base: ${targetBase})` : '';
-                const effortInstruction = buildEffortPromptInstruction(effortLevel);
+                const effortInstruction = buildEffortPromptInstruction(effortLevel, commentsOnly);
+                const publishFlags = commentsOnly
+                  ? `--comments-only --workspace-dir "${windowWsRoot}"`
+                  : `--workspace-dir "${windowWsRoot}"`;
                 await sendPromptToQuasar(
-                  `Review local branch "${targetBranch}"${baseDesc} in repository "${repoDir}" using the quasar skill for workspace "${windowWsRoot}". Context and snapshots are already initialized in "${windowStateDir}/active_session.json" (and "${windowStateDir}/pr_context.json" / "${windowStateDir}/pr.diff"). ${effortInstruction} Run Phase 2 and Phase 3 (\`publish_review_session.py --workspace-dir "${windowWsRoot}"\`).`,
-                  `Quasar (${effortSpec.shortLabel}): ${repoName}@${targetBranch}`,
+                  `Review local branch "${targetBranch}"${baseDesc} in repository "${repoDir}" using the quasar skill for workspace "${windowWsRoot}". Context and snapshots are already initialized in "${windowStateDir}/active_session.json" (and "${windowStateDir}/pr_context.json" / "${windowStateDir}/pr.diff"). ${effortInstruction} Run Phase 2 and Phase 3 (\`publish_review_session.py ${publishFlags}\`).`,
+                  `Quasar (${modeTitleTag}): ${repoName}@${targetBranch}`,
                   null,
-                  { effortLevel }
+                  { effortLevel, commentsOnly }
                 );
                 resolve();
               }
@@ -4313,38 +4692,131 @@ function activate(context) {
     })
   );
 
-  // 6. Ask Quasar Directly Inside a Native Comment Thread
-  async function handleAskInThread(replyOrThread, explicitQuestion) {
+  // Helper to keep the top finding message card in sync when draftComment/title/whyItMatters changes
+  function syncPrimaryThreadMessageInJs(t) {
+    if (!t || !Array.isArray(t.messages) || t.messages.length === 0) return;
+    const first = t.messages[0];
+    if (!first || first.author !== 'Quasar') return;
+    const firstBody = String(first.body || '');
+    if (
+      !firstBody.includes('**Draft GitHub Comment**:') &&
+      !firstBody.includes('**Candidate GitHub Comment (if kept)**:') &&
+      t.kind !== 'ai_candidate'
+    ) {
+      return;
+    }
+    const title = t.title || 'Review Finding';
+    const why = t.whyItMatters || '';
+    const draft = t.draftComment || '';
+    if (t.status === 'uncertain') {
+      const q =
+        t.uncertaintyQuestion ||
+        `Do you want Quasar to flag issues like "${title}" in future reviews, or skip this pattern?`;
+      first.body =
+        `### 🤔 Preference Check: ${title}\n\n` +
+        `**Question for You**: *${q}*\n\n` +
+        `*Context & Trade-off*: ${why}\n\n` +
+        `---\n` +
+        `**Candidate GitHub Comment (if kept)**:\n> ${draft}\n\n` +
+        `*(Use the **🤔 Calibrate Preference** button above or 👍/👎 to teach Quasar how to handle this in the future.)*`;
+    } else {
+      const parts = [`**${title}**`];
+      if (why) parts.push(`*CliffsNotes Context*: ${why}`);
+      if (draft) parts.push(`---\n**Draft GitHub Comment**:\n> ${draft}`);
+      first.body = parts.join('\n\n');
+    }
+  }
+
+  function extractThreadCodeSnippet(session, relPath, startLine, endLine, explicitFsPath = null) {
+    const candidates = [
+      explicitFsPath,
+      session.headSnapshotRoot && relPath ? path.join(session.headSnapshotRoot, relPath) : null,
+      session.repoDir && relPath ? path.join(session.repoDir, relPath) : null,
+    ].filter(Boolean);
+    for (const filePath of candidates) {
+      try {
+        if (!fs.existsSync(filePath)) continue;
+        const fileLines = fs.readFileSync(filePath, 'utf-8').split('\n');
+        const s = Math.max(0, (startLine || 1) - 8);
+        const e = Math.min(fileLines.length, (endLine || startLine || 1) + 8);
+        return fileLines
+          .slice(s, e)
+          .map((l, idx) => `${s + idx + 1}: ${l}`)
+          .join('\n');
+      } catch (_) {}
+    }
+    return '';
+  }
+
+  // 6. Ask Quasar Directly Inside a Native Comment Thread (or Comment to Change a Quasar Comment)
+  async function handleAskInThread(replyOrThread, explicitQuestion, options = {}) {
     const session = loadActiveSession();
-    if (!session) return;
+    if (!session || !replyOrThread) return;
 
     const thread = replyOrThread.thread || replyOrThread;
-    const questionText = (explicitQuestion || replyOrThread.text || '').trim();
-    if (!questionText) return;
+    const preResolvedId = resolveThreadId(replyOrThread) || (thread && thread.threadId) || null;
+    const existingThread = preResolvedId
+      ? (session.threads || []).find((t) => t.id === preResolvedId)
+      : null;
 
-    const docFsPath = thread.uri.fsPath;
-    const relPath = thread.relPath || inferRelPathFromDocument(docFsPath, session) || path.basename(docFsPath);
-    const startLine = (thread.range ? thread.range.start.line : 0) + 1;
-    const endLine = (thread.range ? thread.range.end.line : startLine - 1) + 1;
+    let questionText = (
+      explicitQuestion ||
+      (typeof replyOrThread.text === 'string' ? replyOrThread.text : '') ||
+      ''
+    ).trim();
 
-    // Extract surrounding code snippet for precision
-    let codeSnippet = '';
-    try {
-      const fileLines = fs.readFileSync(docFsPath, 'utf-8').split('\n');
-      const s = Math.max(0, startLine - 8);
-      const e = Math.min(fileLines.length, endLine + 8);
-      codeSnippet = fileLines
-        .slice(s, e)
-        .map((l, idx) => `${s + idx + 1}: ${l}`)
-        .join('\n');
-    } catch (_) {}
+    if (!questionText) {
+      const isChangeMode = Boolean(options.changeCommentMode || existingThread);
+      const targetTitle = existingThread
+        ? existingThread.title || path.basename(existingThread.path || '')
+        : 'This Code';
+      const currentDraftPreview = existingThread
+        ? String(existingThread.draftComment || '').replace(/\s+/g, ' ').slice(0, 110)
+        : '';
+      const input = await vscode.window.showInputBox({
+        title: isChangeMode
+          ? `💬 Comment on "${targetTitle}" (Ask Quasar to Change)`
+          : `💬 Ask Quasar About ${targetTitle}`,
+        prompt:
+          isChangeMode && currentDraftPreview
+            ? `Current draft: "${currentDraftPreview}${
+                (existingThread.draftComment || '').length > 110 ? '…' : ''
+              }" — Comment on how the agent should change or revise this comment`
+            : 'Enter your comment or question for Quasar',
+        placeHolder: isChangeMode
+          ? 'e.g. "Make this shorter", "Change to suggest WeakReference instead", or "Phrase as a question"'
+          : 'e.g. "Is this null-safe?" or "Change this comment to suggest final instead"',
+      });
+      if (!input || !input.trim()) return;
+      questionText = input.trim();
+    }
 
-    let threadId = thread.threadId;
+    const docFsPath =
+      thread && thread.uri && thread.uri.fsPath
+        ? thread.uri.fsPath
+        : existingThread && existingThread.path
+        ? path.join(session.headSnapshotRoot || session.repoDir || '', existingThread.path)
+        : '';
+    const relPath =
+      (existingThread && existingThread.path) ||
+      (thread && thread.relPath) ||
+      (docFsPath ? inferRelPathFromDocument(docFsPath, session) || path.basename(docFsPath) : '');
+    const startLine = existingThread
+      ? existingThread.startLine || 1
+      : ((thread && thread.range ? thread.range.start.line : 0) + 1);
+    const endLine = existingThread
+      ? existingThread.endLine || startLine
+      : ((thread && thread.range ? thread.range.end.line : startLine - 1) + 1);
+
+    const codeSnippet = extractThreadCodeSnippet(session, relPath, startLine, endLine, docFsPath);
+
+    let threadId = preResolvedId;
     const nowIso = new Date().toISOString();
+    const isUpdatingExisting = Boolean(existingThread);
 
-    if (!threadId) {
+    if (!threadId || !existingThread) {
       threadId = `qa-${Date.now()}`;
-      thread.threadId = threadId;
+      if (thread) thread.threadId = threadId;
       session.threads = session.threads || [];
       session.threads.push({
         id: threadId,
@@ -4372,45 +4844,105 @@ function activate(context) {
         ],
       });
     } else {
-      const existing = (session.threads || []).find((t) => t.id === threadId);
-      if (existing) {
-        existing.messages = existing.messages || [];
-        existing.messages.push(
-          {
-            author: 'You',
-            body: questionText,
-            timestamp: nowIso,
-          },
-          {
-            author: 'Quasar',
-            body: '_⏳ Quasar is analyzing this code hunk..._',
-            timestamp: nowIso,
-            pending: true,
-          }
-        );
-      }
+      existingThread.messages = (existingThread.messages || []).filter(
+        (m) => !m.pending && !String(m.body || '').includes('⏳ Quasar is ')
+      );
+      existingThread.messages.push(
+        {
+          author: 'You',
+          body: questionText,
+          timestamp: nowIso,
+        },
+        {
+          author: 'Quasar',
+          body: options.changeCommentMode
+            ? '_⏳ Quasar is updating this comment based on your feedback..._'
+            : '_⏳ Quasar is analyzing your comment..._',
+          timestamp: nowIso,
+          pending: true,
+        }
+      );
     }
 
     saveActiveSession(session);
     refreshAllUI(false);
 
     const answerScript = path.join(PLUGIN_SCRIPTS_DIR, 'answer_comment_question.py');
-    const prompt =
-      `The reviewer asked an inline code review question in \`${relPath}\` (lines ${startLine}-${endLine}) on PR #${
-        (session.pr && session.pr.number) || 'local'
-      }:\n\n` +
-      `Question: "${questionText}"\n\n` +
-      `Code Context:\n\`\`\`\n${codeSnippet}\n\`\`\`\n\n` +
-      `Please investigate the codebase if needed and reply directly into the inline comment thread by running:\n` +
-      `\`python3 "${answerScript}" --thread-id "${threadId}" --answer "<YOUR_CONCISE_MARKDOWN_ANSWER>"\`\n` +
-      `(If the reviewer asked to refine/update the draft GitHub comment, also pass \`--updated-draft "<NEW_DRAFT>"\`).`;
+    const windowWsRoot = getWindowWorkspaceRoot();
 
-    await sendPromptToQuasar(prompt, `Comment Question: ${ path.basename(relPath) }:${startLine}`);
+    let prompt = '';
+    if (isUpdatingExisting && existingThread) {
+      const priorHistory = (existingThread.messages || [])
+        .filter((m) => !m.pending)
+        .slice(-6)
+        .map((m) => `- **${m.author || 'User'}**: ${String(m.body || '').replace(/\n+/g, ' ')}`)
+        .join('\n');
+
+      prompt =
+        `The reviewer commented on Quasar review comment \`${threadId}\` in \`${relPath}\` (lines ${startLine}-${endLine}) on PR #${
+          (session.pr && session.pr.number) || 'local'
+        }:\n\n` +
+        `Reviewer's Comment / Change Request:\n"${questionText}"\n\n` +
+        `Current Quasar Comment State:\n` +
+        `- **Thread ID**: \`${threadId}\`\n` +
+        `- **Title**: ${existingThread.title || ''}\n` +
+        `- **Severity**: ${existingThread.severity || 'DESIGN'} (Status: ${existingThread.status || 'staged'})\n` +
+        `- **CliffsNotes Context (whyItMatters)**: ${existingThread.whyItMatters || ''}\n` +
+        `- **Current Draft GitHub Comment**:\n\`\`\`\n${existingThread.draftComment || ''}\n\`\`\`\n\n` +
+        (priorHistory ? `Recent Thread History:\n${priorHistory}\n\n` : '') +
+        (codeSnippet ? `Code Context (\`${relPath}:L${startLine}-${endLine}\`):\n\`\`\`\n${codeSnippet}\n\`\`\`\n\n` : '') +
+        `Please update the Quasar comment (or answer their comment) directly in place by running:\n` +
+        `\`python3 "${answerScript}" --thread-id "${threadId}" --workspace-dir "${windowWsRoot}" --updated-draft "<REVISED_GITHUB_COMMENT>" --answer "<BRIEF_CONFIRMATION_OR_ANSWER>"\`\n\n` +
+        `Optional flags if requested by the reviewer's comment:\n` +
+        `- \`--updated-title "<NEW_TITLE>"\` (if the title should also change)\n` +
+        `- \`--updated-why "<NEW_RATIONALE>"\` (if the CliffsNotes context/rationale should change)\n` +
+        `- \`--updated-severity "<BLOCKING|DESIGN|NIT>"\` (if the reviewer asked to change severity)\n` +
+        `- \`--start-line <N> --end-line <M>\` (if the comment should move to different lines)\n` +
+        `- \`--stage\`, \`--unstage\`, or \`--dismiss\` (if the reviewer asked to stage, unstage, or remove the comment)\n` +
+        `- \`--learned-rule "<GENERALIZED_PREFERENCE_RULE>" --sentiment <prefer|avoid|custom>\` (if the reviewer's comment also expresses a reusable preference for future reviews)`;
+    } else {
+      prompt =
+        `The reviewer asked an inline code review question in \`${relPath}\` (lines ${startLine}-${endLine}) on PR #${
+          (session.pr && session.pr.number) || 'local'
+        }:\n\n` +
+        `Question: "${questionText}"\n\n` +
+        `Code Context:\n\`\`\`\n${codeSnippet}\n\`\`\`\n\n` +
+        `Please investigate the codebase if needed and reply directly into the inline comment thread by running:\n` +
+        `\`python3 "${answerScript}" --thread-id "${threadId}" --workspace-dir "${windowWsRoot}" --answer "<YOUR_CONCISE_MARKDOWN_ANSWER>"\`\n` +
+        `(If the reviewer asked to create or update a draft GitHub comment, also pass \`--updated-draft "<NEW_DRAFT>"\`).`;
+    }
+
+    const dispatchRes = await sendPromptToQuasar(
+      prompt,
+      isUpdatingExisting
+        ? `Update Quasar Comment: ${path.basename(relPath)}:${startLine}`
+        : `Comment Question: ${path.basename(relPath)}:${startLine}`
+    );
+
+    if (dispatchRes && dispatchRes.success) {
+      vscode.window.setStatusBarMessage(
+        isUpdatingExisting
+          ? `💬 Sent your comment to Quasar to update "${existingThread.title || path.basename(relPath)}"...`
+          : `💬 Sent question to Quasar (${path.basename(relPath)}:L${startLine})...`,
+        4000
+      );
+    } else {
+      await vscode.env.clipboard.writeText(prompt);
+      vscode.window.showWarningMessage(
+        'Could not auto-dispatch via agentapi. Prompt copied to clipboard — paste it into the Antigravity chat!'
+      );
+    }
   }
 
   context.subscriptions.push(
     vscode.commands.registerCommand('quasar.askInComment', async (reply) => {
-      await handleAskInThread(reply);
+      await handleAskInThread(reply, null, { changeCommentMode: false });
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.commentOnComment', async (arg) => {
+      await handleAskInThread(arg, null, { changeCommentMode: true });
     })
   );
 
@@ -4456,6 +4988,7 @@ function activate(context) {
           existing.status = 'staged';
           existing.kind = 'user_staged';
           existing.messages = existing.messages || [];
+          syncPrimaryThreadMessageInJs(existing);
           existing.messages.push({
             author: 'You (Staged Draft)',
             body: `**Updated & Staged GitHub Comment**:\n> ${text}`,
@@ -4496,6 +5029,7 @@ function activate(context) {
     if (!arg) return null;
     if (typeof arg === 'string') return arg;
     if (arg.thread && arg.thread.threadId) return arg.thread.threadId;
+    if (arg.comment && arg.comment.threadId) return arg.comment.threadId;
     return arg.threadId || (arg.threadData && arg.threadData.id) || null;
   }
 
@@ -4603,6 +5137,7 @@ function activate(context) {
       target.draftComment = edited.trim();
       target.status = 'staged';
       target.messages = target.messages || [];
+      syncPrimaryThreadMessageInJs(target);
       target.messages.push({
         author: 'You (Edited & Staged)',
         body: `**Updated GitHub Comment**:\n> ${target.draftComment}`,
@@ -6283,6 +6818,8 @@ function activate(context) {
       fs.mkdirSync(stateDir, { recursive: true });
       nextSession.workspaceDir = getWindowWorkspaceRoot();
       nextSession.stateDir = stateDir;
+      nextSession.windowId = THIS_WINDOW_ID;
+      nextSession.windowPid = THIS_WINDOW_PID;
       fs.writeFileSync(
         getWindowActiveSessionPath(),
         JSON.stringify(nextSession, null, 2),

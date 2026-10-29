@@ -49,6 +49,6 @@ For each architectural or API issue found (if any):
 - **Uncertainty Question (if `UNCERTAIN`)**: A 1-sentence question asking the reviewer's preference (e.g., *"Do you prefer keeping helper classes package-private under `src/` unless external consumers need them?"*)
 - **Location**: Exact file path and 1-indexed line range (`path/to/file:L10-L25`)
 - **The Issue (For the Reviewer)**: Clear technical explanation of the structural concern or trade-off.
-- **Draft Comment (For the Author)**: Constructive, collaborative question or suggestion phrased for a PR comment.
+- **Draft Comment (For the Author)**: Constructive, collaborative comment phrased for a PR review. Lean less verbose without losing important technical context; often simply pointing out the issue or asking a brief question is enough, and only include a concrete suggestion when it genuinely helps.
 
 If the architecture and API changes are sound, state that clearly rather than inventing artificial criticisms.

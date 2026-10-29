@@ -2,7 +2,7 @@
   "name": "codeium-dev",
   "displayName": "Quasar",
   "description": "Comprehension-first GitHub PR & local branch review tool. Features interactive CliffsNotes study guides with expandable code snippets, clickable SVG flowcharts, logical reading tours, native side-by-side diffs, inline Ask-Quasar comment threads, and 1-click GitHub Review publishing.",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "publisher": "codeium",
   "license": "MIT",
   "repository": {
@@ -75,9 +75,15 @@
       },
       {
         "command": "quasar.selectEffortLevel",
-        "title": "Set Review Effort Level (Low / Medium / High)...",
+        "title": "Set Review Mode & Effort (Full Guide vs Comments Only / Low / Medium / High)...",
         "category": "Quasar",
         "icon": "$(zap)"
+      },
+      {
+        "command": "quasar.startTutorial",
+        "title": "Interactive Tutorial: Try Quasar in a Sandbox PR...",
+        "category": "Quasar",
+        "icon": "$(mortar-board)"
       },
       {
         "command": "quasar.openCliffsNotesGuide",
@@ -150,6 +156,12 @@
         "title": "Edit Draft GitHub Comment...",
         "category": "Quasar",
         "icon": "$(edit)"
+      },
+      {
+        "command": "quasar.commentOnComment",
+        "title": "Ask Agent to Change Comment",
+        "category": "Quasar",
+        "icon": "$(comment-discussion)"
       },
       {
         "command": "quasar.calibrateFindingPreference",
@@ -383,6 +395,11 @@
           "group": "inline@0"
         },
         {
+          "command": "quasar.commentOnComment",
+          "when": "view == quasar.commentsTree && (viewItem == thread-candidate || viewItem == thread-uncertain || viewItem == thread-staged || viewItem == thread-existing)",
+          "group": "inline@0_change"
+        },
+        {
           "command": "quasar.fixSingleComment",
           "when": "view == quasar.commentsTree && (viewItem == thread-candidate || viewItem == thread-uncertain || viewItem == thread-staged || viewItem == thread-existing)",
           "group": "inline@0_fix"
@@ -413,6 +430,11 @@
           "group": "inline@5"
         },
         {
+          "command": "quasar.commentOnComment",
+          "when": "view == quasar.commentsTree && (viewItem == thread-candidate || viewItem == thread-uncertain || viewItem == thread-staged || viewItem == thread-existing)",
+          "group": "1_modify@0_change"
+        },
+        {
           "command": "quasar.toggleSelectForFix",
           "when": "view == quasar.commentsTree && (viewItem == thread-candidate || viewItem == thread-uncertain || viewItem == thread-staged || viewItem == thread-existing)",
           "group": "1_modify@0"
@@ -438,6 +460,11 @@
           "command": "quasar.calibrateFindingPreference",
           "when": "commentController == quasar && commentThread =~ /uncertain/",
           "group": "inline@0"
+        },
+        {
+          "command": "quasar.commentOnComment",
+          "when": "commentController == quasar && commentThread =~ /candidate|uncertain|staged|qa|existing/",
+          "group": "inline@0_change"
         },
         {
           "command": "quasar.toggleSelectForFix",
@@ -485,7 +512,24 @@
           "group": "inline@7"
         }
       ],
+      "comments/comment/title": [
+        {
+          "command": "quasar.commentOnComment",
+          "when": "commentController == quasar",
+          "group": "inline@1"
+        },
+        {
+          "command": "quasar.editDraftComment",
+          "when": "commentController == quasar",
+          "group": "inline@2"
+        }
+      ],
       "comments/commentThread/context": [
+        {
+          "command": "quasar.commentOnComment",
+          "when": "commentController == quasar && commentThread =~ /candidate|uncertain|staged|qa|existing/",
+          "group": "inline@0"
+        },
         {
           "command": "quasar.askInComment",
           "when": "commentController == quasar",

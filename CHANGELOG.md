@@ -2,6 +2,29 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [1.2.0] - 2026-10-29
+
+### Added
+- **Interactive Sandbox PR Tutorial (`quasar.startTutorial`)**:
+  - Added a zero-setup **🎓 Interactive Tutorial (Sandbox PR)** (`collect_pr_context.py --tutorial`) accessible from the Quasar Quick Menu, Command Palette, and empty-state welcome view.
+  - Creates a realistic 3-file sandbox PR (`src/token_cache.py`, `src/auth_middleware.py`, `tests/test_token_cache.py`) with an interactive 5-step walkthrough banner in the Study Guide, clickable SVG architecture flowchart, guided reading tour stops, and realistic `🔴 Blocking`, `🟡 Design`, `🟢 Nit`, and `🤔 Uncertain` threads to test every Quasar feature safely.
+- **Comments-Only Review Mode (`--comments-only`)**:
+  - Added a **💬 Comments Only (Skip Study Guide & Tour)** scope selector when starting any GitHub PR or local branch review (as well as `--comments-only` in `collect_pr_context.py` and `publish_review_session.py`, plus `"commentsOnly"` in `SKILL.md`).
+  - Skips generating the CliffsNotes study guide, Mermaid flowcharts, and reading tour chapters/stops—producing only high-signal inline review comments ready to publish to GitHub or fix with the agent.
+- **Comment on Quasar Comments to Revise with Agent (`quasar.commentOnComment`)**:
+  - Added **💬 Ask Agent to Change Comment...** across inline diff comment threads (both typing directly in the reply box and via thread action buttons), sidebar comment context menus, and Study Guide finding cards (`answer_comment_question.py --revise-finding`).
+  - Instructs the agent to rewrite the comment's `title`, `body`, `suggestion`, or `severity` in-place based on your feedback and records a before/after phrasing example in your learned preferences.
+
+### Changed
+- **Concise-by-Default Comment Style & Optional Code Suggestions**:
+  - Tuned `SKILL.md`, all 4 review subagents (`review-architect`, `review-bug-hunter`, `review-test-critic`, `review-advocate`), and default style preferences in `manage_preferences.py` so comments lead with the core issue in 1–3 concise sentences without filler.
+  - Made `suggestion` blocks optional—only included when a concrete replacement snippet adds clear value over stating the issue plainly.
+
+### Fixed
+- **Strict Per-Window Session Isolation**:
+  - Locked each active review session to the exact VS Code / Antigravity window that activated it using per-window `windowId` (`vscode.env.sessionId`) and extension host `windowPid` (`process.pid`) ownership verification, plus window focus registration (`windows.json`).
+  - Removed parent `.git` monorepo walk-up and open-document fallback in `resolveWorkspaceRootSync` / `resolve_workspace_root`, preventing reviews or tutorials in one window from ever leaking into other open windows.
+
 ## [1.1.2] - 2026-10-28
 
 ### Fixed

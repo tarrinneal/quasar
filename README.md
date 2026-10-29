@@ -43,6 +43,7 @@ After reloading the window, you can open **Quasar** from **3 places**:
 1. **Bottom-Left Status Bar (Easiest)**: Click **`$(git-pull-request) Quasar`** in the bottom-left status bar to open the Quasar Quick Menu & focus the sidebar.
 2. **Command Palette (`Cmd+Shift+P`)**: Type **`Quasar`** to see all commands:
    - `Quasar: Open Quasar Sidebar & Menu...`
+   - `Quasar: Start Interactive Tutorial (Sandbox PR)...`
    - `Quasar: Review Local Branch or Diff...`
    - `Quasar: Review PR from GitHub URL...`
    - `Quasar: Import Premade Review Skill as Starting Point...`
@@ -86,27 +87,33 @@ When an agent is asked to set up Quasar, it should execute these exact steps:
 
 ---
 
-## 📖 How to Start a Review
+## 📖 How to Start a Review (or Try the Interactive Tutorial)
+
+### Option 0: 🎓 Try the Interactive Sandbox PR Tutorial (Zero Setup)
+- Click **`Quasar`** in the bottom Status Bar $\rightarrow$ **`🎓 Start Interactive Tutorial (Sandbox PR)`** (or run **`Quasar: Start Interactive Tutorial (Sandbox PR)...`** from the Command Palette).
+- Quasar instantly loads a self-contained 3-file sandbox PR (`PR #42: Add TTL token cache & auth middleware`) with a 5-step interactive walkthrough banner so you can explore the Study Guide, SVG flowchart, guided reading tour, and inline comment actions without touching your repo.
 
 ### Option A: Review a Local Branch or Working-Tree Diff
 - **In Chat**:
   - `Review my current branch`
+  - `Review my current branch (comments only)`
   - `Review local branch feature/my-branch`
   - `Review local branch main...feature/my-branch in /path/to/repo`
 - **From the UI**:
-  - Click **`Quasar`** in the bottom Status Bar $\rightarrow$ **`Review Local Branch or Working-Tree Diff...`** to interactively pick a repository, local branch (including uncommitted working-tree changes), and base ref.
+  - Click **`Quasar`** in the bottom Status Bar $\rightarrow$ **`Review Local Branch or Working-Tree Diff...`** to interactively pick a repository, local branch (including uncommitted working-tree changes), base ref, effort level (`Low`, `Medium`, `High`), and review mode (**`📘 Full Review (Study Guide + Comments)`** or **`💬 Comments Only`**).
 
 ### Option B: Review a GitHub Pull Request
 - **In Chat**:
   - `Review https://github.com/owner/repo/pull/123`
+  - `Review https://github.com/owner/repo/pull/123 comments only`
 - **From the UI**:
-  - Click **`Quasar`** in the bottom Status Bar $\rightarrow$ **`Review GitHub PR from URL or Number...`** and paste the PR link.
+  - Click **`Quasar`** in the bottom Status Bar $\rightarrow$ **`Review GitHub PR from URL or Number...`**, paste the PR link, and choose your effort level and review mode (**Full Review** or **Comments Only**).
 
 ---
 
 ## ✨ Key Features
 
-### 1. CliffsNotes-First Comprehension (No Code Clutter)
+### 1. CliffsNotes-First Comprehension (or Fast Comments-Only Mode)
 - **Native `CliffsNotes & Reading Tour` Sidebar TreeView**:
   - **At-a-Glance CliffsNotes**: Expandable `TL;DR`, `Character List (Key Symbols & Roles)`, and `Key Design Trade-offs` right in the sidebar.
   - **Logical Reading Chapters**: Groups files and hunks top-down (e.g., *Chapter 1: Core Interfaces & Models* $\rightarrow$ *Chapter 2: Implementation* $\rightarrow$ *Chapter 3: Verification & Unit Tests* $\rightarrow$ *Chapter 4: Skim / Generated Fixtures*).
@@ -115,12 +122,15 @@ When an agent is asked to set up Quasar, it should execute these exact steps:
   - Click **Open Full CliffsNotes Study Guide** (`$(book)`) to view the formatted Markdown guide with Mermaid architecture diagrams and chapter-by-chapter breakdowns alongside your diff editor.
 - **CliffsNotes on Hover & CodeLens**:
   - Hover over any changed hunk in the diff editor to see a **📘 Quasar CliffsNotes Hover Card** explaining *what* the hunk does, *why* it changed, and *how* it connects to callers/invariants—without adding comprehension threads into the code.
+- **💬 Comments-Only Mode**:
+  - Want just the inline review comments to publish to GitHub or fix with the agent without generating the study guide or reading tour? Select **💬 Comments Only** when launching a review (or say `"comments only"` in chat).
 
-### 2. Ask Quasar Directly in Inline Comment Threads (`vscode.comments`)
+### 2. Ask Quasar & Revise Comments with the Agent (`vscode.comments`)
 - Click the native `+` gutter icon on **any line** in the diff editor (or click `💬 Ask Quasar` in the CodeLens/Hover card).
 - Type a question in the comment box and click **`$(sparkle) Ask Quasar`**:
   - Quasar analyzes the exact hunk and surrounding codebase and posts its answer **directly back into that native inline comment thread**.
-  - You can also reply inside any **Quasar Candidate Comment Thread** (`🔴 Blocking`, `🟡 Design`, `🟢 Nit`) to ask follow-up questions or ask Quasar to refine the draft comment.
+- **Comment on Any Quasar Comment to Have the Agent Change It**:
+  - Reply directly inside any **Quasar Candidate Comment Thread** (`🔴 Blocking`, `🟡 Design`, `🟢 Nit`, `🤔 Uncertain`) or click **`💬 Ask Agent to Change Comment...`** (available on inline diff threads, sidebar comment items, and Study Guide finding cards) to tell the agent how to revise the comment (e.g., *"Make this shorter"*, *"Remove the code suggestion"*, or *"Downgrade to Nit"*). Quasar rewrites the comment in-place and learns from your before/after phrasing.
 
 ### 3. Preference Calibration, Premade Skill Seeding & Continuous Learning
 - **🌱 Import a Premade Review Skill as a Starting Point**:

@@ -39,10 +39,11 @@ def default_preferences() -> Dict[str, Any]:
         "version": 2,
         "updatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "defaultEffort": "medium",
+        "defaultCommentsOnly": False,
         "styleProfile": {
             "commentTone": "constructive, collaborative questions rather than prescriptive demands",
             "nitThreshold": "only high-signal polish that improves readability or prevents bugs",
-            "verbosity": "concise (1-3 sentences with concrete code suggestion when helpful)",
+            "verbosity": "lean less verbose without losing important context; simply mentioning the issue is often enough, and only include a suggestion when it genuinely helps",
             "uncertaintyBehavior": "ask preference on borderline architectural or testing trade-offs",
         },
         "seedSkills": [],
@@ -71,6 +72,7 @@ def load_preferences() -> Dict[str, Any]:
         base.update(data)
         if base.get("defaultEffort") not in ("low", "medium", "high"):
             base["defaultEffort"] = "medium"
+        base["defaultCommentsOnly"] = bool(base.get("defaultCommentsOnly", False))
         base.setdefault("seedSkills", [])
         base.setdefault("rules", [])
         return base
@@ -508,6 +510,7 @@ def build_prompt_summary(prefs: Dict[str, Any], repo_name: Optional[str] = None)
 
     return {
         "defaultEffort": prefs.get("defaultEffort") if prefs.get("defaultEffort") in ("low", "medium", "high") else "medium",
+        "defaultCommentsOnly": bool(prefs.get("defaultCommentsOnly", False)),
         "styleProfile": prefs.get("styleProfile") or {},
         "seedSkills": [
             {
@@ -644,9 +647,21 @@ def update_active_session_thread(
             break
 
     if target_thread:
-        msgs = target_thread.get("messages") or []
+        msgs = [
+            m
+            for m in (target_thread.get("messages") or [])
+            if not m.get("pending")
+            and "⏳ Quasar is analyzing" not in (m.get("body") or "")
+            and "⏳ Quasar is updating" not in (m.get("body") or "")
+        ]
         if updated_draft:
             target_thread["draftComment"] = updated_draft.strip()
+            try:
+                from answer_comment_question import sync_primary_message_if_applicable
+
+                sync_primary_message_if_applicable(target_thread, msgs)
+            except Exception:
+                pass
 
         if action in ("upvote", "calibrate_keep"):
             target_thread["feedbackRating"] = "up"
@@ -758,6 +773,7 @@ def main() -> None:
     parser.add_argument("--set-nit-threshold", help="Update preferred nit threshold in styleProfile")
     parser.add_argument("--set-verbosity", help="Update preferred comment verbosity in styleProfile")
     parser.add_argument("--set-effort", choices=["low", "medium", "high"], help="Update default review effort level (low, medium, high)")
+    parser.add_argument("--set-comments-only", choices=["true", "false"], help="Update default Comments-Only mode (true or false)")
     args = parser.parse_args()
 
     if args.discover_skills:
@@ -798,6 +814,8 @@ def main() -> None:
 
     if args.set_effort:
         prefs["defaultEffort"] = args.set_effort.strip().lower()
+    if args.set_comments_only is not None:
+        prefs["defaultCommentsOnly"] = args.set_comments_only.strip().lower() == "true"
     if args.set_tone:
         prefs.setdefault("styleProfile", {})["commentTone"] = args.set_tone.strip()
     if args.set_nit_threshold:

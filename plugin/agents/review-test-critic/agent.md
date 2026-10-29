@@ -43,4 +43,4 @@ For each testing gap or repo hygiene issue:
 - **Uncertainty Question (if `UNCERTAIN`)**: A 1-sentence question asking the reviewer's testing preference.
 - **Location**: Exact file path and 1-indexed line range (`path/to/file:L10-L25`)
 - **Why It Matters (For the Reviewer)**: What regression could slip through without this test or check.
-- **Draft Comment (For the Author)**: Specific suggestion for a test case or assertion to add.
+- **Draft Comment (For the Author)**: Concise PR comment noting the missing coverage or check without losing key context (simply pointing out the gap is often enough; include a specific test suggestion when helpful).

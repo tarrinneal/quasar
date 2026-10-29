@@ -45,6 +45,6 @@ For each verified bug or edge case (if any):
 - **Uncertainty Question (if `UNCERTAIN`)**: A 1-sentence question asking the reviewer's preference.
 - **Location**: Exact file path and 1-indexed line range (`path/to/file:L10-L25`)
 - **Trigger Scenario (For the Reviewer)**: Step-by-step trace of the input or state that causes the failure.
-- **Draft Comment (For the Author)**: Clear, polite PR comment pointing out the scenario and suggesting a fix.
+- **Draft Comment (For the Author)**: Clear, polite PR comment pointing out the scenario without unnecessary verbosity (preserve important context, but keep it concise; simply mentioning the issue is often enough, or include a suggestion when helpful).
 
 If you find zero bugs after thorough tracing, explicitly report that no correctness issues were found.

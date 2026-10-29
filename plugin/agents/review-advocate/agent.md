@@ -44,7 +44,7 @@ For each finding that survives your scrutiny with high confidence:
 - **Status**: `candidate`
 - **Location**: Verified file path and exact 1-indexed line numbers in the NEW file (`path/to/file:L10-L25`)
 - **For the Reviewer (Context & Verification)**: Why this is genuinely valid and what you verified in the codebase.
-- **Draft PR Comment**: A natural, constructive, concise comment matching the reviewer's preferred tone.
+- **Draft PR Comment**: A natural, constructive comment matching the reviewer's preferred tone—lean less verbose without losing essential context, and remember that not every comment needs a suggestion (sometimes simply mentioning the issue is enough, while other times a suggestion is helpful).
 
 ### 2. Uncertain / Preference-Calibration Findings (Ask the Reviewer)
 For 1–3 borderline findings where the technical facts are verified, but you are uncertain whether the reviewer wants Quasar to flag this class of issue:

@@ -27,6 +27,7 @@ Run `collect_pr_context.py` immediately, passing `--workspace-dir <ACTIVE_WORKSP
 python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/collect_pr_context.py \
   --pr <PR_URL_OR_NUMBER> \
   [--effort <low|medium|high>] \
+  [--comments-only] \
   --workspace-dir <ACTIVE_WORKSPACE_PATH> \
   --output-dir <SCRATCH_DIR>
 
@@ -36,13 +37,15 @@ python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/collect_pr_context
   [--base <BASE_REF_OR_AUTO>] \
   [--repo-dir <REPO_ROOT>] \
   [--effort <low|medium|high>] \
+  [--comments-only] \
   --workspace-dir <ACTIVE_WORKSPACE_PATH> \
   [--committed-only] \
   --output-dir <SCRATCH_DIR>
 ```
 
-Inspect `effort_level` (`"low"`, `"medium"`, or `"high"`) and `reviewer_preferences` inside `pr_context.json` (or view `~/.gemini/quasar/PREFERENCES.md` if it exists) so you know:
+Inspect `effort_level` (`"low"`, `"medium"`, or `"high"`), `comments_only` (`true` or `false`), and `reviewer_preferences` inside `pr_context.json` (or view `~/.gemini/quasar/PREFERENCES.md` if it exists) so you know:
 - Which **Effort Level** to run (`"low"`, `"medium"`, or `"high"` — if the user explicitly asked for `"low effort"` / `"quick"`, `"medium effort"`, or `"high effort"` / `"deep"` in their prompt, pass `--effort <level>` to `collect_pr_context.py` or honor their requested level).
+- Whether **Comments-Only Mode (`comments_only: true` / `--comments-only`)** is active (either via `--comments-only` flag, `comments_only: true` in `pr_context.json`, or because the user asked for comments only / no study guide).
 - What patterns the reviewer **prefers to flag** (`preferRules`)
 - What patterns the reviewer **wants suppressed/skipped** (`avoidRules`)
 - Their preferred **comment tone, verbosity, and phrasing examples** (`styleProfile` & `recentEditedDrafts`).
@@ -63,23 +66,29 @@ When the user provides a GitHub PR link or number, inspect `pr_metadata` in `pr_
 
 ## Phase 2: Effort-Scaled Analysis (`low`, `medium`, `high`) & Preference-Aware Filtering
 
+> **💬 Comments-Only Mode (`comments_only: true`)**:
+> When `comments_only` is `true` (or the user requested a comments-only review):
+> - **Do NOT build the CliffsNotes Study Guide** (`cliffsNotes.tldr`, `whatAndWhy`, `architectureDiagram`, `keySymbols`, `designTradeoffs`) and **do NOT generate reading tour `chapters` or `stops`**.
+> - Focus 100% on finding verified, high-signal review comments (`findings`) and triaging `existing_comments` (`existingCommentAssessments`) so the user can immediately publish them to GitHub or queue them for Agent fixes.
+> - In `medium` effort Comments-Only mode, you only need to spawn `review-bug-hunter` (`Model: "flash"`) or ask subagents strictly for candidate review findings (skipping reading-tour & architecture-diagram synthesis).
+
 Choose the analysis pipeline below that matches `effort_level` (`"low"`, `"medium"`, or `"high"`):
 
 ### ⚡ Option A: `low` Effort (Fast / Quick Scan — Single-Pass, 0 Subagents)
 - **Do NOT spawn any subagents (`invoke_subagent`)**.
 - Read `<SCRATCH_DIR>/pr_context.json` and `<SCRATCH_DIR>/pr.diff` directly in a single fast pass (only view individual files if a diff hunk is ambiguous).
-- Build a concise CliffsNotes Study Guide (`tldr`, `architectureDiagram`, logical `chapters` & `stops`), triage any `existing_comments`, and include only **obvious, high-confidence bugs or blockers** (skipping deep cross-file hunting and minor nits).
+- Build a concise CliffsNotes Study Guide (`tldr`, `architectureDiagram`, logical `chapters` & `stops` — **skip this step if `comments_only` is `true`**), triage any `existing_comments`, and include only **obvious, high-confidence bugs or blockers** (skipping deep cross-file hunting and minor nits).
 - Proceed immediately to **Phase 3** (`publish_review_session.py`).
 
 ### ⚖️ Option B: `medium` Effort (Balanced — Default — 2 Fast `flash` Subagents in 1 Wave)
 - Spawn **2 subagents in parallel** in a single `invoke_subagent` call with **`Model: "flash"`**:
-  1. **`review-architect`** (`Model: "flash"`, `Role: "Architecture & API Reviewer"`): Pass the PR title/description, changed `core_source` files, `<SCRATCH_DIR>/pr.diff`, and `reviewer_preferences`.
+  1. **`review-architect`** (`Model: "flash"`, `Role: "Architecture & API Reviewer"`): Pass the PR title/description, changed `core_source` files, `<SCRATCH_DIR>/pr.diff`, and `reviewer_preferences`. *(If `comments_only` is `true`, instruct `review-architect` to only return API/design `findings` and skip building a reading tour or mental model.)*
   2. **`review-bug-hunter`** (`Model: "flash"`, `Role: "Bug & Edge-Case Hunter"`): Pass the changed `core_source` files, `<SCRATCH_DIR>/pr.diff`, and `reviewer_preferences`.
 - **Do NOT spawn a second sequential `review-advocate` wave** in `medium` effort — once the 2 `flash` subagents report back, verify and filter their findings directly in the main agent and proceed immediately to **Phase 3**.
 
 ### 🔬 Option C: `high` Effort (Deep / Thorough — Full 4-Lens Pipeline)
 - Spawn all **3 specialist review subagents in parallel** using a single `invoke_subagent` call (`Model: "inherit"`). Pass each subagent the active `reviewer_preferences` summary (or instruct them to read `~/.gemini/quasar/PREFERENCES.md`):
-  1. **`review-architect`** (`Model: "inherit"`, `Role: "Architecture & API Reviewer"`): Build the architectural mental model, identify key symbols ("Character List"), evaluate API boundaries & backwards compatibility, and suggest the logical top-down reading order.
+  1. **`review-architect`** (`Model: "inherit"`, `Role: "Architecture & API Reviewer"`): Build the architectural mental model, identify key symbols ("Character List"), evaluate API boundaries & backwards compatibility, and suggest the logical top-down reading order *(if `comments_only` is `true`, skip the reading tour & mental model and focus strictly on architectural/API findings)*.
   2. **`review-bug-hunter`** (`Model: "inherit"`, `Role: "Bug & Edge-Case Hunter"`): Trace execution paths, nullability, state mutations, resource lifecycle, and language-boundary/generator edge cases.
   3. **`review-test-critic`** (`Model: "inherit"`, `Role: "Test & Verification Critic"`): Build a coverage matrix, evaluate test falsifiability, verify generated file sync, and check repo hygiene (`CHANGELOG.md`, `pubspec.yaml`).
 
@@ -101,11 +110,12 @@ Verify every candidate finding against the actual codebase callers/callees, `exi
 
 ## Phase 3: Publish the CliffsNotes Session & Calibrate Uncertain Preferences
 
-Write `<SCRATCH_DIR>/review_synthesis.json` and publish it using `publish_review_session.py`:
+Write `<SCRATCH_DIR>/review_synthesis.json` and publish it using `publish_review_session.py` (when `comments_only` is `true`, set `"commentsOnly": true` and omit `"cliffsNotes"` and `"chapters"`):
 
 ```json
 {
   "analysisStatus": "ready",
+  "commentsOnly": false,
   "cliffsNotes": {
     "tldr": "One-sentence summary of what the PR does and why.",
     "whatAndWhy": "Concise paragraph explaining the problem solved and the core mechanism.",
@@ -191,6 +201,10 @@ Write `<SCRATCH_DIR>/review_synthesis.json` and publish it using `publish_review
 > - **`cliffsNotes.tldr`**, each chapter's **`summary`**, and each tour stop's **`cliffsNotes`** are rendered up front in the default view: keep each one to **1 short, plain-English sentence (under ~140 characters)** without long parenthetical type lists.
 > - Put deeper mechanics, callers, edge cases, and symbol breakdowns into **`cliffsNotes.whatAndWhy`**, **`cliffsNotesBullets`**, **`whyItChanged`**, and **`callersAndInvariants`** — Quasar automatically places those inside expandable `▸ Context & code snippet` drawers alongside a live code preview.
 >
+> **Draft Comment Style & Verbosity (`draftComment`)**:
+> - **Lean less verbose without losing important information**: Keep `draftComment` focused on the core issue and essential context (typically 1–2 concise sentences). Put extra background or step-by-step trace details into `whyItMatters` (for the reviewer) so the GitHub comment itself stays crisp.
+> - **Suggestions are optional, not mandatory**: Not every comment needs a code suggestion or prescribed fix. Often, simply pointing out the issue or asking a brief question is enough—include a suggestion only when the fix is non-obvious or genuinely helpful.
+>
 > **Mermaid Flowchart Rules (`architectureDiagram`)**:
 > - Always quote every node and subgraph label (`ID["Label Text"]`, `subgraph sg_id ["Title"]`).
 > - Keep node labels short (`Title - 3-5 word subtitle` max) and on a **single line** — never put raw newlines, `\n`, `<br/>`, or `<tag>` angle brackets inside labels.
@@ -268,16 +282,23 @@ python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/manage_preferences
   2. **Imported Premade Seed Skills (`origin: "seed_skill"`)**: Baseline preferences and domain checklists extracted from the user's premade skill.
   3. **Evolved Learned Preferences (`origin: "learned"`, Highest Priority)**: Rules learned from the user's explicit calibrations, 👍/👎 ratings, and meta-feedback automatically supersede any conflicting seed skill rules so Quasar grows with the user over time.
 
-### 3. When the Reviewer Asks a Question in a Native Comment Thread
-When you receive a prompt triggered from an inline comment thread (`--thread-id`), investigate the code and post your answer directly back into that inline thread so it updates live inside the diff editor:
+### 3. When the Reviewer Comments on a Quasar Comment (to Change/Revise It) or Asks an Inline Question
+When the reviewer comments on a Quasar comment to have the agent change/revise it (or asks a question inside a native comment thread with `--thread-id`), update the comment and reply directly in place so the inline diff thread, sidebar, and study guide update live:
 
 ```bash
 python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/answer_comment_question.py \
   --thread-id "<THREAD_ID>" \
-  --answer "<CONCISE_MARKDOWN_EXPLANATION>" \
-  [--updated-draft "<OPTIONAL_UPDATED_GITHUB_COMMENT>"]
+  --workspace-dir "<ACTIVE_WORKSPACE_PATH>" \
+  [--updated-draft "<REVISED_GITHUB_COMMENT>"] \
+  [--answer "<CONCISE_EXPLANATION_OR_CONFIRMATION>"] \
+  [--updated-title "<OPTIONAL_NEW_TITLE>"] \
+  [--updated-why "<OPTIONAL_NEW_RATIONALE>"] \
+  [--updated-severity "<BLOCKING|DESIGN|NIT>"] \
+  [--start-line <N> --end-line <M>] \
+  [--stage | --unstage | --dismiss] \
+  [--learned-rule "<OPTIONAL_REUSABLE_PREFERENCE_RULE>" --sentiment <prefer|avoid|custom>]
 ```
-*(If their question also expresses a review preference, record it via `manage_preferences.py` as well!)*
+*(When `--updated-draft` is passed, `answer_comment_question.py` updates both `draftComment` and the primary finding card at the top of the thread, and automatically records the before/after phrasing example in `preferences.json`.)*
 
 ### 4. Publishing Reviews to GitHub as the User (`post_pending_review.py`)
 The reviewer can provide their GitHub Personal Access Token (API Key) via **`🔑 Configure GitHub API Key / Personal Access Token...`** in the Quasar UI (or by giving it to you in chat) and publish reviews directly to the PR under their own GitHub account (`@login`) without needing `gh` CLI installed:
