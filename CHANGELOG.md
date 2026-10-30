@@ -19,6 +19,8 @@ All notable changes to **Quasar** are documented in this file.
 - **Concise-by-Default Comment Style & Optional Code Suggestions**:
   - Tuned `SKILL.md`, all 4 review subagents (`review-architect`, `review-bug-hunter`, `review-test-critic`, `review-advocate`), and default style preferences in `manage_preferences.py` so comments lead with the core issue in 1–3 concise sentences without filler.
   - Made `suggestion` blocks optional—only included when a concrete replacement snippet adds clear value over stating the issue plainly.
+- **Cleaner Sidebar by Default (`quasar.toggleChecksTree`)**:
+  - Hid the **Checks & Learned Preferences** sidebar section (`quasar.checksTree`) by default so the sidebar stays focused on **CliffsNotes & Reading Tour** and **Review Comments & Cart**, with a **Show / Hide Checks & Learned Preferences Panel** toggle in the Quasar Quick Menu and Command Palette.
 
 ### Fixed
 - **Strict Per-Window Session Isolation**:

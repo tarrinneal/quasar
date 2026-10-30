@@ -50,11 +50,19 @@
         {
           "id": "quasar.checksTree",
           "name": "Checks & Learned Preferences",
-          "contextualTitle": "Checks & Preferences"
+          "contextualTitle": "Checks & Preferences",
+          "visibility": "hidden",
+          "when": "quasar.showChecksTree"
         }
       ]
     },
     "commands": [
+      {
+        "command": "quasar.toggleChecksTree",
+        "title": "Show / Hide Checks & Learned Preferences Panel",
+        "category": "Quasar",
+        "icon": "$(eye)"
+      },
       {
         "command": "quasar.openMenu",
         "title": "Open Quasar Sidebar & Menu...",

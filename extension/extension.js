@@ -2079,7 +2079,7 @@ class ChecksTreeProvider {
         : `Learned Reviewer Preferences (${rules.length} rules)`;
     const prefsRoot = new vscode.TreeItem(
       prefsLabel,
-      vscode.TreeItemCollapsibleState.Expanded
+      vscode.TreeItemCollapsibleState.Collapsed
     );
     prefsRoot.iconPath = new vscode.ThemeIcon('lightbulb-sparkle');
     prefsRoot.nodeType = 'prefs-root';
@@ -2126,6 +2126,14 @@ class ChecksTreeProvider {
 // ============================================================================
 function activate(context) {
   fs.mkdirSync(REVIEW_STATE_DIR, { recursive: true });
+  let showChecksTree = false;
+  vscode.commands.executeCommand('setContext', 'quasar.showChecksTree', false);
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.toggleChecksTree', async () => {
+      showChecksTree = !showChecksTree;
+      await vscode.commands.executeCommand('setContext', 'quasar.showChecksTree', showChecksTree);
+    })
+  );
   touchWindowRegistration(Boolean(vscode.window.state && vscode.window.state.focused));
   if (typeof vscode.window.onDidChangeWindowState === 'function') {
     context.subscriptions.push(
@@ -4219,6 +4227,11 @@ function activate(context) {
           label: '$(layout-sidebar-left) Focus Quasar Sidebar',
           description: 'Opens the CliffsNotes & Reading Tour panel in the sidebar',
           command: 'focus-only',
+        },
+        {
+          label: `$(eye) ${showChecksTree ? 'Hide' : 'Show'} Checks & Learned Preferences Sidebar Panel`,
+          description: 'Toggle visibility of the Checks & Learned Preferences section in the sidebar',
+          command: 'quasar.toggleChecksTree',
         },
       ];
       if (hasSession) {
