@@ -296,6 +296,7 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
         else:
             existing_threads.append(t)
 
+    head_root = session.get("headSnapshotRoot") or ""
     new_threads: List[Dict[str, Any]] = []
     for idx, finding in enumerate(payload.get("findings") or payload.get("threads") or [], 1):
         if finding.get("kind") in ("github_existing", "user_qa"):
@@ -307,6 +308,22 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
         title = finding.get("title") or f"Finding #{idx}"
         start_l = int(finding.get("startLine") or finding.get("line") or 1)
         end_l = int(finding.get("endLine") or start_l)
+
+        raw_path = (finding.get("path") or "").strip()
+        target_file = (finding.get("targetFile") or raw_path or "").strip()
+        file_in_diff = bool(
+            raw_path
+            and (
+                not head_root
+                or os.path.isfile(os.path.join(head_root, raw_path))
+            )
+        )
+        is_top_level = bool(
+            finding.get("isTopLevel")
+            or not raw_path
+            or not file_in_diff
+        )
+        effective_path = "" if is_top_level else raw_path
 
         is_uncertain = (
             finding.get("status") == "uncertain"
@@ -336,9 +353,16 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
         pref_category = finding.get("preferenceCategory") or finding.get("category") or "general"
         pref_options = finding.get("preferenceOptions") or []
 
+        top_level_note = (
+            f"\n\n📌 *Top-Level PR Comment"
+            + (f" (Untouched file: `{target_file}`)*" if target_file else "*")
+            if is_top_level
+            else ""
+        )
+
         if is_uncertain:
             default_body = (
-                f"### 🤔 Preference Check: {title}\n\n"
+                f"### 🤔 Preference Check: {title}{top_level_note}\n\n"
                 f"**Question for You**: *{uncertainty_q}*\n\n"
                 f"*Context & Trade-off*: {why}\n\n"
                 f"---\n"
@@ -347,7 +371,7 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
             )
         else:
             default_body = (
-                f"**{title}**\n\n"
+                f"**{title}**{top_level_note}\n\n"
                 f"*CliffsNotes Context*: {why}\n\n"
                 f"---\n"
                 f"**Draft GitHub Comment**:\n> {draft}"
@@ -359,12 +383,14 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
                 "kind": kind,
                 "severity": sev,
                 "status": status,
+                "isTopLevel": is_top_level,
+                "targetFile": target_file,
                 "selectedForFix": bool(finding.get("selectedForFix", False)),
                 "uncertain": is_uncertain,
                 "uncertaintyQuestion": uncertainty_q,
                 "preferenceCategory": pref_category,
                 "preferenceOptions": pref_options,
-                "path": finding.get("path", ""),
+                "path": effective_path,
                 "startLine": start_l,
                 "endLine": end_l,
                 "title": title,
@@ -401,6 +427,12 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
     except Exception:
         pass
 
+    if "topLevelComment" in payload or "topLevelCommentIntro" in payload:
+        session["topLevelCommentIntro"] = (
+            payload.get("topLevelCommentIntro")
+            or payload.get("topLevelComment")
+            or ""
+        ).strip()
     if "coverageMatrix" in payload:
         session["coverageMatrix"] = payload["coverageMatrix"]
     if "repoChecks" in payload:
@@ -467,10 +499,9 @@ def main() -> None:
             if m_conv:
                 merged["conversationId"] = m_conv.group(1)
                 break
+    md_content = render_cliffs_notes_markdown(merged)
     with open(active_session_path, "w", encoding="utf-8") as f:
         json.dump(merged, f, indent=2)
-
-    md_content = render_cliffs_notes_markdown(merged)
     with open(cliffs_notes_md_path, "w", encoding="utf-8") as f:
         f.write(md_content)
     archive_review_session(merged, md_content)
@@ -480,6 +511,29 @@ def main() -> None:
         with open(args.artifact_out, "w", encoding="utf-8") as f:
             f.write(md_content)
 
+    html_review_path = os.path.join(state_dir, "quasar_review.html")
+    try:
+        sidecar_dirs = [
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "sidecars", "quasar-web")),
+            os.path.expanduser("~/.gemini/config/plugins/quasar/sidecars/quasar-web"),
+        ]
+        for sdir in sidecar_dirs:
+            if os.path.isfile(os.path.join(sdir, "server.py")):
+                if sdir not in sys.path:
+                    sys.path.insert(0, sdir)
+                import server as quasar_web_server  # type: ignore
+
+                quasar_web_server.export_standalone_html(html_review_path, target_ws)
+                if args.artifact_out:
+                    artifact_html = os.path.join(
+                        os.path.dirname(os.path.abspath(args.artifact_out)),
+                        "quasar_review.html",
+                    )
+                    quasar_web_server.export_standalone_html(artifact_html, target_ws)
+                break
+    except Exception:
+        pass
+
     print(
         json.dumps(
             {
@@ -488,6 +542,9 @@ def main() -> None:
                 "stateDir": state_dir,
                 "activeSessionPath": active_session_path,
                 "cliffsNotesMarkdownPath": cliffs_notes_md_path,
+                "interactiveHtmlPath": html_review_path if os.path.isfile(html_review_path) else None,
+                "sidecarUrl": "sidecar://quasar/quasar-web/",
+                "webUiUrl": "http://127.0.0.1:49341",
                 "commentsOnly": bool(merged.get("commentsOnly", False)),
                 "chaptersCount": len(merged.get("chapters") or []),
                 "threadsCount": len(merged.get("threads") or []),

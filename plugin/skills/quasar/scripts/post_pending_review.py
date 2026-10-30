@@ -336,19 +336,39 @@ def build_hunk_constrained_comments(
         return parsed
 
     for t in staged_threads:
-        rel_path = t["path"]
-        raw_body = t.get("draftComment") or t.get("body") or ""
+        rel_path = (t.get("path") or "").strip()
+        raw_target = (t.get("targetFile") or "").strip()
+        target_file = raw_target or ("" if rel_path == "TOP_LEVEL_PR_COMMENTS.md" else rel_path)
+        raw_body = (t.get("draftComment") or t.get("body") or "").strip()
+        if not raw_body:
+            continue
+
+        file_missing_from_diff = bool(
+            not rel_path
+            or rel_path == "TOP_LEVEL_PR_COMMENTS.md"
+            or t.get("isTopLevel")
+            or (head_root and not os.path.isfile(os.path.join(head_root, rel_path)))
+            or (live_patches is not None and rel_path not in live_patches)
+        )
+        if file_missing_from_diff:
+            if t.get("id") == "top-level-review" or t.get("isTopLevelSummary"):
+                formatted_note = raw_body
+            elif target_file and target_file not in raw_body and os.path.basename(target_file) not in raw_body:
+                formatted_note = f"**`{target_file}`:**\n{raw_body}"
+            elif target_file and target_file not in raw_body:
+                formatted_note = f"**`{target_file}`:** {raw_body}"
+            else:
+                formatted_note = raw_body
+            if not any(raw_body in existing or formatted_note in existing for existing in overflow_notes):
+                overflow_notes.append(formatted_note)
+            continue
+
         orig_s = int(t.get("startLine") or t.get("start_line") or t.get("endLine") or t.get("line") or 1)
         orig_e = int(t.get("endLine") or t.get("line") or orig_s)
         s_line, e_line = align_comment_range_to_head_file(rel_path, orig_s, orig_e, raw_body, head_root)
 
         valid_lines, modified_lines = get_file_hunk_lines(rel_path)
         if not valid_lines:
-            # If we have live_patches and this file has no RIGHT diff lines at all, move to review summary body
-            if live_patches is not None and rel_path not in live_patches:
-                loc_str = f"lines {orig_s}–{orig_e}" if orig_s != orig_e else f"line {orig_e}"
-                overflow_notes.append(f"**`{rel_path}` ({loc_str}):**\n{raw_body}")
-                continue
             # Otherwise pass through aligned lines
             c_obj: Dict[str, Any] = {
                 "path": rel_path,
@@ -419,6 +439,89 @@ def fetch_live_pr_file_patches(owner: str, repo: str, pr_num: int, token: Option
     return patches
 
 
+def delete_existing_pending_reviews(
+    owner: str,
+    repo: str,
+    pr_num: int,
+    token: Optional[str],
+    gh: Optional[str],
+    repo_dir: str,
+    known_review_id: Optional[int] = None,
+) -> List[int]:
+    """Finds and deletes any existing PENDING review owned by the current user on this PR so updated comments can be pushed."""
+    pending_ids: List[int] = []
+    if known_review_id:
+        pending_ids.append(int(known_review_id))
+
+    if token:
+        headers = {
+            "Accept": "application/vnd.github.v3+json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "quasar",
+        }
+        try:
+            list_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_num}/reviews?per_page=100"
+            req = urllib.request.Request(list_url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                reviews = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if isinstance(reviews, list):
+                for r in reviews:
+                    if str(r.get("state") or "").upper() == "PENDING" and r.get("id"):
+                        rid = int(r["id"])
+                        if rid not in pending_ids:
+                            pending_ids.append(rid)
+        except Exception:
+            pass
+
+        deleted: List[int] = []
+        for rid in pending_ids:
+            try:
+                del_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_num}/reviews/{rid}"
+                del_req = urllib.request.Request(del_url, headers=headers, method="DELETE")
+                with urllib.request.urlopen(del_req, timeout=20):
+                    deleted.append(rid)
+            except Exception:
+                pass
+        return deleted
+
+    if gh:
+        cwd = repo_dir if os.path.isdir(repo_dir) else os.getcwd()
+        try:
+            res = subprocess.run(
+                [gh, "api", f"repos/{owner}/{repo}/pulls/{pr_num}/reviews?per_page=100"],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+            )
+            if res.returncode == 0:
+                reviews = json.loads(res.stdout or "[]")
+                if isinstance(reviews, list):
+                    for r in reviews:
+                        if str(r.get("state") or "").upper() == "PENDING" and r.get("id"):
+                            rid = int(r["id"])
+                            if rid not in pending_ids:
+                                pending_ids.append(rid)
+        except Exception:
+            pass
+
+        deleted = []
+        for rid in pending_ids:
+            try:
+                del_res = subprocess.run(
+                    [gh, "api", "--method", "DELETE", f"repos/{owner}/{repo}/pulls/{pr_num}/reviews/{rid}"],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                )
+                if del_res.returncode == 0:
+                    deleted.append(rid)
+            except Exception:
+                pass
+        return deleted
+
+    return []
+
+
 def post_via_rest_or_gh(
     owner: str,
     repo: str,
@@ -427,7 +530,8 @@ def post_via_rest_or_gh(
     repo_dir: str,
     review_event: str = "PENDING",
     head_root: Optional[str] = None,
-) -> Dict[str, Any]:
+    known_pending_review_id: Optional[int] = None,
+) -> Tuple[Dict[str, Any], List[int]]:
     event_upper = (review_event or "PENDING").strip().upper()
     if event_upper == "PENDING":
         payload.pop("event", None)
@@ -435,6 +539,18 @@ def post_via_rest_or_gh(
         payload["event"] = event_upper
 
     token = get_github_token()
+    gh = find_gh_binary() if not token else None
+
+    # Always check and replace any existing PENDING review on this PR so updates push cleanly
+    replaced_ids = delete_existing_pending_reviews(
+        owner,
+        repo,
+        pr_num,
+        token,
+        gh,
+        repo_dir,
+        known_review_id=known_pending_review_id,
+    )
 
     def _send_via_token(req_payload: Dict[str, Any]) -> Dict[str, Any]:
         url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_num}/reviews"
@@ -454,7 +570,7 @@ def post_via_rest_or_gh(
 
     if token:
         try:
-            return _send_via_token(payload)
+            return _send_via_token(payload), replaced_ids
         except urllib.error.HTTPError as http_err:
             err_body = ""
             try:
@@ -482,7 +598,7 @@ def post_via_rest_or_gh(
                         extra = "\n\n".join(overflow)
                         retry_payload["body"] = f"{existing_body}\n\n{extra}".strip() if existing_body else extra
                     try:
-                        return _send_via_token(retry_payload)
+                        return _send_via_token(retry_payload), replaced_ids
                     except urllib.error.HTTPError as retry_err:
                         try:
                             err_body = retry_err.read().decode("utf-8", errors="replace")
@@ -499,7 +615,6 @@ def post_via_rest_or_gh(
                 )
             raise RuntimeError(f"GitHub API HTTP {http_err.code}: {err_body or http_err.reason}")
 
-    gh = find_gh_binary()
     if gh:
         cmd = [
             gh,
@@ -518,7 +633,7 @@ def post_via_rest_or_gh(
             text=True,
         )
         if res.returncode == 0:
-            return json.loads(res.stdout)
+            return json.loads(res.stdout), replaced_ids
         raise RuntimeError(res.stderr.strip() or "gh api call failed")
 
     raise RuntimeError(
@@ -615,7 +730,7 @@ def main() -> None:
         staged = [
             t
             for t in (session.get("threads") or [])
-            if t.get("status") == "staged" and t.get("path") and t.get("draftComment")
+            if t.get("status") == "staged" and (t.get("draftComment") or t.get("body"))
         ]
         if not staged and args.event == "PENDING" and not args.summary_body.strip():
             sys.stderr.write("No staged comments found in active session. Stage one or more comments first.\n")
@@ -637,8 +752,13 @@ def main() -> None:
                 md_lines.append(args.summary_body.strip())
                 md_lines.append("")
             for idx, t in enumerate(staged, 1):
-                md_lines.append(f"## {idx}. `{t['path']}` (Line {t.get('endLine') or t.get('startLine') or 1})")
-                md_lines.append(f"> {t['draftComment']}")
+                if t.get("isTopLevel") or not t.get("path"):
+                    tf = t.get("targetFile") or ""
+                    header_loc = f"📌 Top-Level PR Comment (`{tf}`)" if tf else "📌 Top-Level PR Comment"
+                    md_lines.append(f"## {idx}. {header_loc}")
+                else:
+                    md_lines.append(f"## {idx}. `{t['path']}` (Line {t.get('endLine') or t.get('startLine') or 1})")
+                md_lines.append(f"> {t.get('draftComment') or t.get('body') or ''}")
                 md_lines.append("")
             with open(local_export_path, "w", encoding="utf-8") as mf:
                 mf.write("\n".join(md_lines))
@@ -662,13 +782,18 @@ def main() -> None:
         )
         payload: Dict[str, Any] = {"comments": comments_list}
         summary_parts: List[str] = []
-        if args.summary_body.strip():
-            summary_parts.append(args.summary_body.strip())
-        if overflow_notes:
-            summary_parts.extend(overflow_notes)
+        base_summary = args.summary_body.strip() or (session.get("topLevelCommentIntro") or "").strip()
+        if base_summary and not any(base_summary in note for note in overflow_notes):
+            summary_parts.append(base_summary)
+        for note in overflow_notes:
+            if not any(note in existing for existing in summary_parts):
+                summary_parts.append(note)
         if summary_parts:
             payload["body"] = "\n\n".join(summary_parts)
+        known_pending_id = session.get("githubPendingReviewId")
     else:
+        session = None
+        known_pending_id = None
         head_root = None
         with open(args.comments_file, "r", encoding="utf-8") as f:
             payload = json.load(f)
@@ -679,25 +804,64 @@ def main() -> None:
         repo_dir = args.repo_dir
 
     try:
-        resp = post_via_rest_or_gh(
-            owner, repo, pr_num, payload, repo_dir, args.event, head_root=head_root
+        resp, replaced_ids = post_via_rest_or_gh(
+            owner,
+            repo,
+            pr_num,
+            payload,
+            repo_dir,
+            args.event,
+            head_root=head_root,
+            known_pending_review_id=int(known_pending_id) if known_pending_id else None,
         )
     except Exception as exc:
         sys.stderr.write(f"Failed to publish review: {exc}\n")
         sys.exit(1)
 
+    if session is not None and os.path.isfile(active_session_path):
+        try:
+            if args.event == "PENDING" and resp.get("id"):
+                session["githubPendingReviewId"] = int(resp["id"])
+                session["githubPendingReviewUrl"] = resp.get("html_url") or f"https://github.com/{owner}/{repo}/pull/{pr_num}"
+            else:
+                session.pop("githubPendingReviewId", None)
+                session.pop("githubPendingReviewUrl", None)
+            with open(active_session_path, "w", encoding="utf-8") as sf:
+                json.dump(session, sf, indent=2)
+        except Exception:
+            pass
+
+    body_text = (payload.get("body") or "").strip()
+    copied_to_clipboard = False
+    if body_text and args.event == "PENDING":
+        try:
+            proc_pb = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+            proc_pb.communicate(input=body_text.encode("utf-8"), timeout=3)
+            copied_to_clipboard = proc_pb.returncode == 0
+        except Exception:
+            pass
+
     auth_info = get_auth_status()
+    status_str = (
+        ("pending_review_updated" if replaced_ids else "pending_review_created")
+        if args.event == "PENDING"
+        else "review_published"
+    )
     print(
         json.dumps(
             {
                 "ok": True,
-                "status": "pending_review_created" if args.event == "PENDING" else "review_published",
+                "status": status_str,
                 "event": args.event,
                 "published_as": (resp.get("user") or {}).get("login") or auth_info.get("login") or "",
                 "review_id": resp.get("id"),
+                "replaced_pending_review_ids": replaced_ids,
                 "state": resp.get("state"),
                 "html_url": resp.get("html_url") or f"https://github.com/{owner}/{repo}/pull/{pr_num}",
                 "comments_exported": len(payload.get("comments") or []),
+                "has_top_level_body": bool(body_text),
+                "review_body": body_text,
+                "copied_body_to_clipboard": copied_to_clipboard,
             },
             indent=2,
         )

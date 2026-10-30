@@ -1,0 +1,25 @@
+{
+  "command": "python3",
+  "args": [
+    "server.py"
+  ],
+  "restart_policy": "always",
+  "display_name": "Quasar Code Review",
+  "description": "Comprehension-first GitHub PR & local branch code review web UI: interactive CliffsNotes study guide, SVG architecture flowcharts, side-by-side diff viewer, inline comment revision, agent fixes, and 1-click GitHub review publishing.",
+  "has_web_ui": true,
+  "ui_config": {
+    "display_name": "Quasar Code Review",
+    "views": [
+      {
+        "title": "Quasar Review",
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE"
+      },
+      {
+        "title": "Quasar Study Guide & Diff",
+        "path": "/full",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_FULL_PANE"
+      }
+    ]
+  }
+}

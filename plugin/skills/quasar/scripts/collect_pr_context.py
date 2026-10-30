@@ -1391,7 +1391,240 @@ def _read_stop_snippet_markdown(session: Dict[str, Any], stop: Dict[str, Any], m
         return ""
 
 
+TOP_LEVEL_COMMENTS_FILENAME = "TOP_LEVEL_PR_COMMENTS.md"
+TOP_LEVEL_SUMMARY_THREAD_ID = "top-level-review"
+
+
+def build_combined_top_level_comment(session: Dict[str, Any]) -> str:
+    """Builds a single ready-to-leave Top-Level PR Review Comment combining any
+    explicit `topLevelCommentIntro` / `topLevelComment` and any active top-level
+    findings (such as comments on untouched files outside the PR diff).
+    """
+    intro = (session.get("topLevelCommentIntro") or "").strip()
+    threads = session.get("threads") or []
+    top_items: List[str] = []
+    for t in threads:
+        if t.get("id") == TOP_LEVEL_SUMMARY_THREAD_ID:
+            continue
+        if t.get("status") in ("dismissed", "uncertain"):
+            continue
+        rel_path = (t.get("path") or "").strip()
+        is_top = bool(
+            t.get("isTopLevel")
+            or not rel_path
+            or rel_path == TOP_LEVEL_COMMENTS_FILENAME
+        )
+        if not is_top:
+            continue
+        draft = (t.get("draftComment") or t.get("body") or "").strip()
+        if not draft:
+            continue
+        if intro and draft in intro:
+            continue
+        target_file = (t.get("targetFile") or "").strip()
+        if target_file and target_file not in draft and os.path.basename(target_file) not in draft:
+            top_items.append(f"**`{target_file}`:** {draft}")
+        elif target_file and target_file not in draft:
+            top_items.append(f"**`{target_file}`:** {draft}")
+        else:
+            top_items.append(draft)
+
+    parts: List[str] = []
+    if intro:
+        parts.append(intro)
+    if len(top_items) > 1:
+        parts.append("\n".join(f"- {item}" for item in top_items))
+    elif len(top_items) == 1:
+        parts.append(top_items[0])
+    combined = "\n\n".join(p for p in parts if p).strip()
+    session["topLevelComment"] = combined
+    return combined
+
+
+def sync_top_level_comments_file(session: Dict[str, Any]) -> None:
+    """Generates `<baseSnapshotRoot>/TOP_LEVEL_PR_COMMENTS.md` and
+    `<headSnapshotRoot>/TOP_LEVEL_PR_COMMENTS.md` with a ready-to-leave
+    Top-Level PR Review Comment at the top plus individual top-level comment
+    sections anchored to native VS Code inline comment controls.
+    """
+    base_root = (session.get("baseSnapshotRoot") or "").strip()
+    head_root = (session.get("headSnapshotRoot") or "").strip()
+    repo_dir = (session.get("repoDir") or "").strip()
+    if not head_root or not os.path.isdir(head_root):
+        build_combined_top_level_comment(session)
+        return
+
+    threads = session.get("threads") or []
+    summary_thread: Optional[Dict[str, Any]] = None
+    top_threads: List[Dict[str, Any]] = []
+    for t in threads:
+        if t.get("id") == TOP_LEVEL_SUMMARY_THREAD_ID:
+            summary_thread = t
+            continue
+        rel_path = (t.get("path") or "").strip()
+        is_top = bool(
+            t.get("isTopLevel")
+            or not rel_path
+            or rel_path == TOP_LEVEL_COMMENTS_FILENAME
+            or not os.path.isfile(os.path.join(head_root, rel_path))
+        )
+        if is_top:
+            if rel_path and rel_path != TOP_LEVEL_COMMENTS_FILENAME and not t.get("targetFile"):
+                t["targetFile"] = rel_path
+            t["isTopLevel"] = True
+            t["path"] = TOP_LEVEL_COMMENTS_FILENAME
+            if t.get("status") != "dismissed":
+                top_threads.append(t)
+
+    combined_top_comment = build_combined_top_level_comment(session)
+
+    header_lines = [
+        "# 📌 Top-Level PR Review Comment (Ready to Leave on PR)",
+        "",
+        "This file holds the overall **top-level review comment** to leave on the PR (including comments about untouched files not in the PR diff).",
+        "When you publish your review to GitHub, staged comments here are automatically combined into the **top-level PR review comment body**.",
+    ]
+
+    if base_root and os.path.isdir(base_root):
+        base_file = os.path.join(base_root, TOP_LEVEL_COMMENTS_FILENAME)
+        try:
+            with open(base_file, "w", encoding="utf-8") as bf:
+                bf.write("\n".join(header_lines) + "\n")
+        except Exception:
+            pass
+
+    head_lines = list(header_lines)
+    head_lines.append("")
+    summary_start_line = len(head_lines) + 1
+    head_lines.append("## 📝 Combined Top-Level Comment to Leave on Review")
+    effective_summary_draft = (
+        (summary_thread.get("draftComment") or "").strip()
+        if summary_thread and summary_thread.get("editedByUser")
+        else combined_top_comment
+    )
+    if effective_summary_draft:
+        head_lines.append("```markdown")
+        for c_ln in effective_summary_draft.splitlines():
+            head_lines.append(c_ln)
+        head_lines.append("```")
+    else:
+        head_lines.append("_No top-level PR review comment staged._")
+    summary_end_line = len(head_lines)
+    head_lines.append("")
+    head_lines.append("---")
+    head_lines.append("")
+
+    if effective_summary_draft:
+        now_ts = session.get("updatedAt") or datetime.datetime.now(datetime.timezone.utc).isoformat()
+        summary_msg_body = (
+            f"**📌 Top-Level PR Review Comment (Overall Summary & Untouched Files)**\n\n"
+            f"*CliffsNotes Context*: Ready-to-leave top-level comment for the PR review (automatically used as the GitHub review summary `body`).\n\n"
+            f"---\n"
+            f"**Draft GitHub Comment**:\n> "
+            + "\n> ".join(effective_summary_draft.splitlines())
+        )
+        if summary_thread is None:
+            summary_thread = {
+                "id": TOP_LEVEL_SUMMARY_THREAD_ID,
+                "kind": "ai_candidate",
+                "severity": "DESIGN",
+                "status": "staged",
+                "isTopLevel": True,
+                "isTopLevelSummary": True,
+                "targetFile": "",
+                "selectedForFix": False,
+                "uncertain": False,
+                "uncertaintyQuestion": "",
+                "preferenceCategory": "comment_placement",
+                "preferenceOptions": [],
+                "path": TOP_LEVEL_COMMENTS_FILENAME,
+                "startLine": summary_start_line,
+                "endLine": summary_end_line,
+                "title": "📌 Top-Level PR Review Comment (Ready to Leave on Review)",
+                "whyItMatters": "Overall top-level review comment combining general PR feedback and comments on untouched files outside the PR diff.",
+                "draftComment": effective_summary_draft,
+                "messages": [
+                    {
+                        "author": "Quasar",
+                        "body": summary_msg_body,
+                        "timestamp": now_ts,
+                    }
+                ],
+            }
+            session["threads"] = [summary_thread] + threads
+        else:
+            summary_thread["isTopLevel"] = True
+            summary_thread["isTopLevelSummary"] = True
+            summary_thread["path"] = TOP_LEVEL_COMMENTS_FILENAME
+            summary_thread["startLine"] = summary_start_line
+            summary_thread["endLine"] = summary_end_line
+            if not summary_thread.get("editedByUser"):
+                summary_thread["draftComment"] = effective_summary_draft
+                if summary_thread.get("messages"):
+                    summary_thread["messages"][0]["body"] = summary_msg_body
+
+    if not top_threads:
+        head_lines.append("_No individual untouched-file comments in this session._")
+    else:
+        for idx, t in enumerate(top_threads, 1):
+            start_line = len(head_lines) + 1
+            title = (t.get("title") or f"Top-Level Comment #{idx}").strip()
+            target_file = (t.get("targetFile") or "").strip()
+            sev = (t.get("severity") or "DESIGN").upper()
+            why = (t.get("whyItMatters") or "").strip()
+            draft = (t.get("draftComment") or t.get("body") or "").strip()
+
+            head_lines.append(f"## 📌 #{idx} [{sev}] {title}")
+            if target_file:
+                head_lines.append(f"- **Untouched File (Not in PR Diff)**: `{target_file}`")
+            if why:
+                head_lines.append(f"- **CliffsNotes Context**: {why}")
+            head_lines.append("")
+            head_lines.append("### 💬 Top-Level GitHub Review Comment Item")
+            if target_file and target_file not in draft and os.path.basename(target_file) not in draft:
+                head_lines.append(f"> **`{target_file}`:** {draft}")
+            elif target_file and target_file not in draft:
+                head_lines.append(f"> **`{target_file}`:** {draft}")
+            else:
+                head_lines.append(f"> {draft}")
+
+            end_line = len(head_lines)
+            t["startLine"] = start_line
+            t["endLine"] = end_line
+
+            if target_file and repo_dir:
+                local_target = os.path.join(repo_dir, target_file)
+                if os.path.isfile(local_target):
+                    try:
+                        with open(local_target, "r", encoding="utf-8", errors="replace") as lf:
+                            raw_file_lines = lf.read().splitlines()
+                        preview_count = min(35, len(raw_file_lines))
+                        ext = os.path.splitext(target_file)[1].lstrip(".") or "text"
+                        head_lines.append("")
+                        head_lines.append(
+                            f"#### 📄 Reference Preview: `{target_file}` (lines 1–{preview_count} of {len(raw_file_lines)} in local workspace)"
+                        )
+                        head_lines.append(f"```{ext}")
+                        for ln_idx, content_ln in enumerate(raw_file_lines[:preview_count], 1):
+                            head_lines.append(f"{ln_idx:3d}: {content_ln}")
+                        head_lines.append("```")
+                    except Exception:
+                        pass
+
+            head_lines.append("")
+            head_lines.append("---")
+            head_lines.append("")
+
+    head_file = os.path.join(head_root, TOP_LEVEL_COMMENTS_FILENAME)
+    try:
+        with open(head_file, "w", encoding="utf-8") as hf:
+            hf.write("\n".join(head_lines).rstrip() + "\n")
+    except Exception:
+        pass
+
+
 def render_cliffs_notes_markdown(session: Dict[str, Any]) -> str:
+    sync_top_level_comments_file(session)
     pr = session.get("pr") or {}
     cn = session.get("cliffsNotes") or {}
     lines: List[str] = []
@@ -1531,10 +1764,21 @@ def render_cliffs_notes_markdown(session: Dict[str, Any]) -> str:
     if uncertain_threads:
         lines.append("## 🤔 Needs Your Preference")
         for idx, t in enumerate(uncertain_threads, 1):
-            head_path = os.path.join(session.get("headSnapshotRoot", ""), t.get("path", ""))
             start_l = t.get("startLine", 1)
             end_l = t.get("endLine", start_l)
-            lines.append(f"- **❓ #{idx} [{os.path.basename(t.get('path', ''))}:L{start_l}-{end_l}](file://{head_path}#L{start_l}-L{end_l}) — {t.get('title', 'Uncertain Finding')}**")
+            if t.get("isTopLevel") or not t.get("path"):
+                tf = t.get("targetFile") or ""
+                repo_file = os.path.join(session.get("repoDir", ""), tf) if tf else ""
+                if tf and repo_file and os.path.isfile(repo_file):
+                    loc_md = f"[📌 Top-Level • {os.path.basename(tf)}](file://{repo_file}#L{start_l}-L{end_l})"
+                elif tf:
+                    loc_md = f"`📌 Top-Level • {os.path.basename(tf)}`"
+                else:
+                    loc_md = "`📌 Top-Level PR Comment`"
+            else:
+                head_path = os.path.join(session.get("headSnapshotRoot", ""), t.get("path", ""))
+                loc_md = f"[{os.path.basename(t.get('path', ''))}:L{start_l}-{end_l}](file://{head_path}#L{start_l}-L{end_l})"
+            lines.append(f"- **❓ #{idx} {loc_md} — {t.get('title', 'Uncertain Finding')}**")
             if t.get("uncertaintyQuestion"):
                 lines.append(f"  - *Question*: {t['uncertaintyQuestion']}")
             lines.append("  <details>")
@@ -1547,6 +1791,14 @@ def render_cliffs_notes_markdown(session: Dict[str, Any]) -> str:
             lines.append("  </details>")
         lines.append("")
 
+    if session.get("topLevelComment"):
+        top_md_path = os.path.join(session.get("headSnapshotRoot", ""), TOP_LEVEL_COMMENTS_FILENAME)
+        lines.append(f"## 📌 Top-Level Review Comment ([`{TOP_LEVEL_COMMENTS_FILENAME}`](file://{top_md_path}))")
+        lines.append("```markdown")
+        lines.append(session["topLevelComment"])
+        lines.append("```")
+        lines.append("")
+
     candidate_threads = [
         t
         for t in (session.get("threads") or [])
@@ -1555,13 +1807,24 @@ def render_cliffs_notes_markdown(session: Dict[str, Any]) -> str:
     if candidate_threads:
         lines.append("## 🎯 Review Findings")
         for idx, t in enumerate(candidate_threads, 1):
-            head_path = os.path.join(session.get("headSnapshotRoot", ""), t.get("path", ""))
             start_l = t.get("startLine", 1)
             end_l = t.get("endLine", start_l)
             sev = t.get("severity", "DESIGN")
             badge = "🔴 Blocking" if "BLOCK" in sev.upper() else ("🟡 Design" if "DESIGN" in sev.upper() else "🟢 Nit")
+            if t.get("isTopLevel") or not t.get("path"):
+                tf = t.get("targetFile") or ""
+                repo_file = os.path.join(session.get("repoDir", ""), tf) if tf else ""
+                if tf and repo_file and os.path.isfile(repo_file):
+                    loc_md = f"[📌 Top-Level • {os.path.basename(tf)}](file://{repo_file}#L{start_l}-L{end_l})"
+                elif tf:
+                    loc_md = f"`📌 Top-Level • {os.path.basename(tf)}`"
+                else:
+                    loc_md = "`📌 Top-Level PR Comment`"
+            else:
+                head_path = os.path.join(session.get("headSnapshotRoot", ""), t.get("path", ""))
+                loc_md = f"[{os.path.basename(t.get('path', ''))}:L{start_l}-{end_l}](file://{head_path}#L{start_l}-L{end_l})"
             why_short, why_extra = _split_concise_and_detail(t.get("whyItMatters") or "", 140)
-            lines.append(f"- **#{idx} [{badge}] [{os.path.basename(t.get('path', ''))}:L{start_l}-{end_l}](file://{head_path}#L{start_l}-L{end_l}) — {t.get('title', 'Review Finding')}**")
+            lines.append(f"- **#{idx} [{badge}] {loc_md} — {t.get('title', 'Review Finding')}**")
             if why_short:
                 lines.append(f"  - {why_short}")
             lines.append("  <details>")

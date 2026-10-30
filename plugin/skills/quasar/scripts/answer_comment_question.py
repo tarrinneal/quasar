@@ -270,9 +270,9 @@ def main() -> None:
         pass
 
     session["updatedAt"] = now_iso
+    md_content = render_cliffs_notes_markdown(session)
     with open(active_session_path, "w", encoding="utf-8") as f:
         json.dump(session, f, indent=2)
-    md_content = render_cliffs_notes_markdown(session)
     with open(cliffs_notes_md_path, "w", encoding="utf-8") as f:
         f.write(md_content)
     try:

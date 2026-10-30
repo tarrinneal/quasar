@@ -1868,7 +1868,12 @@ class CommentsTreeProvider {
           `${prefix}${fixBadge}${ratingBadge} ${cleanTitle}`,
           vscode.TreeItemCollapsibleState.None
         );
-        const locStr = `${path.basename(t.path || '')}:L${t.startLine || 1}`;
+        const isTopLevel = Boolean(t.isTopLevel || !t.path);
+        const locStr = isTopLevel
+          ? t.targetFile
+            ? `📌 Top-Level • ${path.basename(t.targetFile)}`
+            : '📌 Top-Level PR Comment'
+          : `${path.basename(t.path || '')}:L${t.startLine || 1}`;
         item.description =
           isExistingGh && inferredAuthor
             ? `@${inferredAuthor.replace(/^@/, '')} • ${locStr}`
@@ -1891,9 +1896,14 @@ class CommentsTreeProvider {
             : vscode.TreeItemCheckboxState.Unchecked;
         }
 
+        const fileHeaderMd = isTopLevel
+          ? `**Placement**: 📌 Top-Level PR Review Comment${
+              t.targetFile ? ` (Untouched file: \`${t.targetFile}\`)` : ''
+            }\n\n`
+          : `**File**: \`${t.path}:L${t.startLine}-${t.endLine || t.startLine}\`\n\n`;
         const tip = new vscode.MarkdownString(
           `### ${prefix} ${t.title || 'Comment'}\n` +
-            `**File**: \`${t.path}:L${t.startLine}-${t.endLine || t.startLine}\`\n\n` +
+            fileHeaderMd +
             (isFixed && t.fixedSummary
               ? `**✅ Applied Fix**: ${t.fixedSummary}\n\n`
               : '') +
@@ -2775,8 +2785,12 @@ function activate(context) {
                   t.id
                 )}">${escapeHtmlText(cleanTitle)}</a>
                 <span class="q-stop-path">${escapeHtmlText(
-                  path.basename(t.path || '')
-                )}:L${t.startLine || 1}</span>
+                  t.isTopLevel || !t.path
+                    ? t.targetFile
+                      ? `📌 Top-Level • ${path.basename(t.targetFile)}`
+                      : '📌 Top-Level PR Comment'
+                    : `${path.basename(t.path || '')}:L${t.startLine || 1}`
+                )}</span>
               </div>
               <div class="q-stop-actions">
                 <button type="button" class="q-btn q-btn-sm" data-act="jumpToThread" data-thread-id="${escapeHtmlText(
@@ -4689,9 +4703,23 @@ function activate(context) {
       const session = loadActiveSession();
       if (!session || !threadData) return;
       const t = threadData.threadData || threadData;
+      const line0 = Math.max(0, (t.startLine || 1) - 1);
+      if (!t.path) {
+        const tf = t.targetFile || '';
+        const localFile = tf && session.repoDir ? path.join(session.repoDir, tf) : '';
+        if (localFile && fs.existsSync(localFile)) {
+          const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(localFile));
+          await vscode.window.showTextDocument(doc, {
+            selection: new vscode.Range(line0, 0, line0, 0),
+            preview: true,
+          });
+          return;
+        }
+        await vscode.commands.executeCommand('quasar.openCliffsNotes');
+        return;
+      }
       const baseUri = vscode.Uri.file(path.join(session.baseSnapshotRoot || '', t.path));
       const headUri = vscode.Uri.file(path.join(session.headSnapshotRoot || '', t.path));
-      const line0 = Math.max(0, (t.startLine || 1) - 1);
       await vscode.commands.executeCommand(
         'vscode.diff',
         baseUri,
@@ -6343,40 +6371,71 @@ function activate(context) {
       }
 
       const finalStaged = (session.threads || []).filter((t) => t.status === 'staged');
+      const hasExistingPending = Boolean(session.githubPendingReviewId);
 
-      const eventChoices = [
-        {
-          label: `$(comment-discussion) Publish Review Now as ${userHandle} (COMMENT)`,
-          description: `Posts ${finalStaged.length} inline comment(s) immediately to the PR under ${userHandle}`,
-          event: 'COMMENT',
-        },
-        {
-          label: `$(check) Approve PR & Publish Review as ${userHandle} (APPROVE)`,
-          description: `Approves the PR and publishes ${finalStaged.length} inline comment(s) under ${userHandle}`,
-          event: 'APPROVE',
-        },
-        {
-          label: `$(request-changes) Request Changes & Publish Review as ${userHandle} (REQUEST_CHANGES)`,
-          description: `Requests changes on the PR and publishes ${finalStaged.length} inline comment(s) under ${userHandle}`,
-          event: 'REQUEST_CHANGES',
-        },
-        {
-          label: `$(clock) Create Draft Pending Review on GitHub as ${userHandle} (PENDING)`,
-          description: `Uploads ${finalStaged.length} inline comment(s) as an unpublished Pending Review on GitHub so you can review before submitting`,
-          event: 'PENDING',
-        },
-        {
-          label: '$(key) Update / Configure GitHub API Key...',
-          description: `Current auth: ${userHandle}`,
-          event: 'CONFIGURE_TOKEN',
-        },
-      ];
+      const pendingOption = {
+        label: hasExistingPending
+          ? `$(sync) Update Existing Pending Review on GitHub as ${userHandle} (PENDING)`
+          : `$(clock) Create / Update Draft Pending Review on GitHub as ${userHandle} (PENDING)`,
+        description: hasExistingPending
+          ? `Replaces your existing pending draft review on GitHub with the latest ${finalStaged.length} staged comment(s) & top-level summary`
+          : `Uploads ${finalStaged.length} inline comment(s) as an unpublished Pending Review on GitHub (or updates your existing pending review)`,
+        event: 'PENDING',
+      };
+
+      const eventChoices = hasExistingPending
+        ? [
+            pendingOption,
+            {
+              label: `$(comment-discussion) Publish Review Now as ${userHandle} (COMMENT)`,
+              description: `Posts ${finalStaged.length} inline comment(s) immediately to the PR under ${userHandle}`,
+              event: 'COMMENT',
+            },
+            {
+              label: `$(check) Approve PR & Publish Review as ${userHandle} (APPROVE)`,
+              description: `Approves the PR and publishes ${finalStaged.length} inline comment(s) under ${userHandle}`,
+              event: 'APPROVE',
+            },
+            {
+              label: `$(request-changes) Request Changes & Publish Review as ${userHandle} (REQUEST_CHANGES)`,
+              description: `Requests changes on the PR and publishes ${finalStaged.length} inline comment(s) under ${userHandle}`,
+              event: 'REQUEST_CHANGES',
+            },
+            {
+              label: '$(key) Update / Configure GitHub API Key...',
+              description: `Current auth: ${userHandle}`,
+              event: 'CONFIGURE_TOKEN',
+            },
+          ]
+        : [
+            {
+              label: `$(comment-discussion) Publish Review Now as ${userHandle} (COMMENT)`,
+              description: `Posts ${finalStaged.length} inline comment(s) immediately to the PR under ${userHandle}`,
+              event: 'COMMENT',
+            },
+            {
+              label: `$(check) Approve PR & Publish Review as ${userHandle} (APPROVE)`,
+              description: `Approves the PR and publishes ${finalStaged.length} inline comment(s) under ${userHandle}`,
+              event: 'APPROVE',
+            },
+            {
+              label: `$(request-changes) Request Changes & Publish Review as ${userHandle} (REQUEST_CHANGES)`,
+              description: `Requests changes on the PR and publishes ${finalStaged.length} inline comment(s) under ${userHandle}`,
+              event: 'REQUEST_CHANGES',
+            },
+            pendingOption,
+            {
+              label: '$(key) Update / Configure GitHub API Key...',
+              description: `Current auth: ${userHandle}`,
+              event: 'CONFIGURE_TOKEN',
+            },
+          ];
 
       const pickedEvent = await vscode.window.showQuickPick(eventChoices, {
-        title: `Publish Review to GitHub (${finalStaged.length} Staged Inline Comment${
+        title: `Publish Review to GitHub (${finalStaged.length} Staged Comment${
           finalStaged.length === 1 ? '' : 's'
         })`,
-        placeHolder: `Choose how to publish this review as ${userHandle}`,
+        placeHolder: `Choose how to publish or update this review as ${userHandle}`,
       });
       if (!pickedEvent) return;
 
@@ -6388,8 +6447,13 @@ function activate(context) {
         return;
       }
 
+      const hasStagedTopLevel =
+        finalStaged.some(
+          (t) => t.isTopLevel || !t.path || t.path === 'TOP_LEVEL_PR_COMMENTS.md'
+        ) || Boolean(String(session.topLevelComment || '').trim());
+
       let summaryBody = '';
-      if (pickedEvent.event !== 'PENDING' || finalStaged.length === 0) {
+      if ((pickedEvent.event !== 'PENDING' || finalStaged.length === 0) && !hasStagedTopLevel) {
         const defaultBody =
           pickedEvent.event === 'APPROVE'
             ? 'LGTM!'
@@ -6466,6 +6530,12 @@ function activate(context) {
         return;
       }
 
+      if (res.event === 'PENDING' && res.review_body) {
+        try {
+          await vscode.env.clipboard.writeText(res.review_body);
+        } catch (_) {}
+      }
+
       const actionLabel =
         res.event === 'APPROVE'
           ? 'Approved PR & published review'
@@ -6473,12 +6543,18 @@ function activate(context) {
           ? 'Requested changes & published review'
           : res.event === 'COMMENT'
           ? 'Published review'
+          : res.status === 'pending_review_updated'
+          ? 'Updated Draft Pending Review'
           : 'Created Draft Pending Review';
       const asWho = res.published_as ? ` as @${res.published_as}` : '';
+      const clipboardHint =
+        res.event === 'PENDING' && res.review_body
+          ? ' 📋 Top-level comment copied to clipboard (paste with Cmd+V in GitHub\'s "Finish your review" box, or publish directly from Quasar).'
+          : '';
       const choice = await vscode.window.showInformationMessage(
         `✅ ${actionLabel}${asWho} on GitHub (${res.comments_exported || 0} inline comment${
           res.comments_exported === 1 ? '' : 's'
-        })!`,
+        })!${clipboardHint}`,
         'Open Review on GitHub'
       );
       if (choice === 'Open Review on GitHub' && res.html_url) {

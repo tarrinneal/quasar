@@ -57,6 +57,12 @@ run_doctor() {
     ok=0
   fi
 
+  if [ -f "${PLUGIN_DEST}/sidecars/quasar-web/sidecar.json" ] && [ -f "${PLUGIN_DEST}/sidecars/quasar-web/server.py" ]; then
+    echo "  ✅ Quasar Web UI Sidecar: Installed at ${PLUGIN_DEST}/sidecars/quasar-web (sidecar://quasar/quasar-web/ & http://127.0.0.1:49341)"
+  else
+    echo "  ⚠️  Quasar Web UI Sidecar: Missing at ${PLUGIN_DEST}/sidecars/quasar-web"
+  fi
+
   local ext_found=0
   for EXT_ROOT in "${HOME}"/.*/extensions; do
     if [ -f "${EXT_ROOT}/${EXT_NAME}/extension.js" ]; then
@@ -65,17 +71,15 @@ run_doctor() {
     fi
   done
   if [ "${ext_found}" -eq 0 ]; then
-    echo "  ❌ Quasar Native Extension: Not found in ~/.antigravity/extensions or ~/.vscode/extensions"
-    ok=0
+    echo "  ℹ️  Quasar Native Extension: Not found in local IDE extensions (Jetski Web UI & Standalone HTML still active)"
   fi
 
   echo "=================================================================="
   if [ "${ok}" -eq 1 ]; then
     echo "🎉 Quasar v${VERSION} is installed and ready!"
-    echo "👉 Next step in Antigravity / VS Code:"
-    echo "   1. Press Cmd+Shift+P (macOS) or Ctrl+Shift+P (Windows/Linux)"
-    echo "   2. Run: Developer: Reload Window"
-    echo "   3. Click 'Quasar' in the bottom-left Status Bar or press Cmd+Shift+P -> 'Quasar: Open Quasar Sidebar & Menu...'"
+    echo "👉 Next step in Antigravity / VS Code / Jetski Web:"
+    echo "   • Desktop IDE: Press Cmd+Shift+P -> 'Developer: Reload Window', then click 'Quasar' in the Status Bar"
+    echo "   • Jetski Web / Browser: Open sidecar://quasar/quasar-web/ or http://127.0.0.1:49341"
     return 0
   else
     echo "❌ Quasar installation is incomplete. Run ./install.sh to fix."
@@ -92,6 +96,7 @@ echo "==> Installing Quasar v${VERSION} plugin to ${PLUGIN_DEST}..."
 rm -rf "${OLD_PLUGIN_DEST}" 2>/dev/null || true
 mkdir -p "${PLUGIN_DEST}/skills/quasar/scripts"
 mkdir -p "${PLUGIN_DEST}/agents"
+mkdir -p "${PLUGIN_DEST}/sidecars/quasar-web"
 mkdir -p "${STATE_DIR}/seed_skills"
 mkdir -p "${STATE_DIR}/workspaces"
 
@@ -102,6 +107,17 @@ chmod +x "${PLUGIN_DEST}/skills/quasar/scripts/"*.py
 
 if [ -d "${SCRIPT_DIR}/plugin/agents" ]; then
   cp -R "${SCRIPT_DIR}/plugin/agents/"* "${PLUGIN_DEST}/agents/" 2>/dev/null || true
+fi
+
+if [ -d "${SCRIPT_DIR}/plugin/sidecars/quasar-web" ]; then
+  cp "${SCRIPT_DIR}/extension/media/mermaid-preview.js" "${SCRIPT_DIR}/plugin/sidecars/quasar-web/mermaid-preview.js" 2>/dev/null || true
+  cp -R "${SCRIPT_DIR}/plugin/sidecars/quasar-web/"* "${PLUGIN_DEST}/sidecars/quasar-web/" 2>/dev/null || true
+  chmod +x "${PLUGIN_DEST}/sidecars/quasar-web/server.py" 2>/dev/null || true
+  # Ensure standalone localhost:49341 Web UI server is running immediately
+  pkill -f "quasar-web/server.py --standalone-daemon" 2>/dev/null || true
+  if ! lsof -iTCP:49341 -sTCP:LISTEN >/dev/null 2>&1; then
+    nohup python3 "${PLUGIN_DEST}/sidecars/quasar-web/server.py" --standalone-daemon >/dev/null 2>&1 &
+  fi
 fi
 
 # Migrate any existing review session state to ~/.gemini/quasar

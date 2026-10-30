@@ -150,6 +150,7 @@ Write `<SCRATCH_DIR>/review_synthesis.json` and publish it using `publish_review
       ]
     }
   ],
+  "topLevelComment": "Optional overall top-level PR review comment to leave on the review (automatically combined with any `isTopLevel: true` untouched-file comments into `TOP_LEVEL_PR_COMMENTS.md` and the GitHub review summary `body`).",
   "findings": [
     {
       "id": "finding-1",
@@ -204,6 +205,7 @@ Write `<SCRATCH_DIR>/review_synthesis.json` and publish it using `publish_review
 > **Draft Comment Style & Verbosity (`draftComment`)**:
 > - **Lean less verbose without losing important information**: Keep `draftComment` focused on the core issue and essential context (typically 1–2 concise sentences). Put extra background or step-by-step trace details into `whyItMatters` (for the reviewer) so the GitHub comment itself stays crisp.
 > - **Suggestions are optional, not mandatory**: Not every comment needs a code suggestion or prescribed fix. Often, simply pointing out the issue or asking a brief question is enough—include a suggestion only when the fix is non-obvious or genuinely helpful.
+> - **Files not included in the PR diff → Top-Level PR Comment (`isTopLevel: true`)**: When a finding is about a file that was **not modified in the PR diff** (for example, a missing unit test in an untouched test file), do **not** anchor it inline on a random changed file in the PR. Instead, set `"isTopLevel": true`, `"path": ""`, and `"targetFile": "<path/to/untouched_file>"` (or pass the untouched file path in `"path"`, which `publish_review_session.py` automatically promotes to a top-level PR review comment when the file is not in `headSnapshotRoot`). When published to GitHub via `post_pending_review.py`, top-level comments are automatically included in the top-level PR review summary `body`.
 >
 > **Mermaid Flowchart Rules (`architectureDiagram`)**:
 > - Always quote every node and subgraph label (`ID["Label Text"]`, `subgraph sg_id ["Title"]`).
@@ -218,6 +220,11 @@ python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/publish_review_ses
   --workspace-dir <ACTIVE_WORKSPACE_PATH> \
   --artifact-out <ARTIFACT_DIR>/code_review_briefing.md
 ```
+
+> **Jetski Web & Browser UI Link**:
+> In your final response after publishing a review, always include the interactive Quasar Web UI pill so teammates on **Jetski Web** (or without the VS Code extension) can open the full interactive Study Guide, SVG Flowchart, and Side-by-Side Diff Viewer right inside Jetski or their browser:
+> - `[📖 Open Quasar Review](sidecar://quasar/quasar-web/)` (opens the Quasar Web UI sidecar pane inside Jetski)
+> - Direct browser URL: `http://127.0.0.1:49341` (or the exported `quasar_review.html` artifact)
 
 ### Interactive Preference Calibration (`ask_question`)
 If your review produced any `"status": "uncertain"` findings (or if you have 1–2 high-leverage questions about the reviewer's preferences for this repo/style), **call the `ask_question` tool** right after publishing the session!
