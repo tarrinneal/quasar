@@ -562,7 +562,10 @@ def build_summary_and_dossiers(
                 }
             reviewer_stats[app_low]["prs_approved_count"] += 1
 
-        comments = pr.get("comments") or []
+        comments = [
+            c for c in (pr.get("comments") or [])
+            if is_substantive_comment(str(c.get("body") or ""))
+        ]
         if comments:
             prs_with_comments += 1
 
@@ -571,7 +574,8 @@ def build_summary_and_dossiers(
             total_comments += 1
             rev = str(c.get("reviewer") or "")
             rev_low = rev.lower()
-            is_sugg = bool(c.get("is_suggested_reviewer"))
+            is_sugg = rev_low in suggested_map
+            c["is_suggested_reviewer"] = is_sugg
             if is_sugg:
                 suggested_comments += 1
 
@@ -620,7 +624,7 @@ def build_summary_and_dossiers(
 
             # Save representative high-signal sample comments per reviewer (prefer inline with substantive length)
             body_text = str(c.get("body") or "").strip()
-            if 25 <= len(body_text) <= 900 and len(st["sample_comments"]) < 35:
+            if 25 <= len(body_text) <= 950 and len(st["sample_comments"]) < 60:
                 st["sample_comments"].append(
                     {
                         "pr": pr_num,
@@ -637,12 +641,20 @@ def build_summary_and_dossiers(
         for r_low in seen_reviewers_this_pr:
             reviewer_stats[r_low]["prs_reviewed_count"] += 1
 
-    # Convert Counters to dicts for JSON serialization
+    # Convert Counters to dicts for JSON serialization and sort sample_comments to prefer inline diff comments
     serializable_reviewers: List[Dict[str, Any]] = []
     for k, v in reviewer_stats.items():
         v_copy = dict(v)
         v_copy["categories"] = dict(v["categories"].most_common())
         v_copy["packages_reviewed"] = dict(v["packages_reviewed"].most_common(15))
+        v_copy["sample_comments"] = sorted(
+            v["sample_comments"],
+            key=lambda sc: (
+                1 if sc.get("type") == "inline_diff_comment" else (0.5 if sc.get("type") == "inline_thread_followup" else 0),
+                1 if len(sc.get("body") or "") >= 55 else 0,
+            ),
+            reverse=True,
+        )[:25]
         serializable_reviewers.append(v_copy)
 
     serializable_reviewers.sort(
@@ -739,11 +751,11 @@ def build_summary_and_dossiers(
         top_cats = ", ".join(f"`{k}`: {v}" for k, v in list(r["categories"].items())[:5])
         md_lines.append(f"- **Comment Breakdown**: {top_cats}")
         md_lines.append("- **Representative Real Review Comments**:")
-        for sc in r["sample_comments"][:8]:
+        for sc in r["sample_comments"][:10]:
             loc = f"`{sc['path']}:{sc['line']}`" if sc.get("path") else "*(PR Review Summary / Top-Level)*"
             body_one_line = re.sub(r"\s+", " ", sc["body"]).strip()
-            if len(body_one_line) > 320:
-                body_one_line = body_one_line[:317] + "..."
+            if len(body_one_line) > 340:
+                body_one_line = body_one_line[:337] + "..."
             md_lines.append(f"  - **[PR #{sc['pr']}]** ({loc}): > {body_one_line}")
 
     with open(DOSSIER_MD, "w", encoding="utf-8") as f:
@@ -752,9 +764,112 @@ def build_summary_and_dossiers(
     return summary
 
 
+TARGETED_SEARCH_QUERY = """
+query($searchQuery: String!) {
+  search(query: $searchQuery, type: ISSUE, first: 35) {
+    nodes {
+      ... on PullRequest {
+        number
+        title
+        url
+        createdAt
+        mergedAt
+        additions
+        deletions
+        changedFiles
+        author {
+          __typename
+          login
+        }
+        files(first: 50) {
+          nodes {
+            path
+          }
+        }
+        reviews(first: 40) {
+          nodes {
+            author {
+              __typename
+              login
+            }
+            state
+            body
+            submittedAt
+          }
+        }
+        comments(first: 30) {
+          nodes {
+            author {
+              __typename
+              login
+            }
+            body
+            createdAt
+          }
+        }
+        reviewThreads(first: 50) {
+          nodes {
+            path
+            line
+            originalLine
+            isResolved
+            isOutdated
+            comments(first: 15) {
+              nodes {
+                author {
+                  __typename
+                  login
+                }
+                body
+                diffHunk
+                createdAt
+                url
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  rateLimit {
+    cost
+    remaining
+    resetAt
+  }
+}
+"""
+
+
+def graphql_search_prs(token: str, search_query: str) -> Dict[str, Any]:
+    payload = json.dumps({"query": TARGETED_SEARCH_QUERY, "variables": {"searchQuery": search_query}}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.github.com/graphql",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "quasar-persona-miner",
+        },
+        method="POST",
+    )
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                data = json.load(resp)
+            if "errors" in data and not data.get("data"):
+                raise RuntimeError(f"GraphQL search errors: {data['errors']}")
+            return data
+        except Exception:
+            if attempt == 3:
+                raise
+            time.sleep(2.0 * (attempt + 1))
+    return {}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Harvest merged human PRs and human review comments from flutter/packages.")
     parser.add_argument("--max-pages", type=int, default=15, help="Number of GraphQL pages (35 PRs/page) to fetch in this chunk.")
+    parser.add_argument("--target-suggested", action="store_true", help="Also run targeted search queries for SUGGESTED_REVIEWERS.md maintainers with < 50 comments.")
     parser.add_argument("--reset", action="store_true", help="Reset pagination cursor to start from newest merged PRs.")
     parser.add_argument("--analyze-only", action="store_true", help="Skip network fetching and rebuild summary/dossiers from local corpus.")
     parser.add_argument("--suggested-reviewers-md", default=DEFAULT_SUGGESTED_REVIEWERS_MD, help="Path to SUGGESTED_REVIEWERS.md")
@@ -787,7 +902,6 @@ def main() -> None:
             pages_fetched += 1
             total_raw_scanned += len(nodes)
 
-            batch_records: List[Dict[str, Any]] = []
             for node in nodes:
                 rec = process_pr_node(node, suggested_map)
                 if rec is None:
@@ -797,9 +911,8 @@ def main() -> None:
                     new_human_prs += 1
                     new_comments += rec["human_comments_count"]
                 prs_by_num[pr_num] = rec
-                batch_records.append(rec)
 
-            # Append new records to JSONL and save state after every page so progress is crash-safe
+            # Save corpus and state after every page so progress is crash-safe
             with open(CORPUS_JSONL, "w", encoding="utf-8") as f:
                 for _, pr_obj in sorted(prs_by_num.items(), key=lambda x: x[0], reverse=True):
                     f.write(json.dumps(pr_obj) + "\n")
@@ -822,6 +935,50 @@ def main() -> None:
                 f"GraphQL remaining: {rate_info.get('remaining')}",
                 flush=True,
             )
+
+        if args.target_suggested:
+            # Count current comments per suggested reviewer
+            rev_counts: collections.Counter = collections.Counter()
+            for pr_obj in prs_by_num.values():
+                for c in pr_obj.get("comments") or []:
+                    if is_substantive_comment(str(c.get("body") or "")):
+                        rev_counts[str(c.get("reviewer") or "").lower()] += 1
+
+            for rev_low, info in suggested_map.items():
+                handle = info["handle"]
+                if rev_counts[rev_low] >= 50:
+                    continue
+                t0 = time.time()
+                q = f"repo:flutter/packages is:pr is:merged reviewed-by:{handle}"
+                try:
+                    resp = graphql_search_prs(token, q)
+                    nodes = (((resp.get("data") or {}).get("search")) or {}).get("nodes") or []
+                    rate_info = (resp.get("data") or {}).get("rateLimit") or {}
+                    added_prs = 0
+                    added_rev_comments = 0
+                    for node in nodes:
+                        rec = process_pr_node(node, suggested_map)
+                        if rec is None:
+                            continue
+                        pr_num = rec["number"]
+                        if pr_num not in prs_by_num:
+                            added_prs += 1
+                            added_rev_comments += sum(
+                                1 for c in rec["comments"] if str(c.get("reviewer") or "").lower() == rev_low
+                            )
+                            prs_by_num[pr_num] = rec
+                    dt = time.time() - t0
+                    print(
+                        f"[Targeted @{handle}] Fetched {len(nodes)} PRs ({dt:.1f}s) -> +{added_prs} new PRs, "
+                        f"+{added_rev_comments} comments by @{handle} | GraphQL remaining: {rate_info.get('remaining')}",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(f"[Targeted @{handle}] Warning: {e}", flush=True)
+
+            with open(CORPUS_JSONL, "w", encoding="utf-8") as f:
+                for _, pr_obj in sorted(prs_by_num.items(), key=lambda x: x[0], reverse=True):
+                    f.write(json.dumps(pr_obj) + "\n")
 
     summary = build_summary_and_dossiers(prs_by_num, suggested_map, state)
     print(
