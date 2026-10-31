@@ -2,6 +2,24 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [1.2.2] - 2026-10-30
+
+### Added
+- **Quasar Web UI Sidecar & Standalone Browser App (`quasar-web`)**:
+  - Added `plugin/sidecars/quasar-web` (`sidecar://quasar/quasar-web/` and `http://127.0.0.1:49341`) plus self-contained `quasar_review.html` export for Jetski Web, Desktop Aux/Full Panes, and standalone browser sessions.
+  - Supports interactive Study Guides, clickable SVG flowcharts, side-by-side & unified diffs, inline line Q&A, comment revision with the agent, batch comment fixing, and 1-click GitHub review publishing.
+  - Added a **Live Agent Activity & Progress Indicator** (`#agentPill` & `#agentActivityBanner`) that tracks pipeline phases (`Phase 1/3` → `Phase 2/3` → `Phase 3/3`), active subagents, live tool steps, and elapsed time in real time.
+- **Update Existing Pending Reviews on GitHub**:
+  - Automatically detects and replaces any existing `PENDING` review owned by you on the PR when pushing updated staged comments (`delete_existing_pending_reviews` in `post_pending_review.py`).
+- **New Quasar App & Activity Bar Icons**:
+  - Added custom Quasar extension icon (`media/quasar-icon.png`), activity bar SVG (`media/review-icon.svg`), and Web UI favicon.
+
+### Fixed
+- **Top-Level PR Comment Preservation on Pending Reviews**:
+  - Automatically copies the top-level review summary (`TOP_LEVEL_PR_COMMENTS.md`) to the clipboard when creating/updating a GitHub `PENDING` review (since GitHub discards `PENDING` review bodies in the web submit box) and fixed duplicate intro lines in `overflow_notes`.
+- **Jetski Web Sidecar Auth & AgentAPI Context Resolution**:
+  - Added `/preload.js`, `X-Sidecar-Token` forwarding, cross-project `ANTIGRAVITY_PROJECT_ID` / `rootConversationId` resolution in `server.py`, and automatic plugin enablement (`JetboxWriteState` + `GetAllPlugins`) in `install.sh`.
+
 ## [1.2.0] - 2026-10-29
 
 ### Added

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="1.2.1"
+VERSION="1.2.2"
 EXT_NAME="codeium.codeium-dev-${VERSION}"
 OLD_CODEIUM_EXT_NAME="codeium.codeium-dev-1.0.0"
 OLD_EXT_NAME="antigravity.antigravity-code-review-1.0.0"
@@ -218,6 +218,7 @@ content_types = """<?xml version="1.0" encoding="utf-8"?>
   <Default Extension=".json" ContentType="application/json"/>
   <Default Extension=".js" ContentType="application/javascript"/>
   <Default Extension=".svg" ContentType="image/svg+xml"/>
+  <Default Extension=".png" ContentType="image/png"/>
   <Default Extension=".vsixmanifest" ContentType="text/xml"/>
 </Types>"""
 
@@ -228,6 +229,7 @@ vsixmanifest = f"""<?xml version="1.0" encoding="utf-8"?>
     <DisplayName>Quasar</DisplayName>
     <Description xml:space="preserve">Comprehension-first, native GitHub PR &amp; local branch review tool.</Description>
     <Categories>Other,SCM Providers</Categories>
+    <Icon>extension/media/quasar-icon.png</Icon>
   </Metadata>
   <Installation>
     <InstallationTarget Id="Microsoft.VisualStudio.Code"/>
@@ -235,6 +237,7 @@ vsixmanifest = f"""<?xml version="1.0" encoding="utf-8"?>
   <Dependencies/>
   <Assets>
     <Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true"/>
+    <Asset Type="Microsoft.VisualStudio.Services.Icons.Default" Path="extension/media/quasar-icon.png" Addressable="true"/>
   </Assets>
 </PackageManifest>"""
 
