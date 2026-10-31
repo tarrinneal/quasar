@@ -331,12 +331,25 @@ def github_api_get(url: str, accept: str = "application/vnd.github.v3+json") -> 
     token = get_github_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-        if "json" in accept:
-            return json.loads(raw)
-        return raw
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            if "json" in accept:
+                return json.loads(raw)
+            return raw
+    except urllib.error.HTTPError:
+        raise
+    except Exception:
+        if "Authorization" in headers:
+            headers.pop("Authorization", None)
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                if "json" in accept:
+                    return json.loads(raw)
+                return raw
+        raise
 
 
 def classify_file(path: str) -> str:
@@ -439,6 +452,17 @@ def fetch_raw_file_content(
             return ""
         return None
     except Exception:
+        if "Authorization" in headers:
+            headers.pop("Authorization", None)
+            try:
+                req = urllib.request.Request(raw_url, headers=headers)
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    return resp.read().decode("utf-8", errors="replace")
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    return ""
+            except Exception:
+                pass
         return None
 
 

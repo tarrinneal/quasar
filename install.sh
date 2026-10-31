@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="1.2.2"
+VERSION="1.2.3"
 EXT_NAME="codeium.codeium-dev-${VERSION}"
 OLD_CODEIUM_EXT_NAME="codeium.codeium-dev-1.0.0"
 OLD_EXT_NAME="antigravity.antigravity-code-review-1.0.0"
@@ -114,7 +114,8 @@ if [ -d "${SCRIPT_DIR}/plugin/sidecars/quasar-web" ]; then
   cp -R "${SCRIPT_DIR}/plugin/sidecars/quasar-web/"* "${PLUGIN_DEST}/sidecars/quasar-web/" 2>/dev/null || true
   chmod +x "${PLUGIN_DEST}/sidecars/quasar-web/server.py" 2>/dev/null || true
   # Auto-enable the Quasar plugin and start its sidecar in any running Jetski / Antigravity Language Server
-  python3 - "${PLUGIN_DEST}/sidecars/quasar-web" <<'PY' 2>/dev/null || true
+  SIDECAR_MANAGED=0
+  if python3 - "${PLUGIN_DEST}/sidecars/quasar-web" <<'PY' 2>/dev/null; then
 import json
 import sys
 import urllib.request
@@ -125,37 +126,34 @@ import server
 env = server.discover_ls_env()
 addr = env.get("ANTIGRAVITY_LS_ADDRESS")
 csrf = env.get("ANTIGRAVITY_CSRF_TOKEN")
-if addr and csrf:
-    def rpc(method: str, body: dict):
-        req = urllib.request.Request(
-            f"http://{addr}/exa.language_server_pb.LanguageServerService/{method}",
-            data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Connect-Protocol-Version": "1",
-                "x-codeium-csrf-token": csrf,
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=4) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+if not (addr and csrf):
+    sys.exit(1)
 
-    enabled_map = {}
-    try:
-        all_plugins = rpc("GetAllPlugins", {}).get("plugins") or []
-        for p in all_plugins:
-            if p.get("id"):
-                enabled_map[p["id"]] = bool(p.get("enabled"))
-    except Exception:
-        pass
-    enabled_map["quasar"] = True
-    rpc("JetboxWriteState", {"uri": "plugins.enabled", "value": json.dumps(enabled_map)})
-    rpc("GetAllPlugins", {})
+def rpc(method: str, body: dict):
+    req = urllib.request.Request(
+        f"http://{addr}/exa.language_server_pb.LanguageServerService/{method}",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Connect-Protocol-Version": "1",
+            "x-codeium-csrf-token": csrf,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=4) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+rpc("JetboxWriteState", {"userConfig": {"plugins": {"quasar": {"enabled": True}}}})
+rpc("GetAllPlugins", {})
 PY
+    SIDECAR_MANAGED=1
+  fi
   # Ensure standalone localhost:49341 Web UI server is running immediately if not started by SidecarManager
-  pkill -f "quasar-web/server.py --standalone-daemon" 2>/dev/null || true
-  if ! lsof -iTCP:49341 -sTCP:LISTEN >/dev/null 2>&1; then
-    nohup python3 "${PLUGIN_DEST}/sidecars/quasar-web/server.py" --standalone-daemon >/dev/null 2>&1 &
+  if [ "${SIDECAR_MANAGED}" -eq 0 ]; then
+    pkill -f "quasar-web/server.py --standalone-daemon" 2>/dev/null || true
+    if ! lsof -iTCP:49341 -sTCP:LISTEN >/dev/null 2>&1; then
+      nohup python3 "${PLUGIN_DEST}/sidecars/quasar-web/server.py" --standalone-daemon >/dev/null 2>&1 &
+    fi
   fi
 fi
 

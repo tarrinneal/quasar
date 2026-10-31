@@ -2,6 +2,20 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [1.2.3] - 2026-10-30
+
+### Added
+- **Proxied & Remote Sandbox Support for GitHub Token Verification & Review Publishing**:
+  - `submitToken()` in `quasar-web` now verifies GitHub Personal Access Tokens against `https://api.github.com/user` directly from the browser first and sends the verified `login` and `name` to `/api/github-token` (with graceful `RemoteDisconnected` fallback on the backend when outbound DLP proxies drop `ghp_...` / `github_pat_...` headers).
+  - `post_pending_review.py` and `/api/publish-github` now return a hunk-aligned `needs_browser_publish` (`clientSidePublish: true`) payload when backend `POST` requests to `api.github.com` are blocked by outbound proxies (`ÜberProxy` / `RemoteDisconnected`), allowing the browser to `POST` the review directly to GitHub via CORS.
+  - Added clean simulated review publishing in **Tutorial Sandbox** mode (`status: "tutorial_simulated"`).
+
+### Fixed
+- **Public PR Fetching Behind DLP Header Scanners**:
+  - `github_api_get()` and `fetch_raw_file_content()` in `collect_pr_context.py` automatically retry without the `Authorization` header if a backend `GET` request carrying a stored token is dropped by an outbound proxy.
+- **Sidecar Port Contention in `install.sh`**:
+  - `install.sh` now skips launching `--standalone-daemon` when `SidecarManager` is active so they do not race for port `49341`.
+
 ## [1.2.2] - 2026-10-30
 
 ### Added

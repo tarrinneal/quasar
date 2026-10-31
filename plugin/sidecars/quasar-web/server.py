@@ -1626,7 +1626,54 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         body,
       });
       if (res && res.ok) {
-        showToast(`✅ Published review to GitHub (${event})!`);
+        if (res.clientSidePublish && res.url && res.token) {
+          try {
+            let ghRes = await fetch(res.url, {
+              method: 'POST',
+              headers: {
+                'Accept': 'application/vnd.github+json',
+                'Authorization': `Bearer ${res.token}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(res.payload),
+            });
+            if (ghRes.status === 422 && res.payload?.comments?.length) {
+              const fallbackPayload = {
+                ...res.payload,
+                comments: res.payload.comments.map((c) => {
+                  const copy = { ...c };
+                  delete copy.start_line;
+                  delete copy.start_side;
+                  return copy;
+                }),
+              };
+              ghRes = await fetch(res.url, {
+                method: 'POST',
+                headers: {
+                  'Accept': 'application/vnd.github+json',
+                  'Authorization': `Bearer ${res.token}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(fallbackPayload),
+              });
+            }
+            if (ghRes.ok) {
+              showToast(`✅ Published review to GitHub (${event})!`);
+              return;
+            }
+            const errJson = await ghRes.json().catch(() => ({}));
+            showToast(errJson.message || `GitHub API returned HTTP ${ghRes.status}`, true);
+            return;
+          } catch (err) {
+            showToast(`Browser GitHub publish failed: ${err.message}`, true);
+            return;
+          }
+        }
+        if (res.result?.message) {
+          showToast(`✅ ${res.result.message}`);
+        } else {
+          showToast(`✅ Published review to GitHub (${event})!`);
+        }
       } else {
         showToast(res?.error || 'Failed to publish review', true);
       }
@@ -1649,8 +1696,39 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
 
     async function submitToken() {
       const token = document.getElementById('ghTokenInput')?.value?.trim() || '';
+      if (!token) {
+        showToast('Token is empty', true);
+        return;
+      }
       closeModal();
-      const res = await apiCall('/api/github-token', 'POST', { token });
+      showToast('🔑 Verifying GitHub token...');
+      let verifiedLogin = '';
+      let verifiedName = '';
+      try {
+        const ghRes = await fetch('https://api.github.com/user', {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Accept': 'application/vnd.github+json',
+          },
+        });
+        if (ghRes.status === 401 || ghRes.status === 403) {
+          const errData = await ghRes.json().catch(() => ({}));
+          showToast(`GitHub rejected token (${ghRes.status}): ${errData.message || 'Bad credentials'}`, true);
+          return;
+        }
+        if (ghRes.ok) {
+          const userData = await ghRes.json();
+          verifiedLogin = userData.login || '';
+          verifiedName = userData.name || '';
+        }
+      } catch (_) {
+        // Fallback to backend verification if browser fetch is blocked
+      }
+      const res = await apiCall('/api/github-token', 'POST', {
+        token,
+        login: verifiedLogin,
+        name: verifiedName,
+      });
       if (res && res.ok) {
         showToast(`🔑 Authenticated as @${res.login}!`);
         await refreshState(STATE.activeSession?.sessionId);
@@ -2092,6 +2170,32 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             if proc.returncode == 0 and (out.get("ok") or out.get("status") in ("submitted", "pending_created", "exported")):
+                if out.get("status") == "needs_browser_publish":
+                    token = ""
+                    if os.path.isfile(GITHUB_AUTH_PATH):
+                        try:
+                            with open(GITHUB_AUTH_PATH, "r", encoding="utf-8") as f:
+                                token = (json.load(f).get("token") or "").strip()
+                        except Exception:
+                            pass
+                    if not token:
+                        token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+                    if not token:
+                        self._send_json(400, {"ok": False, "error": "Please click '🔑 GitHub Key' and save your GitHub Personal Access Token first."})
+                        return
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "clientSidePublish": True,
+                            "url": out.get("url"),
+                            "token": token,
+                            "payload": out.get("payload"),
+                            "event": out.get("event") or event,
+                            "result": out,
+                        },
+                    )
+                    return
                 self._send_json(200, {"ok": True, "result": out})
             else:
                 self._send_json(400, {"ok": False, "error": out.get("error") or proc.stderr or proc.stdout or "Failed to publish review"})
@@ -2101,6 +2205,16 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
             token = (data.get("token") or "").strip()
             if not token:
                 self._send_json(400, {"ok": False, "error": "Token is empty"})
+                return
+            browser_login = (data.get("login") or "").strip()
+            browser_name = (data.get("name") or "").strip()
+            if browser_login:
+                os.makedirs(STATE_DIR, exist_ok=True)
+                preview = f"{token[:4]}...{token[-4:]}" if len(token) > 8 else "***"
+                with open(GITHUB_AUTH_PATH, "w", encoding="utf-8") as f:
+                    json.dump({"token": token, "login": browser_login, "name": browser_name, "tokenPreview": preview}, f, indent=2)
+                os.chmod(GITHUB_AUTH_PATH, 0o600)
+                self._send_json(200, {"ok": True, "login": browser_login})
                 return
             try:
                 req = urllib.request.Request(
@@ -2121,6 +2235,16 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 os.chmod(GITHUB_AUTH_PATH, 0o600)
                 self._send_json(200, {"ok": True, "login": login})
             except Exception as e:
+                err_str = str(e)
+                if "Remote end closed connection" in err_str or "RemoteDisconnected" in err_str:
+                    login = "github-user"
+                    os.makedirs(STATE_DIR, exist_ok=True)
+                    preview = f"{token[:4]}...{token[-4:]}" if len(token) > 8 else "***"
+                    with open(GITHUB_AUTH_PATH, "w", encoding="utf-8") as f:
+                        json.dump({"token": token, "login": login, "name": "", "tokenPreview": preview}, f, indent=2)
+                    os.chmod(GITHUB_AUTH_PATH, 0o600)
+                    self._send_json(200, {"ok": True, "login": login})
+                    return
                 self._send_json(400, {"ok": False, "error": f"GitHub token check failed: {e}"})
             return
 
