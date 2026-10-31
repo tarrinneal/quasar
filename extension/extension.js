@@ -247,7 +247,38 @@ function normalizeEffortLevel(val) {
 }
 
 function getEffortSpec(level) {
-  return EFFORT_LEVEL_SPECS[normalizeEffortLevel(level)] || EFFORT_LEVEL_SPECS.medium;
+  const norm = normalizeEffortLevel(level);
+  const base = { ...(EFFORT_LEVEL_SPECS[norm] || EFFORT_LEVEL_SPECS.medium) };
+  if (norm === 'low') {
+    return base;
+  }
+  let customAgents = [];
+  try {
+    if (typeof discoverInstalledReviewAgents === 'function') {
+      customAgents = discoverInstalledReviewAgents().filter((a) => a && a.isCustom);
+    }
+  } catch (_) {}
+  const customCount = customAgents.length;
+  if (customCount === 0) {
+    return base;
+  }
+  const customShortNames = customAgents
+    .map((a) => String(a.name || '').replace(/^review-/, ''))
+    .filter(Boolean)
+    .join(', ');
+  const customFullNames = customAgents.map((a) => a.name).join(', ');
+
+  if (norm === 'medium') {
+    const totalMed = 2 + customCount;
+    base.description = `${totalMed} fast Flash subagents (Architect + Bug Hunter + ${customCount} custom: ${customShortNames}) in 1 wave`;
+    base.detail = `Runs ${totalMed} parallel Flash subagents (Architect, Bug Hunter, plus ${customFullNames}) and filters directly in a single wave.`;
+  } else if (norm === 'high') {
+    const totalHigh = 4 + customCount;
+    base.title = `$(beaker) High Effort — Deep ${totalHigh}-Lens Pipeline (~2–4m)`;
+    base.description = `All ${totalHigh} specialist subagents (4 built-in + ${customCount} custom: ${customShortNames})`;
+    base.detail = `Full deep codebase verification across all ${totalHigh} specialist lenses (Architect, Bug Hunter, Test Critic, Advocate, plus ${customFullNames}) for maximum thoroughness on complex PRs.`;
+  }
+  return base;
 }
 
 function loadReviewerPreferences() {
@@ -276,6 +307,20 @@ function getDefaultCommentsOnly() {
 
 function buildEffortPromptInstruction(effortLevel, commentsOnly = false) {
   const level = normalizeEffortLevel(effortLevel);
+  let customAgents = [];
+  try {
+    if (typeof discoverInstalledReviewAgents === 'function') {
+      customAgents = discoverInstalledReviewAgents().filter((a) => a && a.isCustom);
+    }
+  } catch (_) {}
+  const customListText =
+    customAgents.length > 0
+      ? `, plus any applicable custom review subagents (${customAgents.map((a) => `\`${a.name}\``).join(', ')})`
+      : '';
+  const totalMed = 2 + customAgents.length;
+  const totalHighLenses = 4 + customAgents.length;
+  const totalHighWave = 3 + customAgents.length;
+
   if (commentsOnly) {
     const modePrefix =
       `REVIEW MODE: COMMENTS ONLY (NO STUDY GUIDE OR READING TOUR). ` +
@@ -291,14 +336,14 @@ function buildEffortPromptInstruction(effortLevel, commentsOnly = false) {
     if (level === 'high') {
       return (
         modePrefix +
-        `EFFORT LEVEL: HIGH (DEEP COMMENTS-ONLY PIPELINE). ` +
-        `Spawn \`review-bug-hunter\`, \`review-test-critic\`, and \`review-architect\` (instructing \`review-architect\` to skip the reading tour/mental model and only return API/design findings) in parallel with \`Model: "inherit"\`, filter false positives, and run \`publish_review_session.py --comments-only\`.`
+        `EFFORT LEVEL: HIGH (DEEP ${totalHighLenses}-LENS COMMENTS-ONLY PIPELINE). ` +
+        `Spawn \`review-bug-hunter\`, \`review-test-critic\`, and \`review-architect\` (instructing \`review-architect\` to skip the reading tour/mental model and only return API/design findings)${customListText} in parallel with \`Model: "inherit"\`, filter false positives, and run \`publish_review_session.py --comments-only\`.`
       );
     }
     return (
       modePrefix +
-      `EFFORT LEVEL: MEDIUM (BALANCED COMMENTS-ONLY — FAST FLASH SUBAGENTS). ` +
-      `Spawn \`review-bug-hunter\` and \`review-architect\` (instructing \`review-architect\` to skip the reading tour/mental model and only return API/design findings) in a single parallel \`invoke_subagent\` call using \`Model: "flash"\`, filter their findings directly, and immediately run \`publish_review_session.py --comments-only\`.`
+      `EFFORT LEVEL: MEDIUM (BALANCED COMMENTS-ONLY — ${totalMed} FAST FLASH SUBAGENTS). ` +
+      `Spawn \`review-bug-hunter\` and \`review-architect\` (instructing \`review-architect\` to skip the reading tour/mental model and only return API/design findings)${customListText} in a single parallel \`invoke_subagent\` call using \`Model: "flash"\`, filter their findings directly, and immediately run \`publish_review_session.py --comments-only\`.`
     );
   }
   if (level === 'low') {
@@ -309,13 +354,13 @@ function buildEffortPromptInstruction(effortLevel, commentsOnly = false) {
   }
   if (level === 'high') {
     return (
-      `EFFORT LEVEL: HIGH (DEEP 4-LENS PIPELINE). ` +
-      `Run the full parallel 3-subagent wave (\`review-architect\`, \`review-bug-hunter\`, \`review-test-critic\` with \`Model: "inherit"\`) followed by thorough false-positive filtering before running \`publish_review_session.py\`.`
+      `EFFORT LEVEL: HIGH (DEEP ${totalHighLenses}-LENS PIPELINE). ` +
+      `Run the full parallel ${totalHighWave}-subagent wave (\`review-architect\`, \`review-bug-hunter\`, \`review-test-critic\`${customListText} with \`Model: "inherit"\`) followed by thorough false-positive filtering before running \`publish_review_session.py\`.`
     );
   }
   return (
-    `EFFORT LEVEL: MEDIUM (BALANCED — 2 FAST FLASH SUBAGENTS). ` +
-    `Spawn only \`review-architect\` and \`review-bug-hunter\` in a single parallel \`invoke_subagent\` call using \`Model: "flash"\` (do NOT spawn \`review-test-critic\` or a second sequential \`review-advocate\` wave), filter their findings directly, and immediately run \`publish_review_session.py\`.`
+    `EFFORT LEVEL: MEDIUM (BALANCED — ${totalMed} FAST FLASH SUBAGENTS). ` +
+    `Spawn \`review-architect\` and \`review-bug-hunter\`${customListText} in a single parallel \`invoke_subagent\` call using \`Model: "flash"\` (do NOT spawn \`review-test-critic\` or a second sequential \`review-advocate\` wave), filter their findings directly, and immediately run \`publish_review_session.py\`.`
   );
 }
 
