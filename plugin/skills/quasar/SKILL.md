@@ -43,9 +43,10 @@ python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/collect_pr_context
   --output-dir <SCRATCH_DIR>
 ```
 
-Inspect `effort_level` (`"low"`, `"medium"`, or `"high"`), `comments_only` (`true` or `false`), and `reviewer_preferences` inside `pr_context.json` (or view `~/.gemini/quasar/PREFERENCES.md` if it exists) so you know:
+Inspect `effort_level` (`"low"`, `"medium"`, or `"high"`), `comments_only` (`true` or `false`), `available_review_agents`, and `reviewer_preferences` inside `pr_context.json` (or view `~/.gemini/quasar/PREFERENCES.md` if it exists) so you know:
 - Which **Effort Level** to run (`"low"`, `"medium"`, or `"high"` — if the user explicitly asked for `"low effort"` / `"quick"`, `"medium effort"`, or `"high effort"` / `"deep"` in their prompt, pass `--effort <level>` to `collect_pr_context.py` or honor their requested level).
 - Whether **Comments-Only Mode (`comments_only: true` / `--comments-only`)** is active (either via `--comments-only` flag, `comments_only: true` in `pr_context.json`, or because the user asked for comments only / no study guide).
+- Which **Built-In & Custom Review Subagents (`available_review_agents`)** are installed and applicable to this repository or diff (including any user-added custom `review-*` subagents with `isCustom: true` in `~/.gemini/config/plugins/quasar/agents/`, `~/.gemini/config/agents/`, or `.gemini/agents/`).
 - What patterns the reviewer **prefers to flag** (`preferRules`)
 - What patterns the reviewer **wants suppressed/skipped** (`avoidRules`)
 - Their preferred **comment tone, verbosity, and phrasing examples** (`styleProfile` & `recentEditedDrafts`).
@@ -70,7 +71,7 @@ When the user provides a GitHub PR link or number, inspect `pr_metadata` in `pr_
 > When `comments_only` is `true` (or the user requested a comments-only review):
 > - **Do NOT build the CliffsNotes Study Guide** (`cliffsNotes.tldr`, `whatAndWhy`, `architectureDiagram`, `keySymbols`, `designTradeoffs`) and **do NOT generate reading tour `chapters` or `stops`**.
 > - Focus 100% on finding verified, high-signal review comments (`findings`) and triaging `existing_comments` (`existingCommentAssessments`) so the user can immediately publish them to GitHub or queue them for Agent fixes.
-> - In `medium` effort Comments-Only mode, you only need to spawn `review-bug-hunter` (`Model: "flash"`) or ask subagents strictly for candidate review findings (skipping reading-tour & architecture-diagram synthesis).
+> - In `medium` effort Comments-Only mode, you only need to spawn `review-bug-hunter` (plus any applicable domain/custom `review-*` subagents) with `Model: "flash"`, asking subagents strictly for candidate review findings (skipping reading-tour & architecture-diagram synthesis).
 
 Choose the analysis pipeline below that matches `effort_level` (`"low"`, `"medium"`, or `"high"`):
 
@@ -80,17 +81,19 @@ Choose the analysis pipeline below that matches `effort_level` (`"low"`, `"mediu
 - Build a concise CliffsNotes Study Guide (`tldr`, `architectureDiagram`, logical `chapters` & `stops` — **skip this step if `comments_only` is `true`**), triage any `existing_comments`, and include only **obvious, high-confidence bugs or blockers** (skipping deep cross-file hunting and minor nits).
 - Proceed immediately to **Phase 3** (`publish_review_session.py`).
 
-### ⚖️ Option B: `medium` Effort (Balanced — Default — 2 Fast `flash` Subagents in 1 Wave)
-- Spawn **2 subagents in parallel** in a single `invoke_subagent` call with **`Model: "flash"`**:
+### ⚖️ Option B: `medium` Effort (Balanced — Default — Fast `flash` Subagents in 1 Wave)
+- Spawn **subagents in parallel** in a single `invoke_subagent` call with **`Model: "flash"`**:
   1. **`review-architect`** (`Model: "flash"`, `Role: "Architecture & API Reviewer"`): Pass the PR title/description, changed `core_source` files, `<SCRATCH_DIR>/pr.diff`, and `reviewer_preferences`. *(If `comments_only` is `true`, instruct `review-architect` to only return API/design `findings` and skip building a reading tour or mental model.)*
   2. **`review-bug-hunter`** (`Model: "flash"`, `Role: "Bug & Edge-Case Hunter"`): Pass the changed `core_source` files, `<SCRATCH_DIR>/pr.diff`, and `reviewer_preferences`.
-- **Do NOT spawn a second sequential `review-advocate` wave** in `medium` effort — once the 2 `flash` subagents report back, verify and filter their findings directly in the main agent and proceed immediately to **Phase 3**.
+  3. **Any Custom Review Subagents (`isCustom: true` in `available_review_agents`)**: Automatically include any user-defined review subagents whose description matches the repository/diff (or all custom `review-*` subagents if general-purpose) with `Model: "flash"`.
+- **Do NOT spawn a second sequential `review-advocate` wave** in `medium` effort — once the `flash` subagents report back, verify and filter their findings directly in the main agent and proceed immediately to **Phase 3**.
 
-### 🔬 Option C: `high` Effort (Deep / Thorough — Full 4-Lens Pipeline)
-- Spawn all **3 specialist review subagents in parallel** using a single `invoke_subagent` call (`Model: "inherit"`). Pass each subagent the active `reviewer_preferences` summary (or instruct them to read `~/.gemini/quasar/PREFERENCES.md`):
+### 🔬 Option C: `high` Effort (Deep / Thorough — Full Multi-Lens Pipeline)
+- Spawn all **specialist review subagents in parallel** using a single `invoke_subagent` call (`Model: "inherit"`). Pass each subagent the active `reviewer_preferences` summary (or instruct them to read `~/.gemini/quasar/PREFERENCES.md`):
   1. **`review-architect`** (`Model: "inherit"`, `Role: "Architecture & API Reviewer"`): Build the architectural mental model, identify key symbols ("Character List"), evaluate API boundaries & backwards compatibility, and suggest the logical top-down reading order *(if `comments_only` is `true`, skip the reading tour & mental model and focus strictly on architectural/API findings)*.
   2. **`review-bug-hunter`** (`Model: "inherit"`, `Role: "Bug & Edge-Case Hunter"`): Trace execution paths, nullability, state mutations, resource lifecycle, and language-boundary/generator edge cases.
   3. **`review-test-critic`** (`Model: "inherit"`, `Role: "Test & Verification Critic"`): Build a coverage matrix, evaluate test falsifiability, verify generated file sync, and check repo hygiene (`CHANGELOG.md`, `pubspec.yaml`).
+  4. **Any Custom Review Subagents (`isCustom: true` in `available_review_agents`)**: Automatically include any user-defined review subagents whose description matches the repository/diff (or all custom `review-*` subagents if general-purpose) with `Model: "inherit"`.
 
 ### Filtering False Positives, Flagging Uncertain Preferences, & Triaging Existing GitHub Comments
 Verify every candidate finding against the actual codebase callers/callees, `existing_comments`, and `reviewer_preferences` (in `high` effort you may invoke `review-advocate` or verify directly; in `low`/`medium` effort always filter directly):

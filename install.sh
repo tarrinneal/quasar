@@ -105,6 +105,11 @@ cp "${SCRIPT_DIR}/plugin/skills/quasar/SKILL.md" "${PLUGIN_DEST}/skills/quasar/S
 cp "${SCRIPT_DIR}/plugin/skills/quasar/scripts/"*.py "${PLUGIN_DEST}/skills/quasar/scripts/"
 chmod +x "${PLUGIN_DEST}/skills/quasar/scripts/"*.py
 
+if [ -d "${SCRIPT_DIR}/plugin/skills/quasar/references" ]; then
+  mkdir -p "${PLUGIN_DEST}/skills/quasar/references"
+  cp -R "${SCRIPT_DIR}/plugin/skills/quasar/references/"* "${PLUGIN_DEST}/skills/quasar/references/" 2>/dev/null || true
+fi
+
 if [ -d "${SCRIPT_DIR}/plugin/agents" ]; then
   cp -R "${SCRIPT_DIR}/plugin/agents/"* "${PLUGIN_DEST}/agents/" 2>/dev/null || true
 fi
@@ -203,18 +208,20 @@ fi
 # Initialize default preferences.json & PREFERENCES.md if not present
 python3 "${PLUGIN_DEST}/skills/quasar/scripts/manage_preferences.py" --show >/dev/null 2>&1 || true
 
-# Package VSIX for official CLI installation
+# Package VSIX for official CLI installation (includes README.md, CHANGELOG.md, and bundled_plugin/ so VSIX-only installs work standalone)
 VSIX_PATH="/tmp/quasar-${VERSION}.vsix"
-python3 - "${SCRIPT_DIR}/extension" "${VSIX_PATH}" "${VERSION}" <<'PY'
+python3 - "${SCRIPT_DIR}/extension" "${SCRIPT_DIR}/plugin" "${SCRIPT_DIR}" "${VSIX_PATH}" "${VERSION}" <<'PY'
 import os
 import sys
 import zipfile
 
-ext_dir, vsix_path, version = sys.argv[1], sys.argv[2], sys.argv[3]
+ext_dir, plugin_dir, repo_root, vsix_path, version = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 content_types = """<?xml version="1.0" encoding="utf-8"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension=".json" ContentType="application/json"/>
   <Default Extension=".js" ContentType="application/javascript"/>
+  <Default Extension=".py" ContentType="text/x-python"/>
+  <Default Extension=".md" ContentType="text/markdown"/>
   <Default Extension=".svg" ContentType="image/svg+xml"/>
   <Default Extension=".png" ContentType="image/png"/>
   <Default Extension=".vsixmanifest" ContentType="text/xml"/>
@@ -235,6 +242,8 @@ vsixmanifest = f"""<?xml version="1.0" encoding="utf-8"?>
   <Dependencies/>
   <Assets>
     <Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true"/>
+    <Asset Type="Microsoft.VisualStudio.Services.Content.Details" Path="extension/README.md" Addressable="true"/>
+    <Asset Type="Microsoft.VisualStudio.Services.Content.Changelog" Path="extension/CHANGELOG.md" Addressable="true"/>
     <Asset Type="Microsoft.VisualStudio.Services.Icons.Default" Path="extension/media/quasar-icon.png" Addressable="true"/>
   </Assets>
 </PackageManifest>"""
@@ -247,6 +256,35 @@ with zipfile.ZipFile(vsix_path, "w", zipfile.ZIP_DEFLATED) as zf:
             full_path = os.path.join(root, file)
             rel_path = os.path.relpath(full_path, ext_dir)
             zf.write(full_path, os.path.join("extension", rel_path))
+    for doc_name in ("README.md", "CHANGELOG.md"):
+        doc_path = os.path.join(repo_root, doc_name)
+        if os.path.isfile(doc_path):
+            zf.write(doc_path, os.path.join("extension", doc_name))
+    if os.path.isdir(plugin_dir):
+        import subprocess
+        tracked_res = subprocess.run(
+            ["git", "ls-files", "plugin"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        tracked_files = [
+            line.strip()
+            for line in (tracked_res.stdout or "").splitlines()
+            if line.strip()
+        ]
+        if tracked_files:
+            for rel_repo_path in tracked_files:
+                full_path = os.path.join(repo_root, rel_repo_path)
+                if os.path.isfile(full_path):
+                    rel_plugin_path = os.path.relpath(full_path, plugin_dir)
+                    zf.write(full_path, os.path.join("extension", "bundled_plugin", rel_plugin_path))
+        else:
+            for root, _, files in os.walk(plugin_dir):
+                for file in files:
+                    full_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(full_path, plugin_dir)
+                    zf.write(full_path, os.path.join("extension", "bundled_plugin", rel_path))
 PY
 
 # Try installing via any discovered Antigravity / VS Code CLI binary
@@ -274,9 +312,13 @@ for EXT_ROOT in "${HOME}"/.*/extensions; do
     TARGET_EXT_DIR="${EXT_ROOT}/${EXT_NAME}"
     echo "==> Syncing native Quasar extension files to ${TARGET_EXT_DIR}..."
     mkdir -p "${TARGET_EXT_DIR}/media"
+    mkdir -p "${TARGET_EXT_DIR}/bundled_plugin"
     cp "${SCRIPT_DIR}/extension/package.json" "${TARGET_EXT_DIR}/package.json"
     cp "${SCRIPT_DIR}/extension/extension.js" "${TARGET_EXT_DIR}/extension.js"
     cp "${SCRIPT_DIR}/extension/media/"* "${TARGET_EXT_DIR}/media/"
+    cp "${SCRIPT_DIR}/README.md" "${TARGET_EXT_DIR}/README.md" 2>/dev/null || true
+    cp "${SCRIPT_DIR}/CHANGELOG.md" "${TARGET_EXT_DIR}/CHANGELOG.md" 2>/dev/null || true
+    cp -R "${SCRIPT_DIR}/plugin/"* "${TARGET_EXT_DIR}/bundled_plugin/" 2>/dev/null || true
 
     python3 - "${EXT_ROOT}/extensions.json" "${TARGET_EXT_DIR}" "${EXT_NAME}" "${VERSION}" <<'PY'
 import json

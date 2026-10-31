@@ -1955,6 +1955,47 @@ class ChecksTreeProvider {
     const learnedRules = rules.filter((r) => r.origin !== 'seed_skill');
     const seedRules = rules.filter((r) => r.origin === 'seed_skill');
 
+    if (element && element.nodeType === 'agents-root') {
+      const children = [];
+      const addAgentItem = new vscode.TreeItem(
+        'Add / Create Custom Review Subagent (AGENT.md)...',
+        vscode.TreeItemCollapsibleState.None
+      );
+      addAgentItem.iconPath = new vscode.ThemeIcon('add');
+      addAgentItem.tooltip = new vscode.MarkdownString(
+        'Create a new specialist `review-*` subagent (via Guided Wizard, importing a `.md` file, or asking Antigravity to generate one).\n\n' +
+          'No Quasar GitHub repo checkout required!'
+      );
+      addAgentItem.command = {
+        command: 'quasar.manageReviewAgents',
+        title: 'Add / Manage Review Subagents',
+        arguments: [{ action: 'create-menu' }],
+      };
+      children.push(addAgentItem);
+
+      const agents = discoverInstalledReviewAgents();
+      for (const ag of agents) {
+        const agItem = new vscode.TreeItem(
+          `${ag.isCustom ? '🧩' : '🤖'} ${ag.name}`,
+          vscode.TreeItemCollapsibleState.None
+        );
+        agItem.description = `${ag.isCustom ? 'Custom' : 'Built-in'} • ${ag.description || ag.scopeLabel}`;
+        agItem.tooltip = new vscode.MarkdownString(
+          `### ${ag.isCustom ? '🧩 Custom' : '🤖 Built-in'} Review Subagent: \`${ag.name}\`\n\n` +
+            `${ag.description ? `${ag.description}\n\n` : ''}` +
+            `**Location**: \`${ag.mdPath}\`\n\n` +
+            `*Click to open \`AGENT.md\`, refine with Antigravity, or manage this subagent.*`
+        );
+        agItem.command = {
+          command: 'quasar.manageReviewAgents',
+          title: 'Manage Review Subagent',
+          arguments: [{ agent: ag }],
+        };
+        children.push(agItem);
+      }
+      return children;
+    }
+
     if (element && element.nodeType === 'prefs-root') {
       const children = [];
       const importSkillItem = new vscode.TreeItem(
@@ -2083,6 +2124,26 @@ class ChecksTreeProvider {
     };
     items.push(ghAuthItem);
 
+    const agents = discoverInstalledReviewAgents();
+    const customAgentsCount = agents.filter((a) => a.isCustom).length;
+    const builtinAgentsCount = agents.length - customAgentsCount;
+    const agentsRoot = new vscode.TreeItem(
+      customAgentsCount > 0
+        ? `Review Subagents (${builtinAgentsCount} built-in, ${customAgentsCount} custom)`
+        : `Review Subagents (${builtinAgentsCount} built-in • click to add custom)`,
+      vscode.TreeItemCollapsibleState.Collapsed
+    );
+    agentsRoot.iconPath = new vscode.ThemeIcon('organization');
+    agentsRoot.nodeType = 'agents-root';
+    agentsRoot.tooltip = new vscode.MarkdownString(
+      `### 🤖 Parallel Review Subagents (\`review-*\`)\n\n` +
+        `Quasar runs specialist read-only subagents in parallel during \`medium\` and \`high\` effort reviews.\n\n` +
+        `- **Built-in Subagents**: ${builtinAgentsCount}\n` +
+        `- **Custom Subagents**: ${customAgentsCount}\n\n` +
+        `*Expand to view, edit, or add custom \`review-*\` subagents directly from the UI (no GitHub repo checkout required).*`
+    );
+    items.push(agentsRoot);
+
     const prefsLabel =
       seedSkills.length > 0
         ? `Reviewer Preferences (${learnedRules.length} learned, ${seedRules.length} from ${seedSkills.length} seed skill${seedSkills.length === 1 ? '' : 's'})`
@@ -2131,11 +2192,149 @@ class ChecksTreeProvider {
   }
 }
 
+const BUILTIN_REVIEW_AGENT_NAMES = new Set([
+  'review-architect',
+  'review-bug-hunter',
+  'review-test-critic',
+  'review-advocate',
+]);
+
+function copyDirRecursiveSync(srcDir, destDir, overwrite = false) {
+  if (!fs.existsSync(srcDir)) return;
+  fs.mkdirSync(destDir, { recursive: true });
+  for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+    const srcPath = path.join(srcDir, entry.name);
+    const destPath = path.join(destDir, entry.name);
+    if (entry.isDirectory()) {
+      copyDirRecursiveSync(srcPath, destPath, overwrite);
+    } else if (entry.isFile()) {
+      if (overwrite || !fs.existsSync(destPath)) {
+        fs.copyFileSync(srcPath, destPath);
+        if (destPath.endsWith('.py') || destPath.endsWith('.sh')) {
+          try {
+            fs.chmodSync(destPath, 0o755);
+          } catch (_) {}
+        }
+      }
+    }
+  }
+}
+
+function ensureQuasarPluginBootstrapped() {
+  try {
+    const pluginDest = path.join(os.homedir(), '.gemini', 'config', 'plugins', 'quasar');
+    const bundledCandidates = [
+      path.join(__dirname, 'bundled_plugin'),
+      path.join(__dirname, '..', 'plugin'),
+    ];
+    const srcPlugin = bundledCandidates.find((p) =>
+      fs.existsSync(path.join(p, 'skills', 'quasar', 'SKILL.md'))
+    );
+    if (!srcPlugin) return;
+    const destSkill = path.join(pluginDest, 'skills', 'quasar', 'SKILL.md');
+    if (!fs.existsSync(destSkill)) {
+      copyDirRecursiveSync(srcPlugin, pluginDest, false);
+    } else {
+      // Ensure any missing built-in agents are present without overwriting custom agents
+      const srcAgents = path.join(srcPlugin, 'agents');
+      const destAgents = path.join(pluginDest, 'agents');
+      if (fs.existsSync(srcAgents)) {
+        copyDirRecursiveSync(srcAgents, destAgents, false);
+      }
+    }
+  } catch (_) {}
+}
+
+function discoverInstalledReviewAgents() {
+  const pluginAgentsDir = path.join(
+    os.homedir(),
+    '.gemini',
+    'config',
+    'plugins',
+    'quasar',
+    'agents'
+  );
+  const globalAgentsDir = path.join(os.homedir(), '.gemini', 'config', 'agents');
+  const wsRoot = getWindowWorkspaceRoot();
+  const wsAgentsDir =
+    wsRoot && wsRoot !== EMPTY_WINDOW_FALLBACK_ROOT
+      ? path.join(wsRoot, '.gemini', 'agents')
+      : null;
+
+  const roots = [
+    { dir: pluginAgentsDir, scope: 'plugin', scopeLabel: 'Quasar Plugin (~/.gemini/config/plugins/quasar/agents)' },
+    { dir: globalAgentsDir, scope: 'global', scopeLabel: 'Global User Agents (~/.gemini/config/agents)' },
+  ];
+  if (wsAgentsDir) {
+    roots.push({
+      dir: wsAgentsDir,
+      scope: 'workspace',
+      scopeLabel: `Workspace (${path.basename(wsRoot)}/.gemini/agents)`,
+    });
+  }
+
+  const seen = new Map();
+  for (const r of roots) {
+    if (!r.dir || !fs.existsSync(r.dir)) continue;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(r.dir).sort();
+    } catch (_) {
+      continue;
+    }
+    for (const entry of entries) {
+      const agentDir = path.join(r.dir, entry);
+      try {
+        if (!fs.statSync(agentDir).isDirectory()) continue;
+      } catch (_) {
+        continue;
+      }
+      const mdPath = ['AGENT.md', 'agent.md']
+        .map((f) => path.join(agentDir, f))
+        .find((p) => fs.existsSync(p));
+      if (!mdPath) continue;
+
+      let name = entry;
+      let description = '';
+      try {
+        const head = fs.readFileSync(mdPath, 'utf8').slice(0, 4096);
+        const fmMatch = head.match(/^---\s*\n([\s\S]*?)\n---/);
+        if (fmMatch) {
+          const fm = fmMatch[1];
+          const mName = fm.match(/^name:\s*([^\n]+)/m);
+          if (mName) {
+            name = mName[1].trim().replace(/^['"]|['"]$/g, '');
+          }
+          const mDesc = fm.match(/^description:\s*([^\n]+)/m);
+          if (mDesc) {
+            description = mDesc[1].trim().replace(/^['"]|['"]$/g, '');
+          }
+        }
+      } catch (_) {}
+
+      if (!name.startsWith('review-') && r.scope !== 'plugin') continue;
+      if (!seen.has(name)) {
+        seen.set(name, {
+          name,
+          description,
+          mdPath,
+          dirPath: agentDir,
+          scope: r.scope,
+          scopeLabel: r.scopeLabel,
+          isCustom: !BUILTIN_REVIEW_AGENT_NAMES.has(name),
+        });
+      }
+    }
+  }
+  return Array.from(seen.values());
+}
+
 // ============================================================================
 // Extension Activation & Native Editor Integrations
 // ============================================================================
 function activate(context) {
   fs.mkdirSync(REVIEW_STATE_DIR, { recursive: true });
+  ensureQuasarPluginBootstrapped();
   let showChecksTree = false;
   vscode.commands.executeCommand('setContext', 'quasar.showChecksTree', false);
   context.subscriptions.push(
@@ -4214,6 +4413,15 @@ function activate(context) {
           command: 'quasar.switchPastReview',
         },
         {
+          label: '$(organization) Add / Manage Review Subagents (review-*)...',
+          description: (() => {
+            const ags = discoverInstalledReviewAgents();
+            const customCnt = ags.filter((a) => a.isCustom).length;
+            return `${ags.length} active (${customCnt} custom) — create, import, or edit specialist review agents`;
+          })(),
+          command: 'quasar.manageReviewAgents',
+        },
+        {
           label: '$(sparkle) Import Premade Review Skill as Starting Point...',
           description: 'Seed Quasar with an existing SKILL.md or review guide without overwriting defaults',
           command: 'quasar.importReviewSkill',
@@ -5837,6 +6045,11 @@ function activate(context) {
       }
       menuItems.push(
         {
+          label: '$(organization) Add / Manage Review Subagents (review-*)...',
+          description: 'Create, import, or edit specialist parallel review subagents (AGENT.md)',
+          action: 'manage-agents',
+        },
+        {
           label: '$(sparkle) Import Premade Review Skill as Starting Point...',
           description:
             seedSkills.length > 0
@@ -5890,6 +6103,8 @@ function activate(context) {
 
       if (picked.action === 'calibrate-uncertain') {
         await vscode.commands.executeCommand('quasar.calibrateFindingPreference');
+      } else if (picked.action === 'manage-agents') {
+        await vscode.commands.executeCommand('quasar.manageReviewAgents');
       } else if (picked.action === 'import-skill') {
         await vscode.commands.executeCommand('quasar.importReviewSkill');
       } else if (picked.action === 'open-guide') {
@@ -5998,6 +6213,343 @@ function activate(context) {
         await runManagePreferences(['--delete-rule-id', toDelete.ruleId]);
         refreshAllUI(false);
         vscode.window.showInformationMessage('Deleted preference rule.');
+      }
+    })
+  );
+
+  // 8d. Add / Manage Custom Review Subagents (review-*) Directly from the Extension UI
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.manageReviewAgents', async (clickedArg) => {
+      ensureQuasarPluginBootstrapped();
+
+      const buildAgentMarkdown = (agentName, description, checklistText) => {
+        const cleanDesc = (description || 'Specialist code review subagent for Quasar.')
+          .replace(/"/g, '\\"')
+          .trim();
+        const defaultBullets =
+          checklistText && checklistText.trim()
+            ? checklistText
+                .trim()
+                .split(/\r?\n/)
+                .map((l) => (l.trim().startsWith('-') || l.trim().startsWith('*') ? l.trim() : `- ${l.trim()}`))
+                .join('\n')
+            : `- Correctness, edge cases, and domain invariants specific to \`${agentName}\`.\n` +
+              `- Backwards compatibility, callers, and error handling.\n` +
+              `- Missing or unfalsifiable tests for changed behavior.`;
+        return (
+          `---\n` +
+          `name: ${agentName}\n` +
+          `description: "${cleanDesc}"\n` +
+          `tools:\n` +
+          `  - view_file\n` +
+          `  - grep_search\n` +
+          `  - find_by_name\n` +
+          `  - list_dir\n` +
+          `mainAgent: false\n` +
+          `subagent: true\n` +
+          `commandExecutionPolicy: off\n` +
+          `---\n\n` +
+          `# Specialist Review Subagent (\`${agentName}\`)\n\n` +
+          `You are a specialist code review subagent (${cleanDesc}). You operate in read-only mode.\n\n` +
+          `## What You Hunt For\n\n` +
+          `${defaultBullets}\n\n` +
+          `## How to Investigate\n\n` +
+          `- Inspect the full files and surrounding callers using \`view_file\` and \`grep_search\` rather than relying only on diff hunks.\n` +
+          `- **Honor Learned Reviewer Preferences**: Check \`~/.gemini/quasar/PREFERENCES.md\` (if it exists) or \`reviewer_preferences\` passed in your prompt. Skip patterns marked \`Avoid\` and match the reviewer's preferred comment tone.\n\n` +
+          `## Output Format\n\n` +
+          `For each verified issue, return:\n` +
+          `- **Severity**: \`BLOCKING\`, \`DESIGN\`, or \`NIT\`\n` +
+          `- **Location**: \`path/to/file:startLine-endLine\`\n` +
+          `- **Title**: Short 1-line summary\n` +
+          `- **Why It Matters**: Concrete trace showing how the issue can be triggered\n` +
+          `- **Draft GitHub Comment**: Concise, collaborative 1–2 sentence review comment\n`
+        );
+      };
+
+      const chooseTargetBaseDir = async () => {
+        const pluginAgentsDir = path.join(
+          os.homedir(),
+          '.gemini',
+          'config',
+          'plugins',
+          'quasar',
+          'agents'
+        );
+        const globalAgentsDir = path.join(os.homedir(), '.gemini', 'config', 'agents');
+        const wsRoot = getWindowWorkspaceRoot();
+        const hasWs = wsRoot && wsRoot !== EMPTY_WINDOW_FALLBACK_ROOT;
+        const scopeOpts = [
+          {
+            label: '$(globe) Quasar Plugin Agents (Recommended — active in all repositories)',
+            description: '~/.gemini/config/plugins/quasar/agents/',
+            baseDir: pluginAgentsDir,
+          },
+        ];
+        if (hasWs) {
+          scopeOpts.push({
+            label: `$(folder) Current Workspace / Repo (${path.basename(wsRoot)}/.gemini/agents/)`,
+            description: 'Can be committed to git so teammates share this review agent',
+            baseDir: path.join(wsRoot, '.gemini', 'agents'),
+          });
+        }
+        scopeOpts.push({
+          label: '$(person) Global User Agents (~/.gemini/config/agents/)',
+          description: 'Available globally across all Antigravity conversations',
+          baseDir: globalAgentsDir,
+        });
+        const pickedScope = await vscode.window.showQuickPick(scopeOpts, {
+          title: 'Where Should This Review Subagent Be Installed?',
+          placeHolder: 'Quasar automatically discovers review-* subagents from all of these locations',
+        });
+        return pickedScope ? pickedScope.baseDir : null;
+      };
+
+      // If the user clicked a specific subagent in the sidebar tree
+      if (clickedArg && clickedArg.agent) {
+        const ag = clickedArg.agent;
+        const agActions = [
+          {
+            label: '$(edit) Open & Edit AGENT.md in Editor',
+            description: ag.mdPath,
+            action: 'open',
+          },
+          {
+            label: '$(sparkle) Ask Antigravity to Refine / Expand This Review Subagent...',
+            description: 'Tell the agent what rules, domain checks, or personas to add to AGENT.md',
+            action: 'refine',
+          },
+        ];
+        if (ag.isCustom) {
+          agActions.push({
+            label: '$(trash) Delete This Custom Review Subagent',
+            description: ag.dirPath,
+            action: 'delete',
+          });
+        }
+        const pickedAgAction = await vscode.window.showQuickPick(agActions, {
+          title: `${ag.isCustom ? '🧩 Custom' : '🤖 Built-in'} Review Subagent: ${ag.name}`,
+          placeHolder: ag.description || ag.mdPath,
+        });
+        if (!pickedAgAction) return;
+
+        if (pickedAgAction.action === 'open') {
+          if (fs.existsSync(ag.mdPath)) {
+            await vscode.window.showTextDocument(vscode.Uri.file(ag.mdPath), {
+              viewColumn: vscode.ViewColumn.Active,
+            });
+          }
+        } else if (pickedAgAction.action === 'refine') {
+          const instructions = await vscode.window.showInputBox({
+            title: `Refine ${ag.name} with Antigravity`,
+            prompt: `How should Antigravity update ${ag.name} (${ag.mdPath})?`,
+            placeHolder:
+              'e.g. Add checks for Swift concurrency MainActor isolation and XCTest memory leaks',
+          });
+          if (!instructions || !instructions.trim()) return;
+          const prompt =
+            `Please update the Quasar review subagent \`${ag.name}\` at \`${ag.mdPath}\` based on these instructions:\n\n` +
+            `> ${instructions.trim()}\n\n` +
+            `Keep the YAML frontmatter valid (\`name: ${ag.name}\`, \`subagent: true\`, \`commandExecutionPolicy: off\`) and preserve its read-only review output format.`;
+          await sendPromptToQuasar(prompt, `Refine Review Agent: ${ag.name}`);
+        } else if (pickedAgAction.action === 'delete' && ag.isCustom) {
+          const confirm = await vscode.window.showWarningMessage(
+            `Delete custom review subagent "${ag.name}" (${ag.dirPath})?`,
+            { modal: true },
+            'Delete'
+          );
+          if (confirm === 'Delete') {
+            try {
+              fs.rmSync(ag.dirPath, { recursive: true, force: true });
+              refreshAllUI(false);
+              vscode.window.showInformationMessage(`Deleted custom review subagent "${ag.name}".`);
+            } catch (err) {
+              vscode.window.showErrorMessage(`Failed to delete "${ag.name}": ${err.message}`);
+            }
+          }
+        }
+        return;
+      }
+
+      const agents = discoverInstalledReviewAgents();
+      const topItems = [
+        {
+          label: '$(add) Create New Custom Review Subagent (Guided Wizard)...',
+          description: 'Create a new review-* AGENT.md from template and open it in the editor',
+          action: 'wizard',
+        },
+        {
+          label: '$(sparkle) Ask Antigravity to Generate a Specialist Review Subagent...',
+          description: 'Describe the domain or persona and let Antigravity write AGENT.md for you',
+          action: 'ai-generate',
+        },
+        {
+          label: '$(file-text) Import Existing AGENT.md or Markdown Checklist as Review Subagent...',
+          description: 'Pick any .md file on disk and install it as a parallel review-* subagent',
+          action: 'import-file',
+        },
+      ];
+
+      for (const ag of agents) {
+        topItems.push({
+          label: `${ag.isCustom ? '$(extensions) 🧩 Custom:' : '$(hubot) 🤖 Built-in:'} ${ag.name}`,
+          description: ag.description || ag.scopeLabel,
+          detail: `${ag.scopeLabel} — ${ag.mdPath}`,
+          agent: ag,
+        });
+      }
+
+      const picked = await vscode.window.showQuickPick(topItems, {
+        title: '🤖 Quasar: Add / Manage Parallel Review Subagents (review-*)',
+        placeHolder:
+          'Create or import custom review-* subagents (automatically run in parallel during medium & high effort reviews)',
+      });
+      if (!picked) return;
+
+      if (picked.agent) {
+        await vscode.commands.executeCommand('quasar.manageReviewAgents', { agent: picked.agent });
+        return;
+      }
+
+      if (picked.action === 'wizard' || picked.action === 'ai-generate') {
+        const rawName = await vscode.window.showInputBox({
+          title: 'Step 1/3: Name Your Review Subagent',
+          prompt: 'Enter a short name (automatically prefixed with "review-" if needed)',
+          placeHolder: 'e.g. review-security, review-accessibility, review-sql-migrations',
+        });
+        if (!rawName || !rawName.trim()) return;
+        const slug =
+          rawName
+            .trim()
+            .toLowerCase()
+            .replace(/[^a-z0-9-]+/g, '-')
+            .replace(/^-+|-+$/g, '') || 'custom';
+        const agentName = slug.startsWith('review-') ? slug : `review-${slug}`;
+
+        const descInput = await vscode.window.showInputBox({
+          title: `Step 2/3: Describe "${agentName}"`,
+          prompt: 'What specialty, language, or domain does this reviewer evaluate?',
+          placeHolder:
+            'e.g. Evaluates authentication boundaries, secret handling, injection risks, and permission checks.',
+        });
+        if (descInput === undefined) return;
+
+        const baseDir = await chooseTargetBaseDir();
+        if (!baseDir) return;
+
+        const checklistInput = await vscode.window.showInputBox({
+          title: `Step 3/3: What Should "${agentName}" Look For?`,
+          prompt:
+            picked.action === 'ai-generate'
+              ? 'Describe the rules, codebase conventions, or persona for Antigravity to write into AGENT.md'
+              : 'Optional: Enter key review checklist items (you can also edit AGENT.md directly in the next step)',
+          placeHolder:
+            'e.g. Verify all SQL migrations are backwards-compatible and indexed; flag N+1 queries',
+        });
+        if (checklistInput === undefined) return;
+
+        const agentDir = path.join(baseDir, agentName);
+        const mdPath = path.join(agentDir, 'AGENT.md');
+        fs.mkdirSync(agentDir, { recursive: true });
+        fs.writeFileSync(
+          mdPath,
+          buildAgentMarkdown(agentName, descInput, checklistInput),
+          'utf8'
+        );
+        refreshAllUI(false);
+
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(mdPath));
+        await vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.Active });
+
+        if (picked.action === 'ai-generate') {
+          const prompt =
+            `I just scaffolded a new Quasar review subagent \`${agentName}\` at \`${mdPath}\`.\n\n` +
+            `- **Specialty**: ${descInput || agentName}\n` +
+            `- **Focus / Instructions**: ${checklistInput || 'Build a comprehensive domain checklist tailored to this repository.'}\n\n` +
+            `Please flesh out \`${mdPath}\` with concrete, high-signal review heuristics, examples, and edge cases while keeping its read-only frontmatter (\`name: ${agentName}\`, \`subagent: true\`, \`commandExecutionPolicy: off\`).`;
+          await sendPromptToQuasar(prompt, `Generate Review Subagent: ${agentName}`);
+        } else {
+          vscode.window.showInformationMessage(
+            `🧩 Created custom review subagent "${agentName}" at ${mdPath}. Quasar will automatically include it in future reviews!`
+          );
+        }
+      } else if (picked.action === 'import-file') {
+        const uris = await vscode.window.showOpenDialog({
+          canSelectFiles: true,
+          canSelectFolders: false,
+          canSelectMany: false,
+          openLabel: 'Import as Review Subagent (AGENT.md)',
+          filters: {
+            'Markdown Files': ['md', 'markdown', 'txt'],
+            'All Files': ['*'],
+          },
+        });
+        if (!uris || uris.length === 0) return;
+        const srcPath = uris[0].fsPath;
+        const rawContent = fs.readFileSync(srcPath, 'utf8');
+
+        let defaultSlug = path
+          .basename(srcPath, path.extname(srcPath))
+          .toLowerCase()
+          .replace(/[^a-z0-9-]+/g, '-')
+          .replace(/^-+|-+$/g, '');
+        if (defaultSlug === 'agent' || defaultSlug === 'skill' || !defaultSlug) {
+          defaultSlug = path
+            .basename(path.dirname(srcPath))
+            .toLowerCase()
+            .replace(/[^a-z0-9-]+/g, '-');
+        }
+        const rawName = await vscode.window.showInputBox({
+          title: 'Name Imported Review Subagent',
+          value: defaultSlug.startsWith('review-') ? defaultSlug : `review-${defaultSlug || 'custom'}`,
+          prompt: 'Enter the subagent identifier (prefixed with "review-")',
+        });
+        if (!rawName || !rawName.trim()) return;
+        const cleanSlug = rawName
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9-]+/g, '-')
+          .replace(/^-+|-+$/g, '');
+        const agentName = cleanSlug.startsWith('review-') ? cleanSlug : `review-${cleanSlug}`;
+
+        const baseDir = await chooseTargetBaseDir();
+        if (!baseDir) return;
+
+        let finalContent = rawContent;
+        if (!/^---\s*\n[\s\S]*?\n---/.test(rawContent)) {
+          finalContent = buildAgentMarkdown(
+            agentName,
+            `Imported custom review subagent (${path.basename(srcPath)})`,
+            rawContent
+          );
+        } else {
+          finalContent = rawContent.replace(
+            /^---\s*\n([\s\S]*?)\n---/,
+            (_m, fm) => {
+              let updatedFm = fm;
+              if (/^name:\s*.+$/m.test(updatedFm)) {
+                updatedFm = updatedFm.replace(/^name:\s*.+$/m, `name: ${agentName}`);
+              } else {
+                updatedFm = `name: ${agentName}\n${updatedFm}`;
+              }
+              if (!/^subagent:/m.test(updatedFm)) {
+                updatedFm += `\nmainAgent: false\nsubagent: true\ncommandExecutionPolicy: off`;
+              }
+              return `---\n${updatedFm}\n---`;
+            }
+          );
+        }
+
+        const agentDir = path.join(baseDir, agentName);
+        const mdPath = path.join(agentDir, 'AGENT.md');
+        fs.mkdirSync(agentDir, { recursive: true });
+        fs.writeFileSync(mdPath, finalContent, 'utf8');
+        refreshAllUI(false);
+
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(mdPath));
+        await vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.Active });
+        vscode.window.showInformationMessage(
+          `🧩 Imported custom review subagent "${agentName}" to ${mdPath}!`
+        );
       }
     })
   );

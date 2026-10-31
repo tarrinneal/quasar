@@ -3008,6 +3008,77 @@ def main() -> None:
 
     win_id, win_pid = resolve_target_window(state_dir)
 
+    def discover_review_agents() -> List[Dict[str, Any]]:
+        builtin_names = {
+            "review-architect",
+            "review-bug-hunter",
+            "review-test-critic",
+            "review-advocate",
+        }
+        plugin_agents_dir = os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "agents")
+        )
+        candidate_roots = [
+            os.path.expanduser("~/.gemini/config/plugins/quasar/agents"),
+            plugin_agents_dir,
+            os.path.expanduser("~/.gemini/config/agents"),
+        ]
+        for extra_root in (repo_dir, ws_root):
+            if extra_root:
+                candidate_roots.append(os.path.join(extra_root, ".gemini", "agents"))
+
+        discovered: Dict[str, Dict[str, Any]] = {}
+        for root in candidate_roots:
+            if not root or not os.path.isdir(root):
+                continue
+            try:
+                entries = sorted(os.listdir(root))
+            except Exception:
+                continue
+            for entry in entries:
+                agent_dir = os.path.join(root, entry)
+                if not os.path.isdir(agent_dir):
+                    continue
+                md_file = None
+                for fname in ("AGENT.md", "agent.md"):
+                    cand = os.path.join(agent_dir, fname)
+                    if os.path.isfile(cand):
+                        md_file = cand
+                        break
+                if not md_file:
+                    continue
+                name = entry
+                desc = ""
+                try:
+                    with open(md_file, "r", encoding="utf-8") as af:
+                        head = af.read(4096)
+                    fm = re.match(r"^---\s*\n(.*?)\n---", head, re.DOTALL)
+                    if fm:
+                        fm_text = fm.group(1)
+                        m_name = re.search(r"^name:\s*([^\n]+)", fm_text, re.MULTILINE)
+                        if m_name:
+                            name = m_name.group(1).strip().strip('"').strip("'")
+                        m_desc = re.search(r"^description:\s*([^\n]+)", fm_text, re.MULTILINE)
+                        if m_desc:
+                            desc = m_desc.group(1).strip().strip('"').strip("'")
+                except Exception:
+                    pass
+                if not name.startswith("review-") and root not in (
+                    os.path.expanduser("~/.gemini/config/plugins/quasar/agents"),
+                    plugin_agents_dir,
+                ):
+                    continue
+                if name not in discovered:
+                    discovered[name] = {
+                        "name": name,
+                        "description": desc,
+                        "path": md_file,
+                        "isCustom": name not in builtin_names,
+                    }
+        return list(discovered.values())
+
+    available_review_agents = discover_review_agents()
+
     summary: Dict[str, Any] = {
         "mode": "pr" if pr_arg else "local_branch",
         "session_id": session_id,
@@ -3022,6 +3093,7 @@ def main() -> None:
         "head_snapshot_root": head_root,
         "pr_metadata": metadata,
         "reviewer_preferences": prefs_for_context,
+        "available_review_agents": available_review_agents,
         "existing_comments": comments,
         "categorized_files": categorized_files,
     }

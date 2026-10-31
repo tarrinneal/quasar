@@ -203,6 +203,12 @@
         "icon": "$(sparkle)"
       },
       {
+        "command": "quasar.manageReviewAgents",
+        "title": "Add / Manage Review Subagents (review-*)...",
+        "category": "Quasar",
+        "icon": "$(organization)"
+      },
+      {
         "command": "quasar.managePreferences",
         "title": "Manage & Calibrate Reviewer Preferences...",
         "category": "Quasar",

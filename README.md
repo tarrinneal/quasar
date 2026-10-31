@@ -5,7 +5,7 @@ A **comprehension-first, 100% native** GitHub PR & local branch code review tool
 Point **Quasar** at any **GitHub PR URL** or **local branch / working-tree diff** and it automatically:
 1. Fetches the PR metadata or local branch commit history, unified diff, and existing comments.
 2. Materializes clean local `base/` and `head/` file snapshots so native side-by-side diffs (`vscode.diff`) work immediately without dirtying your active branch.
-3. Runs 4 parallel specialist review subagents (`review-architect`, `review-bug-hunter`, `review-test-critic`, `review-advocate`).
+3. Runs 4 parallel specialist review subagents (`review-architect`, `review-bug-hunter`, `review-test-critic`, `review-advocate`, plus any custom `review-*` subagents you add).
 4. Populates a **CliffsNotes Study Guide**, a **Guided Reading Tour** ordered by logical chapters (instead of alphabetically), **CliffsNotes Hover Cards & CodeLenses** (keeping your code completely free of inline comprehension clutter), and **Native Inline Comment Threads** where you can ask Quasar questions directly on any line of code, calibrate your review preferences, or stage comments for a **GitHub Pending Review**.
 
 ---
@@ -28,7 +28,7 @@ chmod +x install.sh
 ./install.sh
 ```
 `./install.sh` automatically:
-1. Installs the **Quasar** agent plugin (`SKILL.md`, Python scripts, and 4 specialist review subagents) to `~/.gemini/config/plugins/quasar`.
+1. Installs the **Quasar** agent plugin (`SKILL.md`, Python scripts, and specialist review subagents) to `~/.gemini/config/plugins/quasar`.
 2. Packages and installs the **Quasar** native IDE extension into `~/.antigravity/extensions` (and `~/.vscode/extensions`).
 3. Initializes your persistent preference store at `~/.gemini/quasar/PREFERENCES.md`.
 4. Runs the **Quasar Doctor** (`./install.sh --check`) and prints `✅` checks for every component.
@@ -46,6 +46,7 @@ After reloading the window, you can open **Quasar** from **3 places**:
    - `Quasar: Start Interactive Tutorial (Sandbox PR)...`
    - `Quasar: Review Local Branch or Diff...`
    - `Quasar: Review PR from GitHub URL...`
+   - `Quasar: Add / Manage Review Subagents (review-*)...`
    - `Quasar: Import Premade Review Skill as Starting Point...`
    - `Quasar: Manage & Calibrate Reviewer Preferences...`
 3. **Source Control (`Git`) Sidebar Header**: Click the **branch** or **PR** icon buttons at the top-right of the Source Control panel.
@@ -146,9 +147,70 @@ When an agent is asked to set up Quasar, it should execute these exact steps:
   - Every inline comment thread and sidebar finding includes **`$(thumbsup) Helpful (More Like This)`**, **`$(thumbsdown) Not Useful (Less Like This...)`**, and **`$(lightbulb-sparkle) Teach Quasar / Give Feedback on This Feedback...`**.
   - You can also type feedback directly into any inline comment reply box and click **`Teach Quasar`**, or edit a draft comment (Quasar automatically records before/after phrasing examples to learn your tone).
 - **Persistent Preference Memory (`~/.gemini/quasar/PREFERENCES.md` & `preferences.json`)**:
-  - Learned rules, seed skills, style profiles, and phrasing examples are automatically persisted and injected into `pr_context.json` and all 4 review subagents on every future review.
+  - Learned rules, seed skills, style profiles, and phrasing examples are automatically persisted and injected into `pr_context.json` and all review subagents on every future review.
 
-### 4. Author Self-Review: Check Comments & Fix with Agent (`manage_fixes.py`)
+### 4. Multi-Lens Review Subagents & Adding Custom Review Agents (`review-*`)
+Quasar ships with 4 built-in specialist review subagents under `plugin/agents/`:
+- **`review-architect`**: Architecture, API surface, backwards compatibility, and logical reading order.
+- **`review-bug-hunter`**: Execution paths, nullability, concurrency/async hazards, resource leaks, and platform edge cases.
+- **`review-test-critic`**: Test falsifiability, edge-case coverage matrix, generated file sync, and repo hygiene (`CHANGELOG.md`, `pubspec.yaml`).
+- **`review-advocate`**: False-positive filter that verifies candidate findings against callers, types, and existing PR comments.
+
+#### How to Add Your Own Review Subagents
+You can add custom domain-, language-, or team-specific review subagents (e.g., `review-security`, `review-accessibility`, `review-sql-migrations`) and Quasar will automatically discover them (`available_review_agents` in `pr_context.json`) and spawn them in parallel during `medium` and `high` effort reviews:
+
+- **Option A: Directly from the Extension UI (No GitHub Repo Needed)**
+  1. Open the Command Palette (`Cmd+Shift+P` $\rightarrow$ **`Quasar: Add / Manage Review Subagents (review-*)...`**), click **`$(git-pull-request) Quasar`** in the Status Bar $\rightarrow$ **`Add / Manage Review Subagents (review-*)...`**, or expand **`Review Subagents`** in the **Checks & Learned Preferences** sidebar.
+  2. Choose how to add your subagent:
+     - **`$(add) Create New Custom Review Subagent (Guided Wizard)...`** — Prompts for name, specialty, install scope (`Quasar Plugin`, `Current Workspace (.gemini/agents/)`, or `Global User Agents`), and optional checklist items, then creates and opens `AGENT.md` in your editor.
+     - **`$(sparkle) Ask Antigravity to Generate a Specialist Review Subagent...`** — Describe the domain or persona and let Antigravity write `AGENT.md` tailored to your repository.
+     - **`$(file-text) Import Existing AGENT.md or Markdown Checklist as Review Subagent...`** — Pick any `.md` file on disk and install it as a parallel `review-*` subagent.
+
+- **Option B: Create an `AGENT.md` File on Disk**
+  1. **Create an `AGENT.md` file** in any of these automatically discovered locations:
+     - **Directly in the installed Quasar plugin**: `~/.gemini/config/plugins/quasar/agents/review-<your-agent>/AGENT.md`
+     - **Per-repository / workspace agents** (team-sharable in git): `<your-repo>/.gemini/agents/review-<your-agent>/AGENT.md`
+     - **Global user agents**: `~/.gemini/config/agents/review-<your-agent>/AGENT.md`
+     - **In the Quasar repo** (if installing from source): `plugin/agents/review-<your-agent>/AGENT.md` (then run `./install.sh`)
+  2. **Use the standard read-only review subagent template**:
+     ```markdown
+     ---
+     name: review-security
+     description: "Security & Auth Reviewer. Evaluates authentication boundaries, secret handling, injection risks, and permission checks."
+     tools:
+       - view_file
+       - grep_search
+       - find_by_name
+       - list_dir
+     mainAgent: false
+     subagent: true
+     commandExecutionPolicy: off
+     ---
+
+     # Security & Auth Reviewer (`review-security`)
+
+     You are a specialist code review subagent focused on security boundaries and safe data handling. You operate in read-only mode.
+
+     ## What You Hunt For
+     - Unvalidated external inputs, path traversal, or command/SQL injection risks.
+     - Token/secret leakage in logs, error messages, or serialized state.
+     - Missing authorization or permission checks on newly exposed endpoints or platform channels.
+
+     ## Honor Learned Reviewer Preferences
+     Check `~/.gemini/quasar/PREFERENCES.md` or the `reviewer_preferences` passed in your prompt. Skip patterns marked `Avoid` and match the reviewer's preferred comment tone.
+
+     ## Output Format
+     For each verified issue, return:
+     - **Severity**: `BLOCKING`, `DESIGN`, or `NIT`
+     - **Location**: `path/to/file:startLine-endLine`
+     - **Title**: Short 1-line summary
+     - **Why It Matters**: Concrete trace showing how the issue can be triggered
+     - **Draft GitHub Comment**: Concise, collaborative 1–2 sentence review comment
+     ```
+  3. **Automatic Discovery & Execution**:
+     - On the next review, `collect_pr_context.py` automatically detects all installed `review-*` subagents and lists them under `available_review_agents` in `pr_context.json` so Quasar spawns them alongside the built-in reviewers (or you can explicitly ask in chat: *"Review this PR using `review-security`"*).
+
+### 5. Author Self-Review: Check Comments & Fix with Agent (`manage_fixes.py`)
 - When reviewing a **local branch** or a **GitHub PR you own** (auto-detected from your git/GitHub identity or checked-out branch), Quasar enables **Author Self-Review / Fix Mode**:
   - **Check Any Comment in the Sidebar**: Every Quasar finding (`🔴 Blocking`, `🟡 Design`, `🟢 Nit`, `🤔 Uncertain`) **and** every **Existing GitHub PR Comment from teammates** (`👀`) has a native checkbox in the **Review Comments & Cart** tree.
   - **Queue or Fix Directly from Inline Diff Threads**: Click **`$(tools) Queue / Unqueue Comment for Agent Fix`** or **`$(wrench) Fix This Issue with Quasar Now...`** on any inline comment thread in the diff editor.
@@ -156,7 +218,7 @@ When an agent is asked to set up Quasar, it should execute these exact steps:
   - **Working-Tree Edits, Live Diff Sync & Preference Learning**:
     - The agent edits the real working-tree files in your local repo (without auto-committing), syncs the updated files into Quasar's diff snapshot so your open `vscode.diff` view updates immediately, marks the threads **`✅ Fixed`**, and records a positive preference signal on any Quasar findings you chose to fix.
 
-### 5. Publish Reviews Directly to GitHub (as You) via GitHub API Key
+### 6. Publish Reviews Directly to GitHub (as You) via GitHub API Key
 - **No `gh` CLI Required**: Click **`$(key) Configure GitHub API Key / Personal Access Token...`** in the **Review Comments & Cart** header (or in the **Checks & Learned Preferences** tree / Quasar menu) and paste a GitHub Personal Access Token (`repo` scope or Fine-Grained `Pull requests: Read & write`).
   - Quasar verifies the token against `https://api.github.com/user`, displays your `@login`, and stores it locally at `~/.gemini/quasar/github_auth.json` (`chmod 0600`).
 - **Publish as `@your-username` in Any Mode**:
