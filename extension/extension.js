@@ -3609,6 +3609,9 @@ function activate(context) {
         localResourceRoots: [vscode.Uri.file(path.join(context.extensionPath, 'media'))],
       }
     );
+    cliffsNotesWebviewPanel.iconPath = vscode.Uri.file(
+      path.join(context.extensionPath, 'media', 'quasar-icon.png')
+    );
 
     cliffsNotesWebviewPanel.onDidDispose(() => {
       cliffsNotesWebviewPanel = null;

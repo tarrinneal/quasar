@@ -51,14 +51,16 @@ def find_mermaid_js_path() -> Optional[str]:
     return None
 
 
-def get_agentapi_binary() -> str:
-    env_exe = os.environ.get("ANTIGRAVITY_AGENTAPI_EXE")
-    if env_exe and os.path.isfile(env_exe):
-        return env_exe
+def get_agentapi_cmd() -> List[str]:
     for cand in glob.glob(os.path.expanduser("~/.gemini/*/bin/agentapi")):
         if os.path.isfile(cand):
-            return cand
-    return "agentapi"
+            return [cand]
+    env_exe = os.environ.get("ANTIGRAVITY_AGENTAPI_EXE")
+    if env_exe and os.path.isfile(env_exe):
+        if os.path.basename(env_exe) == "agentapi":
+            return [env_exe]
+        return [env_exe, "agentapi"]
+    return ["agentapi"]
 
 
 def discover_ls_env(workspace_dir: Optional[str] = None) -> Dict[str, str]:
@@ -117,13 +119,23 @@ def discover_ls_env(workspace_dir: Optional[str] = None) -> Dict[str, str]:
     return env
 
 
-def dispatch_to_agent(prompt: str, title: str = "Quasar Code Review", conversation_id: Optional[str] = None, workspace_dir: Optional[str] = None) -> Dict[str, Any]:
-    exe = get_agentapi_binary()
+def resolve_conversation_context(
+    conversation_id: Optional[str] = None,
+    workspace_dir: Optional[str] = None,
+) -> Tuple[str, str, str, Dict[str, str]]:
+    """Returns (conv_id, project_id, workspace_dir, env) for communicating with the active conversation."""
+    cmd_prefix = get_agentapi_cmd()
     env = discover_ls_env(workspace_dir)
-    conv_id = (conversation_id or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or "").strip()
+    env.pop("ANTIGRAVITY_SOURCE_METADATA", None)
+
+    conv_id = (
+        conversation_id
+        or os.environ.get("ANTIGRAVITY_SIDECAR_CONVERSATION_ID")
+        or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+        or ""
+    ).strip()
 
     if not conv_id:
-        # Check most recently active root transcript
         try:
             brain_dir = os.path.expanduser("~/.gemini/jetski/brain")
             candidates: List[Tuple[float, str]] = []
@@ -138,33 +150,281 @@ def dispatch_to_agent(prompt: str, title: str = "Quasar Code Review", conversati
         except Exception:
             pass
 
+    project_id = ""
+    resolved_ws = (workspace_dir or "").strip()
     if conv_id:
         try:
             proc = subprocess.run(
-                [exe, "send-message", f"--title={title}", conv_id, prompt],
+                cmd_prefix + ["get-conversation-metadata", conv_id],
                 env=env,
                 capture_output=True,
                 text=True,
-                timeout=8,
+                timeout=5,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                data = json.loads(proc.stdout)
+                meta = (
+                    ((data.get("response") or {}).get("conversationMetadata") or {}).get("metadata")
+                    or ((data.get("response") or {}).get("conversation_metadata") or {}).get("metadata")
+                    or {}
+                )
+                root_id = (meta.get("rootConversationId") or meta.get("root_conversation_id") or "").strip()
+                if root_id and root_id != conv_id:
+                    conv_id = root_id
+                project_id = (meta.get("projectId") or meta.get("project_id") or "").strip()
+                if not resolved_ws:
+                    ws_uris = meta.get("workspaceUris") or meta.get("workspace_uris") or []
+                    for uri in ws_uris:
+                        if isinstance(uri, str) and uri.startswith("file://"):
+                            cand_ws = urllib.parse.unquote(uri[len("file://") :])
+                            if os.path.isdir(os.path.join(cand_ws, "google3")):
+                                resolved_ws = os.path.join(cand_ws, "google3")
+                            elif os.path.isdir(cand_ws):
+                                resolved_ws = cand_ws
+                            break
+        except Exception:
+            pass
+
+    if project_id:
+        env["ANTIGRAVITY_PROJECT_ID"] = project_id
+
+    if not resolved_ws:
+        resolved_ws = os.path.expanduser("~")
+
+    return conv_id, project_id, resolved_ws, env
+
+
+ACTIVE_AGENT_JOB: Dict[str, Any] = {}
+
+
+def dispatch_to_agent(
+    prompt: str,
+    title: str = "Quasar Code Review",
+    conversation_id: Optional[str] = None,
+    workspace_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    import time
+
+    cmd_prefix = get_agentapi_cmd()
+    conv_id, project_id, resolved_ws, env = resolve_conversation_context(conversation_id, workspace_dir)
+
+    all_sess = list_all_sessions()
+    baseline_mtime = max((s["mtime"] for s in all_sess), default=0.0)
+
+    def _record_active(cid: Optional[str], mode: str) -> None:
+        ACTIVE_AGENT_JOB.clear()
+        ACTIVE_AGENT_JOB.update({
+            "active": True,
+            "title": title,
+            "promptPreview": prompt.splitlines()[0][:120] if prompt else title,
+            "startedAt": time.time(),
+            "baselineMtime": baseline_mtime,
+            "conversationId": cid or "",
+            "mode": mode,
+            "completedAt": None,
+        })
+
+    if conv_id:
+        try:
+            proc = subprocess.run(
+                cmd_prefix + ["send-message", f"--title={title}", conv_id, prompt],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=12,
             )
             if proc.returncode == 0 and '"error"' not in (proc.stdout or "").lower():
-                return {"ok": True, "mode": "send-message", "conversationId": conv_id, "stdout": proc.stdout.strip()}
+                _record_active(conv_id, "send-message")
+                return {
+                    "ok": True,
+                    "mode": "send-message",
+                    "conversationId": conv_id,
+                    "projectId": project_id,
+                    "workspaceDir": resolved_ws,
+                    "stdout": proc.stdout.strip(),
+                }
         except Exception:
             pass
 
     try:
         proc = subprocess.run(
-            [exe, "new-conversation", f"--title={title}", prompt],
+            cmd_prefix + ["new-conversation", f"--title={title}", prompt],
             env=env,
             capture_output=True,
             text=True,
-            timeout=8,
+            timeout=12,
         )
         if proc.returncode == 0:
-            return {"ok": True, "mode": "new-conversation", "stdout": proc.stdout.strip()}
+            out_str = (proc.stdout or "").strip()
+            m_uuid = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", out_str)
+            new_cid = m_uuid.group(1) if m_uuid else conv_id
+            _record_active(new_cid, "new-conversation")
+            return {
+                "ok": True,
+                "mode": "new-conversation",
+                "conversationId": new_cid,
+                "projectId": project_id,
+                "workspaceDir": resolved_ws,
+                "stdout": out_str,
+            }
         return {"ok": False, "error": (proc.stderr or proc.stdout or "agentapi failed").strip(), "prompt": prompt}
     except Exception as e:
         return {"ok": False, "error": str(e), "prompt": prompt}
+
+
+def get_live_agent_status(session: Optional[Dict[str, Any]], all_sessions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    import time
+
+    now = time.time()
+    current_max_mtime = max((s["mtime"] for s in all_sessions), default=0.0)
+
+    # Check if a web-dispatched job just completed because a session file was updated
+    if ACTIVE_AGENT_JOB.get("active"):
+        started_at = float(ACTIVE_AGENT_JOB.get("startedAt") or now)
+        baseline_mtime = float(ACTIVE_AGENT_JOB.get("baselineMtime") or 0.0)
+        if current_max_mtime > baseline_mtime + 0.5 and (now - started_at) > 1.0:
+            ACTIVE_AGENT_JOB["active"] = False
+            ACTIVE_AGENT_JOB["completedAt"] = now
+        elif (now - started_at) > 300:
+            ACTIVE_AGENT_JOB["active"] = False
+
+    if not ACTIVE_AGENT_JOB.get("active") and ACTIVE_AGENT_JOB.get("completedAt"):
+        comp_at = float(ACTIVE_AGENT_JOB["completedAt"])
+        if (now - comp_at) <= 8.0:
+            return {
+                "active": False,
+                "completedJustNow": True,
+                "title": ACTIVE_AGENT_JOB.get("title") or "Quasar Agent Task",
+                "stage": "✅ Agent finished — Review updated!",
+                "detail": "The latest review changes have been loaded.",
+                "percent": 100,
+                "elapsedSeconds": int(comp_at - float(ACTIVE_AGENT_JOB.get("startedAt") or comp_at)),
+            }
+
+    # Inspect recent transcript activity to provide real-time pipeline stage & tool action
+    brain_dir = os.path.expanduser("~/.gemini/jetski/brain")
+    target_cid = (
+        ACTIVE_AGENT_JOB.get("conversationId")
+        or (session or {}).get("conversationId")
+        or ""
+    ).strip()
+
+    transcript_path = None
+    if target_cid and os.path.isdir(brain_dir):
+        cand = os.path.join(brain_dir, target_cid, ".system_generated", "logs", "transcript.jsonl")
+        if os.path.isfile(cand):
+            transcript_path = cand
+
+    if not transcript_path and os.path.isdir(brain_dir):
+        recent: List[Tuple[float, str]] = []
+        try:
+            for entry in os.listdir(brain_dir):
+                tp = os.path.join(brain_dir, entry, ".system_generated", "logs", "transcript.jsonl")
+                if os.path.isfile(tp):
+                    recent.append((os.path.getmtime(tp), tp))
+            recent.sort(reverse=True)
+            if recent and (now - recent[0][0]) < 45:
+                transcript_path = recent[0][1]
+        except Exception:
+            pass
+
+    stage = "Initializing Quasar Agent..."
+    detail = "Waiting for agent response..."
+    percent = 15
+    subagents: List[str] = []
+    transcript_is_running = False
+    transcript_started_at = None
+
+    if transcript_path and os.path.isfile(transcript_path):
+        try:
+            t_mtime = os.path.getmtime(transcript_path)
+            with open(transcript_path, "r", encoding="utf-8", errors="replace") as tf:
+                lines = tf.readlines()[-35:]
+            steps = []
+            for ln in lines:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    steps.append(json.loads(ln))
+                except Exception:
+                    pass
+            if steps:
+                last_step = steps[-1]
+                last_type = last_step.get("type") or ""
+                last_tools = last_step.get("tool_calls") or []
+                # If the transcript was modified recently and the last step has tool calls or is USER_INPUT / TOOL_RESPONSE
+                if (now - t_mtime) < 45 and (last_tools or last_type != "PLANNER_RESPONSE"):
+                    transcript_is_running = True
+
+                # Scan backwards to last USER_INPUT to determine current pipeline phase
+                recent_slice = []
+                for st in reversed(steps):
+                    recent_slice.append(st)
+                    if st.get("type") == "USER_INPUT":
+                        break
+                recent_slice.reverse()
+
+                saw_quasar = False
+                for st in recent_slice:
+                    raw_str = json.dumps(st)
+                    if any(k in raw_str for k in ("collect_pr_context", "publish_review_session", "answer_comment_question", "manage_fixes", "review-architect", "review-bug-hunter")):
+                        saw_quasar = True
+                    for tc in st.get("tool_calls") or []:
+                        args_obj = tc.get("arguments") or tc.get("args") or {}
+                        if isinstance(args_obj, str):
+                            try:
+                                args_obj = json.loads(args_obj)
+                            except Exception:
+                                args_obj = {}
+                        t_act = (args_obj.get("toolAction") or args_obj.get("toolSummary") or tc.get("name") or "").strip()
+                        if t_act:
+                            detail = f"Current step: {t_act}"
+                        cmd_line = str(args_obj.get("CommandLine") or "")
+                        if "collect_pr_context.py" in cmd_line:
+                            stage = "Phase 1/3: Fetching PR Context, Diffs & Snapshots"
+                            percent = max(percent, 28)
+                        elif "invoke_subagent" in str(tc.get("name") or "") or "Subagents" in args_obj:
+                            stage = "Phase 2/3: Running 4 Multi-Lens Subagents (Architect, Bug Hunter, Test Critic, Advocate)"
+                            percent = max(percent, 62)
+                            for sa in (args_obj.get("Subagents") or []):
+                                role = sa.get("Role") or sa.get("TypeName")
+                                if role and role not in subagents:
+                                    subagents.append(role)
+                        elif "publish_review_session.py" in cmd_line:
+                            stage = "Phase 3/3: Synthesizing Study Guide, Flowchart & Inline Findings"
+                            percent = max(percent, 90)
+                        elif "answer_comment_question.py" in cmd_line:
+                            stage = "Updating Inline Comment Thread & Preferences"
+                            percent = max(percent, 75)
+                        elif "manage_fixes.py" in cmd_line:
+                            stage = "Applying Code Fixes & Syncing Diff Snapshots"
+                            percent = max(percent, 80)
+                if not saw_quasar and not ACTIVE_AGENT_JOB.get("active"):
+                    transcript_is_running = False
+        except Exception:
+            pass
+
+    is_active = bool(ACTIVE_AGENT_JOB.get("active") or transcript_is_running)
+    if not is_active:
+        return {"active": False}
+
+    started_at = float(ACTIVE_AGENT_JOB.get("startedAt") or transcript_started_at or now)
+    elapsed = max(1, int(now - started_at))
+    # Smoothly advance progress slightly with time so the bar never looks frozen while subagents think
+    if percent < 85:
+        percent = min(85, max(percent, 15 + int(elapsed * 0.8)))
+
+    return {
+        "active": True,
+        "title": ACTIVE_AGENT_JOB.get("title") or "Quasar Multi-Agent Code Review",
+        "stage": stage,
+        "detail": detail,
+        "percent": percent,
+        "subagents": subagents,
+        "elapsedSeconds": elapsed,
+        "startedAt": started_at,
+    }
 
 
 def list_all_sessions() -> List[Dict[str, Any]]:
@@ -374,9 +634,13 @@ def compute_file_diffs(session: Optional[Dict[str, Any]]) -> List[Dict[str, Any]
     return result
 
 
-def build_state_payload(session_id: Optional[str] = None) -> Dict[str, Any]:
+def build_state_payload(
+    session_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+) -> Dict[str, Any]:
     session, session_path = load_target_session(session_id)
     all_sessions = list_all_sessions()
+    _, _, default_ws, _ = resolve_conversation_context(conversation_id)
     session_summaries = []
     for item in all_sessions[:30]:
         s = item["session"]
@@ -418,10 +682,10 @@ def build_state_payload(session_id: Optional[str] = None) -> Dict[str, Any]:
 
         prefs = load_preferences()
         prefs_summary = {
-            "defaultEffort": prefs.get("defaultEffort") or "medium",
-            "defaultCommentsOnly": bool(prefs.get("defaultCommentsOnly", False)),
-            "rulesCount": len(prefs.get("rules") or []),
-            "rules": (prefs.get("rules") or [])[:30],
+            "defaultEffort": prefs.get("default_effort") or prefs.get("defaultEffort") or "medium",
+            "defaultCommentsOnly": bool(prefs.get("default_comments_only", prefs.get("defaultCommentsOnly", False))),
+            "rulesCount": len((prefs.get("prefer_rules") or []) + (prefs.get("avoid_rules") or []) + (prefs.get("custom_rules") or [])),
+            "rules": ((prefs.get("prefer_rules") or []) + (prefs.get("avoid_rules") or []) + (prefs.get("custom_rules") or []))[:30],
         }
     except Exception:
         pass
@@ -430,10 +694,12 @@ def build_state_payload(session_id: Optional[str] = None) -> Dict[str, Any]:
         "ok": True,
         "activeSession": session,
         "activeSessionPath": session_path,
+        "defaultWorkspaceDir": default_ws,
         "filesDiff": compute_file_diffs(session),
         "sessions": session_summaries,
         "githubAuth": gh_auth or {"configured": False},
         "preferences": prefs_summary,
+        "agentStatus": get_live_agent_status(session, all_sessions),
         "sidecarPort": PORT,
     }
 
@@ -444,6 +710,8 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Quasar — Code Review & Study Guide</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2358a6ff' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5.5 5.5L9.8 9.8'/%3E%3Cpath d='M14.2 14.2L18.5 18.5'/%3E%3Cellipse cx='12' cy='12' rx='9.2' ry='3.8' transform='rotate(-32 12 12)'/%3E%3Ccircle cx='12' cy='12' r='2.3' fill='%2379c0ff'/%3E%3C/svg%3E" />
+  <script src="/preload.js"></script>
   <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
   <script src="/mermaid-preview.js"></script>
   <!--__QUASAR_INLINE_SCRIPTS__-->
@@ -457,8 +725,8 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       --q-accent: var(--app-primary, #58a6ff);
     }
     body {
-      background: var(--q-bg);
-      color: var(--q-fg);
+      background: var(--q-bg) !important;
+      color: var(--q-fg) !important;
       font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
       margin: 0;
       padding: 0;
@@ -537,6 +805,23 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
     .diff-mod-left { background: rgba(248, 81, 73, 0.14); }
     .diff-mod-right { background: rgba(46, 160, 67, 0.14); }
     .mermaid-box svg { max-width: 100%; height: auto; }
+    @keyframes qSpin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    @keyframes qShimmer {
+      0% { background-position: 200% 0; }
+      100% { background-position: -200% 0; }
+    }
+    .q-spin {
+      animation: qSpin 1.8s linear infinite;
+    }
+    .q-progress-fill {
+      background: linear-gradient(90deg, #1f6feb, #58a6ff, #a371f7, #58a6ff, #1f6feb);
+      background-size: 200% 100%;
+      animation: qShimmer 2.4s linear infinite;
+      transition: width 0.5s ease;
+    }
   </style>
 </head>
 <body class="min-h-screen flex flex-col">
@@ -554,6 +839,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         <button class="q-btn" onclick="openNewReviewModal()" title="Review a GitHub PR URL or local git branch">➕ New Review</button>
       </div>
       <div class="flex items-center gap-2">
+        <span id="agentPill" class="hidden q-badge border-blue-500/60 bg-blue-500/15 text-blue-300"></span>
         <span id="progressPill" class="q-badge text-[var(--q-muted)]">0/0 stops read</span>
         <button class="q-btn q-btn-success" onclick="openPublishModal()" title="Publish staged comments to GitHub PR as you">☁️ Publish to GitHub</button>
         <button class="q-btn" onclick="openTokenModal()" id="ghAuthBtn" title="Configure GitHub Personal Access Token">🔑 GitHub Key</button>
@@ -569,6 +855,9 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       <div class="ml-auto flex items-center gap-1.5" id="batchFixBar"></div>
     </div>
   </header>
+
+  <!-- Live Agent Activity Banner -->
+  <div id="agentActivityBanner" class="hidden max-w-7xl w-full mx-auto px-4 pt-3"></div>
 
   <!-- Toast Banner -->
   <div id="toastBanner" class="hidden fixed bottom-4 right-4 z-50 max-w-md px-4 py-2.5 rounded-lg border border-blue-500/50 bg-[#161b22] text-xs shadow-xl"></div>
@@ -588,6 +877,111 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
     let DIFF_MODE = 'split'; // 'split' | 'unified'
     let COMMENT_FILTER = 'all';
     let API_BASE = '';
+    const URL_PARAMS = new URLSearchParams(window.location.search);
+    const SIDECAR_TOKEN = URL_PARAMS.get('token') || '';
+    const CONVERSATION_ID = URL_PARAMS.get('conversationId') || (window.sidecar && window.sidecar.conversationId) || '';
+    let OPTIMISTIC_AGENT_JOB = null;
+
+    function formatElapsed(sec) {
+      const s = Math.max(0, Math.floor(sec || 0));
+      const m = Math.floor(s / 60);
+      const r = s % 60;
+      return `${m}:${r < 10 ? '0' : ''}${r}`;
+    }
+
+    function startOptimisticAgentBanner(title, stage, detail) {
+      OPTIMISTIC_AGENT_JOB = {
+        active: true,
+        title: title || 'Quasar Agent Working...',
+        stage: stage || 'Phase 1/3: Dispatching request & collecting PR context...',
+        detail: detail || 'Sent task to Antigravity agent...',
+        percent: 18,
+        startedAt: Date.now() / 1000,
+      };
+      renderAgentActivityBanner();
+    }
+
+    function renderAgentActivityBanner() {
+      const banner = document.getElementById('agentActivityBanner');
+      const pill = document.getElementById('agentPill');
+      if (!banner) return;
+
+      const srv = STATE?.agentStatus || {};
+      let status = null;
+      if (srv.active || srv.completedJustNow) {
+        status = srv;
+        if (srv.completedJustNow) OPTIMISTIC_AGENT_JOB = null;
+      } else if (OPTIMISTIC_AGENT_JOB && (Date.now() / 1000 - OPTIMISTIC_AGENT_JOB.startedAt) < 25) {
+        const el = Math.floor(Date.now() / 1000 - OPTIMISTIC_AGENT_JOB.startedAt);
+        status = { ...OPTIMISTIC_AGENT_JOB, elapsedSeconds: el, percent: Math.min(40, 18 + el) };
+      } else {
+        OPTIMISTIC_AGENT_JOB = null;
+      }
+
+      if (!status || (!status.active && !status.completedJustNow)) {
+        banner.className = 'hidden';
+        banner.innerHTML = '';
+        if (pill) pill.className = 'hidden';
+        return;
+      }
+
+      if (status.completedJustNow) {
+        if (pill) {
+          pill.className = 'q-badge border-emerald-500/60 bg-emerald-500/15 text-emerald-300';
+          pill.innerHTML = '✅ Review Updated';
+        }
+        banner.className = 'max-w-7xl w-full mx-auto px-4 pt-3';
+        banner.innerHTML = `
+          <div class="rounded-lg border border-emerald-500/50 bg-emerald-950/30 px-4 py-3 flex items-center justify-between text-xs">
+            <div class="flex items-center gap-2.5">
+              <span class="text-base">🎉</span>
+              <div>
+                <div class="font-bold text-emerald-300">${esc(status.stage || 'Agent finished — Review updated!')}</div>
+                <div class="text-[var(--q-muted)]">${esc(status.title || '')} completed in ${formatElapsed(status.elapsedSeconds || 0)}</div>
+              </div>
+            </div>
+            <button class="q-btn" onclick="OPTIMISTIC_AGENT_JOB=null; document.getElementById('agentActivityBanner').className='hidden';">Dismiss</button>
+          </div>`;
+        return;
+      }
+
+      const elapsed = status.startedAt
+        ? Math.max(status.elapsedSeconds || 1, Math.floor(Date.now() / 1000 - status.startedAt))
+        : (status.elapsedSeconds || 1);
+      const pct = Math.min(95, Math.max(12, status.percent || 20));
+      const subBadges = (status.subagents || []).map((sa) =>
+        `<span class="px-2 py-0.5 rounded-full bg-purple-500/20 border border-purple-500/40 text-purple-200 text-[11px]">🤖 ${esc(sa)}</span>`
+      ).join('');
+
+      if (pill) {
+        pill.className = 'q-badge border-blue-500/60 bg-blue-500/15 text-blue-300';
+        pill.innerHTML = `<span class="inline-block w-2 h-2 rounded-full bg-blue-400 animate-ping"></span> Agent Working (${formatElapsed(elapsed)})`;
+      }
+
+      banner.className = 'max-w-7xl w-full mx-auto px-4 pt-3';
+      banner.innerHTML = `
+        <div class="rounded-xl border border-blue-500/50 bg-[#111827] px-4 py-3.5 shadow-lg space-y-2.5">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="flex items-center gap-2.5">
+              <svg class="q-spin text-blue-400 shrink-0" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                <path d="M12 2a10 10 0 1 0 10 10" stroke-linecap="round"/>
+              </svg>
+              <div>
+                <div class="text-xs font-bold text-blue-200 flex items-center gap-2">
+                  <span>${esc(status.title || 'Quasar Multi-Agent Review in Progress')}</span>
+                  <span class="px-2 py-0.5 rounded bg-blue-500/20 text-blue-300 font-mono text-[11px]">${formatElapsed(elapsed)} elapsed</span>
+                </div>
+                <div class="text-xs text-blue-300/90 font-medium mt-0.5">${esc(status.stage || 'Analyzing PR & running review subagents...')}</div>
+              </div>
+            </div>
+            <div class="text-[11px] text-[var(--q-muted)] font-mono">${esc(status.detail || 'Auto-refreshing when complete...')}</div>
+          </div>
+          ${subBadges ? `<div class="flex flex-wrap gap-1.5 pt-0.5">${subBadges}</div>` : ''}
+          <div class="w-full h-1.5 bg-black/50 rounded-full overflow-hidden">
+            <div class="h-full q-progress-fill rounded-full" style="width: ${pct}%"></div>
+          </div>
+        </div>`;
+    }
 
     async function detectApiBase() {
       if (window.location.protocol.startsWith('http')) {
@@ -607,9 +1001,25 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
     }
 
     async function apiCall(path, method = 'GET', body = null) {
-      const opts = { method, headers: { 'Content-Type': 'application/json' } };
-      if (body !== null) opts.body = JSON.stringify(body);
-      const res = await fetch(`${API_BASE}${path}`, opts);
+      const headers = { 'Content-Type': 'application/json' };
+      if (SIDECAR_TOKEN) {
+        headers['X-Sidecar-Token'] = SIDECAR_TOKEN;
+      }
+      let fullPath = path;
+      if (SIDECAR_TOKEN) {
+        fullPath += (fullPath.includes('?') ? '&' : '?') + `token=${encodeURIComponent(SIDECAR_TOKEN)}`;
+      }
+      if (CONVERSATION_ID && method === 'GET' && !fullPath.includes('conversationId=')) {
+        fullPath += (fullPath.includes('?') ? '&' : '?') + `conversationId=${encodeURIComponent(CONVERSATION_ID)}`;
+      }
+      const opts = { method, headers, credentials: 'include' };
+      if (body !== null) {
+        const payload = (typeof body === 'object' && body !== null && CONVERSATION_ID && !body.conversationId)
+          ? { ...body, conversationId: CONVERSATION_ID }
+          : body;
+        opts.body = JSON.stringify(payload);
+      }
+      const res = await fetch(`${API_BASE}${fullPath}`, opts);
       return await res.json();
     }
 
@@ -649,6 +1059,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
 
     function renderAll() {
       if (!STATE) return;
+      renderAgentActivityBanner();
       const session = STATE.activeSession;
       const sessions = STATE.sessions || [];
       const sel = document.getElementById('sessionSelect');
@@ -827,11 +1238,13 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
     }
 
     function renderThreadCardHtml(t) {
+      const sev = String(t.severity || '').toLowerCase();
+      const isStaged = Boolean(t.stagedForGithub || t.status === 'staged');
       const sevBadge = t.status === 'uncertain'
         ? '<span class="q-badge text-amber-300 border-amber-500/40">🤔 Uncertain — Calibrate</span>'
-        : t.severity === 'blocking'
+        : sev === 'blocking'
         ? '<span class="q-badge text-red-300 border-red-500/40">🔴 Blocking</span>'
-        : t.severity === 'design'
+        : sev === 'design'
         ? '<span class="q-badge text-yellow-300 border-yellow-500/40">🟡 Design</span>'
         : t.kind === 'github_existing'
         ? `<span class="q-badge text-purple-300 border-purple-500/40">${esc(t.triageBadge || '👀 GitHub Comment')}</span>`
@@ -839,7 +1252,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
 
       const statusBadge = t.status === 'fixed'
         ? '<span class="q-badge text-emerald-300 border-emerald-500/50">✅ Fixed</span>'
-        : t.stagedForGithub
+        : isStaged
         ? '<span class="q-badge text-blue-300 border-blue-500/50">☁️ Staged for GitHub</span>'
         : '<span class="q-badge text-[var(--q-muted)]">Draft</span>';
 
@@ -862,20 +1275,24 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
               <button class="q-btn" onclick="openReviseCommentModal('${esc(t.id)}')">💬 Change Comment...</button>
               <button class="q-btn" onclick="openEditDraftModal('${esc(t.id)}')">✏️ Edit</button>
               <button class="q-btn" onclick="threadAction('${esc(t.id)}', 'toggleStage')">
-                ${t.stagedForGithub ? 'Unstage' : '☁️ Stage'}
+                ${isStaged ? 'Unstage' : '☁️ Stage'}
               </button>
               <button class="q-btn" onclick="threadAction('${esc(t.id)}', 'rate', { rating: 'up' })" title="Helpful — flag more like this">👍</button>
               <button class="q-btn" onclick="threadAction('${esc(t.id)}', 'dismiss')" title="Dismiss comment">✕</button>
             </div>
           </div>
+          ${t.whyItMatters ? `<div class="text-xs text-[var(--q-muted)]"><b>Why it matters:</b> ${esc(t.whyItMatters)}</div>` : ''}
           <div class="text-xs whitespace-pre-wrap leading-relaxed">${esc(t.draftComment || '')}</div>
           ${t.suggestion ? `<pre class="text-[11px] bg-black/40 border border-[var(--q-border)] rounded p-2.5 overflow-x-auto"><code>${esc(t.suggestion)}</code></pre>` : ''}
           ${t.status === 'uncertain' ? `
-            <div class="flex flex-wrap items-center gap-2 pt-1.5 border-t border-amber-500/30 text-xs">
-              <span class="text-amber-300 font-medium">🤔 Calibrate Preference:</span>
-              <button class="q-btn q-btn-primary" onclick="threadAction('${esc(t.id)}', 'calibrate', { decision: 'keep_always' })">✅ Stage & Always Flag Similar</button>
-              <button class="q-btn" onclick="threadAction('${esc(t.id)}', 'calibrate', { decision: 'keep_once' })">Keep Once</button>
-              <button class="q-btn" onclick="threadAction('${esc(t.id)}', 'calibrate', { decision: 'dismiss_skip' })">🚫 Dismiss & Skip Pattern in Future</button>
+            <div class="space-y-1.5 pt-1.5 border-t border-amber-500/30 text-xs">
+              ${(t.uncertaintyQuestion || t.calibrationQuestion) ? `<div class="text-amber-200">${esc(t.uncertaintyQuestion || t.calibrationQuestion)}</div>` : ''}
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="text-amber-300 font-medium">🤔 Calibrate Preference:</span>
+                <button class="q-btn q-btn-primary" onclick="threadAction('${esc(t.id)}', 'calibrate', { decision: 'keep_always' })">✅ Stage & Always Flag Similar</button>
+                <button class="q-btn" onclick="threadAction('${esc(t.id)}', 'calibrate', { decision: 'keep_once' })">Keep Once</button>
+                <button class="q-btn" onclick="threadAction('${esc(t.id)}', 'calibrate', { decision: 'dismiss_skip' })">🚫 Dismiss & Skip Pattern in Future</button>
+              </div>
             </div>` : ''}
           ${replies.length ? `
             <div class="space-y-1.5 pt-2 border-t border-[var(--q-border)]">
@@ -972,7 +1389,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
     function renderCommentsTab(session) {
       const allThreads = (session.threads || []).filter((t) => t.status !== 'dismissed');
       const filtered = allThreads.filter((t) => {
-        if (COMMENT_FILTER === 'staged') return Boolean(t.stagedForGithub);
+        if (COMMENT_FILTER === 'staged') return Boolean(t.stagedForGithub || t.status === 'staged');
         if (COMMENT_FILTER === 'fix') return Boolean(t.selectedForFix);
         if (COMMENT_FILTER === 'uncertain') return t.status === 'uncertain';
         return true;
@@ -984,7 +1401,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
           <div class="flex flex-wrap items-center justify-between gap-2">
             <div class="flex items-center gap-1.5">
               <button class="q-btn ${COMMENT_FILTER === 'all' ? 'q-btn-primary' : ''}" onclick="COMMENT_FILTER='all'; renderAll();">All (${allThreads.length})</button>
-              <button class="q-btn ${COMMENT_FILTER === 'staged' ? 'q-btn-primary' : ''}" onclick="COMMENT_FILTER='staged'; renderAll();">☁️ Staged for GitHub (${allThreads.filter(t => t.stagedForGithub).length})</button>
+              <button class="q-btn ${COMMENT_FILTER === 'staged' ? 'q-btn-primary' : ''}" onclick="COMMENT_FILTER='staged'; renderAll();">☁️ Staged for GitHub (${allThreads.filter(t => t.stagedForGithub || t.status === 'staged').length})</button>
               <button class="q-btn ${COMMENT_FILTER === 'fix' ? 'q-btn-primary' : ''}" onclick="COMMENT_FILTER='fix'; renderAll();">🔧 Queued for Fix (${allThreads.filter(t => t.selectedForFix).length})</button>
               <button class="q-btn ${COMMENT_FILTER === 'uncertain' ? 'q-btn-primary' : ''}" onclick="COMMENT_FILTER='uncertain'; renderAll();">🤔 Uncertain (${allThreads.filter(t => t.status === 'uncertain').length})</button>
             </div>
@@ -1077,6 +1494,11 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       const instruction = document.getElementById('reviseInstructionInput')?.value?.trim();
       if (!instruction) return;
       closeModal();
+      startOptimisticAgentBanner(
+        'Quasar Revise Comment',
+        `Updating comment ${threadId}`,
+        `Dispatching instruction to Quasar agent: "${instruction.slice(0, 60)}"`
+      );
       showToast('💬 Sending comment revision request to Quasar agent...');
       const res = await apiCall('/api/revise-comment', 'POST', {
         sessionId: STATE.activeSession?.sessionId,
@@ -1087,6 +1509,8 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         showToast('✨ Agent notified to revise this comment!');
         await refreshState(STATE.activeSession?.sessionId);
       } else {
+        OPTIMISTIC_AGENT_JOB = null;
+        renderAgentActivityBanner();
         showToast(res?.error || 'Could not dispatch to agent', true);
       }
     }
@@ -1126,6 +1550,11 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       const question = document.getElementById('askLineInput')?.value?.trim();
       if (!question) return;
       closeModal();
+      startOptimisticAgentBanner(
+        `Quasar Question at ${path}:${line}`,
+        'Analyzing code & drafting inline response',
+        `Investigating "${question.slice(0, 60)}"`
+      );
       showToast('💬 Sending inline question to Quasar agent...');
       const res = await apiCall('/api/ask-line', 'POST', {
         sessionId: STATE.activeSession?.sessionId,
@@ -1137,24 +1566,34 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         showToast('✨ Question posted & dispatched to agent!');
         await refreshState(STATE.activeSession?.sessionId);
       } else {
+        OPTIMISTIC_AGENT_JOB = null;
+        renderAgentActivityBanner();
         showToast(res?.error || 'Failed to post question', true);
       }
     }
 
     async function fixSelectedComments() {
+      startOptimisticAgentBanner(
+        'Quasar Fix Selected Comments',
+        'Applying queued review fixes to codebase',
+        'Preparing fix manifest and dispatching to Quasar agent...'
+      );
       showToast('🔧 Preparing fix manifest and dispatching to Quasar agent...');
       const res = await apiCall('/api/fix-selected', 'POST', {
         sessionId: STATE.activeSession?.sessionId,
       });
       if (res && res.ok) {
         showToast(`🔧 Dispatched ${res.count || ''} comment(s) to agent for fixing!`);
+        await refreshState(STATE.activeSession?.sessionId);
       } else {
+        OPTIMISTIC_AGENT_JOB = null;
+        renderAgentActivityBanner();
         showToast(res?.error || 'Select at least one comment with Queue for Fix first.', true);
       }
     }
 
     function openPublishModal() {
-      const stagedCount = (STATE.activeSession?.threads || []).filter((t) => t.status !== 'dismissed' && t.stagedForGithub).length;
+      const stagedCount = (STATE.activeSession?.threads || []).filter((t) => t.status !== 'dismissed' && (t.stagedForGithub || t.status === 'staged')).length;
       showModal(`
         <div class="text-sm font-bold">☁️ Publish Review to GitHub (${stagedCount} staged comment(s))</div>
         <div class="space-y-2 text-xs">
@@ -1232,7 +1671,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
           <div>
             <label class="block font-semibold mb-1">Local Repository Path (for Local Branch or PR checkout)</label>
             <input id="newReviewRepoInput" type="text" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2"
-                   value="${esc(STATE?.activeSession?.repoDir || '')}" placeholder="/path/to/repo" />
+                   value="${esc(STATE?.activeSession?.repoDir || STATE?.defaultWorkspaceDir || '')}" placeholder="/path/to/repo" />
           </div>
           <div class="grid grid-cols-2 gap-2">
             <div>
@@ -1265,12 +1704,19 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       const effort = document.getElementById('newReviewEffort')?.value || 'medium';
       const commentsOnly = document.getElementById('newReviewMode')?.value === 'comments_only';
       closeModal();
+      startOptimisticAgentBanner(
+        `Quasar Code Review (${prUrl || repoDir || 'Local Branch'})`,
+        'Phase 1/3 • Collecting PR diff & context snapshot',
+        `Starting ${effort}-effort review pipeline and spawning multi-lens subagents...`
+      );
       showToast('🚀 Starting Quasar review...');
       const res = await apiCall('/api/start-review', 'POST', { prUrl, repoDir, effort, commentsOnly });
       if (res && res.ok) {
         showToast('🚀 Review context collected and dispatched to agent!');
         await refreshState();
       } else {
+        OPTIMISTIC_AGENT_JOB = null;
+        renderAgentActivityBanner();
         showToast(res?.error || 'Failed to start review', true);
       }
     }
@@ -1279,11 +1725,19 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       await detectApiBase();
       if (STATE) renderAll();
       await refreshState();
+      let lastPollAt = Date.now();
       setInterval(() => {
-        if (!document.getElementById('modalBackdrop')?.classList.contains('fixed')) {
-          refreshState(STATE?.activeSession?.sessionId);
+        if (STATE?.agentStatus?.active || OPTIMISTIC_AGENT_JOB) {
+          renderAgentActivityBanner();
         }
-      }, 4000);
+        const pollIntervalMs = (STATE?.agentStatus?.active || OPTIMISTIC_AGENT_JOB) ? 2000 : 4000;
+        if (Date.now() - lastPollAt >= pollIntervalMs) {
+          lastPollAt = Date.now();
+          if (!document.getElementById('modalBackdrop')?.classList.contains('fixed')) {
+            refreshState(STATE?.activeSession?.sessionId);
+          }
+        }
+      }, 1000);
     })();
   </script>
 </body>
@@ -1332,6 +1786,21 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
         pathname = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
 
+        if pathname == "/preload.js":
+            preload_candidates = [
+                "/google/src/files/head/depot/google3/third_party/jetski/sidecar_sdk/preload.js",
+                os.path.join(THIS_DIR, "preload.js"),
+            ]
+            p_path = next((p for p in preload_candidates if os.path.isfile(p)), None)
+            content = open(p_path, "r", encoding="utf-8").read() if p_path else "// preload.js fallback\nwindow.sidecar = window.sidecar || {};\n"
+            body = content.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if pathname == "/mermaid-preview.js":
             m_path = find_mermaid_js_path()
             content = open(m_path, "r", encoding="utf-8").read() if m_path else "// mermaid-preview.js not found"
@@ -1345,10 +1814,11 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
 
         if pathname == "/api/state":
             sid = (qs.get("sessionId") or [None])[0]
-            self._send_json(200, build_state_payload(sid))
+            cid = (qs.get("conversationId") or [None])[0]
+            self._send_json(200, build_state_payload(sid, cid))
             return
 
-        if pathname in ("/", "/full", "/index.html", "/ui") or pathname.startswith("/c/") or pathname.startswith("/s/"):
+        if pathname in ("/", "/full", "/index.html", "/ui") or pathname.startswith("/c/") or pathname.startswith("/s/") or pathname.startswith("/_sidecar/"):
             self._send_html(WEB_UI_HTML)
             return
 
@@ -1361,15 +1831,22 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
 
         if pathname == "/api/tutorial":
             try:
+                _, _, default_ws, _ = resolve_conversation_context(data.get("conversationId"))
                 script = os.path.join(SCRIPTS_DIR, "collect_pr_context.py")
+                cmd = [sys.executable, script, "--tutorial"]
+                if default_ws and os.path.isdir(default_ws):
+                    cmd.extend(["--workspace-dir", default_ws])
                 proc = subprocess.run(
-                    [sys.executable, script, "--tutorial"],
+                    cmd,
                     capture_output=True,
                     text=True,
                     timeout=20,
                 )
+                if proc.returncode != 0:
+                    self._send_json(500, {"ok": False, "error": (proc.stderr or proc.stdout or "Failed to generate tutorial").strip()})
+                    return
                 out = json.loads(proc.stdout or "{}")
-                self._send_json(200, {"ok": True, "sessionId": out.get("sessionId") or "quasar-interactive-tutorial"})
+                self._send_json(200, {"ok": True, "sessionId": out.get("sessionId") or out.get("session_id") or "quasar-interactive-tutorial"})
             except Exception as e:
                 self._send_json(500, {"ok": False, "error": str(e)})
             return
@@ -1400,9 +1877,13 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 self._send_json(404, {"ok": False, "error": "Thread not found"})
                 return
 
+            ws_dir = session.get("workspaceDir") or session.get("repoDir")
+            pref_script = os.path.join(SCRIPTS_DIR, "manage_preferences.py")
+            pref_cmd: List[str] = []
             msg = ""
             if act == "toggleStage":
-                target["stagedForGithub"] = not bool(target.get("stagedForGithub"))
+                currently_staged = bool(target.get("stagedForGithub") or target.get("status") == "staged")
+                target["stagedForGithub"] = not currently_staged
                 target["status"] = "staged" if target["stagedForGithub"] else "candidate"
                 msg = "Staged for GitHub review" if target["stagedForGithub"] else "Unstaged from GitHub review"
             elif act == "toggleFix":
@@ -1414,65 +1895,70 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 target["selectedForFix"] = False
                 msg = "Comment dismissed"
             elif act == "editDraft":
-                old_draft = target.get("draftComment") or ""
                 new_draft = str(data.get("draftComment") or "").strip()
                 if new_draft:
                     target["draftComment"] = new_draft
                     if target.get("messages"):
                         target["messages"][0]["body"] = new_draft
-                    try:
-                        from manage_preferences import record_feedback
-
-                        record_feedback(
-                            action="edited_comment",
-                            finding_title=target.get("title") or "",
-                            category=target.get("category") or "general",
-                            before_text=old_draft,
-                            after_text=new_draft,
-                        )
-                    except Exception:
-                        pass
+                    pref_cmd = [
+                        sys.executable,
+                        pref_script,
+                        "--record-feedback",
+                        "--thread-id",
+                        str(tid),
+                        "--action",
+                        "edit_draft",
+                        "--edited-text",
+                        new_draft,
+                    ]
                     msg = "Saved edited draft & recorded phrasing preference"
             elif act == "calibrate":
                 decision = data.get("decision")
                 if decision == "keep_always":
                     target["status"] = "staged"
                     target["stagedForGithub"] = True
+                    cal_act = "calibrate_keep"
                     msg = "Staged & saved preference to always flag similar patterns"
                 elif decision == "dismiss_skip":
                     target["status"] = "dismissed"
                     target["stagedForGithub"] = False
+                    cal_act = "calibrate_skip"
                     msg = "Dismissed & saved preference to skip this pattern in future reviews"
                 else:
                     target["status"] = "staged"
                     target["stagedForGithub"] = True
+                    cal_act = "calibrate_once"
                     msg = "Kept for this review"
-                try:
-                    from manage_preferences import record_feedback
-
-                    record_feedback(
-                        action="calibrated_keep" if decision != "dismiss_skip" else "calibrated_skip",
-                        finding_title=target.get("title") or "",
-                        category=target.get("category") or "general",
-                        rule_text=target.get("calibrationQuestion") or target.get("title") or "",
-                    )
-                except Exception:
-                    pass
+                pref_cmd = [
+                    sys.executable,
+                    pref_script,
+                    "--record-feedback",
+                    "--thread-id",
+                    str(tid),
+                    "--action",
+                    cal_act,
+                ]
             elif act == "rate":
                 rating = data.get("rating")
-                try:
-                    from manage_preferences import record_feedback
-
-                    record_feedback(
-                        action="thumbs_up" if rating == "up" else "thumbs_down",
-                        finding_title=target.get("title") or "",
-                        category=target.get("category") or "general",
-                    )
-                except Exception:
-                    pass
+                pref_cmd = [
+                    sys.executable,
+                    pref_script,
+                    "--record-feedback",
+                    "--thread-id",
+                    str(tid),
+                    "--action",
+                    "upvote" if rating == "up" else "downvote",
+                ]
                 msg = "Recorded positive feedback 👍" if rating == "up" else "Recorded feedback 👎"
 
             save_session_everywhere(session, session_path)
+            if pref_cmd:
+                if ws_dir:
+                    pref_cmd.extend(["--workspace-dir", ws_dir])
+                try:
+                    subprocess.run(pref_cmd, capture_output=True, text=True, timeout=10)
+                except Exception:
+                    pass
             self._send_json(200, {"ok": True, "message": msg})
             return
 
@@ -1494,16 +1980,21 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 f"> {instruction}\n\n"
                 f"Current draft comment:\n```\n{target.get('draftComment') or ''}\n```\n\n"
                 f"Run `python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/answer_comment_question.py "
-                f"--workspace-dir \"{ws_dir or ''}\" --thread-id \"{tid}\" --revise-finding "
-                f"--user-instruction {json.dumps(instruction)} --draft-comment \"<REVISED_COMMENT>\"` "
+                f"--workspace-dir \"{ws_dir or ''}\" --thread-id \"{tid}\" --updated-draft \"<REVISED_COMMENT>\" "
+                f"--answer \"<BRIEF_SUMMARY_OF_CHANGE>\"` "
                 f"(and `--title` / `--suggestion` / `--clear-suggestion` / `--severity` as needed)."
             )
-            res = dispatch_to_agent(prompt, title="Quasar: Revise Comment", conversation_id=session.get("conversationId"), workspace_dir=ws_dir)
-            self._send_json(200, {"ok": True, "dispatch": res})
+            res = dispatch_to_agent(
+                prompt,
+                title="Quasar: Revise Comment",
+                conversation_id=data.get("conversationId") or session.get("conversationId"),
+                workspace_dir=ws_dir,
+            )
+            self._send_json(200 if res.get("ok") else 500, {"ok": bool(res.get("ok")), "error": res.get("error"), "dispatch": res})
             return
 
         if pathname == "/api/ask-line":
-            session, _ = load_target_session(data.get("sessionId"))
+            session, session_path = load_target_session(data.get("sessionId"))
             if not session:
                 self._send_json(404, {"ok": False, "error": "No active session"})
                 return
@@ -1511,34 +2002,34 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
             line = int(data.get("line") or 1)
             question = (data.get("question") or "").strip()
             ws_dir = session.get("workspaceDir") or session.get("repoDir")
-            script = os.path.join(SCRIPTS_DIR, "answer_comment_question.py")
-            cmd = [
-                sys.executable,
-                script,
-                "--create-question",
-                "--path",
-                rel_path,
-                "--line",
-                str(line),
-                "--question",
-                question,
-            ]
-            if ws_dir:
-                cmd.extend(["--workspace-dir", ws_dir])
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            created = {}
-            try:
-                created = json.loads(proc.stdout or "{}")
-            except Exception:
-                pass
-            tid = created.get("threadId") or ""
+            threads = session.setdefault("threads", [])
+            tid = f"user-q-{len(threads) + 1}"
+            threads.append({
+                "id": tid,
+                "kind": "user_question",
+                "path": rel_path,
+                "startLine": line,
+                "endLine": line,
+                "severity": "nit",
+                "status": "candidate",
+                "title": f"Question on {os.path.basename(rel_path)}:{line}",
+                "draftComment": question,
+                "messages": [{"author": "You", "body": question}],
+            })
+            save_session_everywhere(session, session_path)
             prompt = (
                 f"Using the `quasar` skill, answer my inline question on `{rel_path}:{line}` (thread ID: `{tid}`):\n\n"
                 f"> {question}\n\n"
-                f"Post the answer back into the thread using `answer_comment_question.py --workspace-dir \"{ws_dir or ''}\" --thread-id \"{tid}\" --answer \"...\"`."
+                f"Post the answer back into the thread using `python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/answer_comment_question.py "
+                f"--workspace-dir \"{ws_dir or ''}\" --thread-id \"{tid}\" --answer \"...\"`."
             )
-            res = dispatch_to_agent(prompt, title=f"Quasar Q&A: {os.path.basename(rel_path)}:{line}", conversation_id=session.get("conversationId"), workspace_dir=ws_dir)
-            self._send_json(200, {"ok": True, "threadId": tid, "dispatch": res})
+            res = dispatch_to_agent(
+                prompt,
+                title=f"Quasar Q&A: {os.path.basename(rel_path)}:{line}",
+                conversation_id=data.get("conversationId") or session.get("conversationId"),
+                workspace_dir=ws_dir,
+            )
+            self._send_json(200 if res.get("ok") else 500, {"ok": bool(res.get("ok")), "error": res.get("error"), "threadId": tid, "dispatch": res})
             return
 
         if pathname == "/api/fix-selected":
@@ -1548,7 +2039,7 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 return
             ws_dir = session.get("workspaceDir") or session.get("repoDir")
             script = os.path.join(SCRIPTS_DIR, "manage_fixes.py")
-            cmd = [sys.executable, script, "--prepare-fix-request"]
+            cmd = [sys.executable, script, "--prepare-fix"]
             if ws_dir:
                 cmd.extend(["--workspace-dir", ws_dir])
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
@@ -1557,12 +2048,27 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 prep = json.loads(proc.stdout or "{}")
             except Exception:
                 pass
-            if not prep.get("selectedCount"):
+            count = prep.get("count") or prep.get("selectedCount") or 0
+            if not count:
                 self._send_json(400, {"ok": False, "error": "No comments are currently queued for fix. Click 'Queue for Fix' on one or more comments first."})
                 return
-            prompt = prep.get("agentPrompt") or f"Using the `quasar` skill, fix the {prep.get('selectedCount')} selected review comments in `{prep.get('fixRequestPath')}`."
-            res = dispatch_to_agent(prompt, title="Quasar: Fix Selected Comments", conversation_id=session.get("conversationId"), workspace_dir=ws_dir)
-            self._send_json(200, {"ok": True, "count": prep.get("selectedCount"), "dispatch": res})
+            prompt_path = prep.get("promptPath") or prep.get("fixRequestPath") or ""
+            prompt = ""
+            if prompt_path and os.path.isfile(prompt_path):
+                try:
+                    with open(prompt_path, "r", encoding="utf-8") as f:
+                        prompt = f.read().strip()
+                except Exception:
+                    pass
+            if not prompt:
+                prompt = f"Using the `quasar` skill, fix the {count} selected review comments in `{prompt_path}`."
+            res = dispatch_to_agent(
+                prompt,
+                title="Quasar: Fix Selected Comments",
+                conversation_id=data.get("conversationId") or session.get("conversationId"),
+                workspace_dir=ws_dir,
+            )
+            self._send_json(200 if res.get("ok") else 500, {"ok": bool(res.get("ok")), "error": res.get("error"), "count": count, "dispatch": res})
             return
 
         if pathname == "/api/publish-github":
@@ -1573,10 +2079,10 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
             event = data.get("event") or "COMMENT"
             body = data.get("body") or ""
             ws_dir = session.get("workspaceDir") or session.get("repoDir")
-            script = os.path.join(SCRIPTS_DIR, "export_github_review.py")
-            cmd = [sys.executable, script, "--event", event]
+            script = os.path.join(SCRIPTS_DIR, "post_pending_review.py")
+            cmd = [sys.executable, script, "--from-session", "--event", event]
             if body:
-                cmd.extend(["--body", body])
+                cmd.extend(["--summary-body", body])
             if ws_dir:
                 cmd.extend(["--workspace-dir", ws_dir])
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -1585,7 +2091,7 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 out = json.loads(proc.stdout or "{}")
             except Exception:
                 pass
-            if proc.returncode == 0 and out.get("status") in ("submitted", "pending_created", "exported"):
+            if proc.returncode == 0 and (out.get("ok") or out.get("status") in ("submitted", "pending_created", "exported")):
                 self._send_json(200, {"ok": True, "result": out})
             else:
                 self._send_json(400, {"ok": False, "error": out.get("error") or proc.stderr or proc.stdout or "Failed to publish review"})
@@ -1619,8 +2125,9 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
             return
 
         if pathname == "/api/start-review":
+            conv_id, _, default_ws, _ = resolve_conversation_context(data.get("conversationId"))
             pr_url = (data.get("prUrl") or "").strip()
-            repo_dir = (data.get("repoDir") or os.getcwd()).strip()
+            repo_dir = (data.get("repoDir") or default_ws or os.getcwd()).strip()
             effort = (data.get("effort") or "medium").strip()
             comments_only = bool(data.get("commentsOnly", False))
             mode_str = " (comments only)" if comments_only else ""
@@ -1628,8 +2135,13 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 prompt = f"Review {pr_url} on {effort} effort{mode_str}"
             else:
                 prompt = f"Review local branch in {repo_dir} on {effort} effort{mode_str}"
-            res = dispatch_to_agent(prompt, title="Quasar Code Review", workspace_dir=repo_dir)
-            self._send_json(200, {"ok": True, "dispatch": res})
+            res = dispatch_to_agent(
+                prompt,
+                title="Quasar Code Review",
+                conversation_id=conv_id,
+                workspace_dir=repo_dir,
+            )
+            self._send_json(200 if res.get("ok") else 500, {"ok": bool(res.get("ok")), "error": res.get("error"), "dispatch": res})
             return
 
         self._send_json(404, {"ok": False, "error": "Unknown endpoint"})

@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 REVIEW_STATE_DIR = os.path.expanduser("~/.gemini/quasar")
 WORKSPACES_STATE_DIR = os.path.join(REVIEW_STATE_DIR, "workspaces")
+SNAPSHOTS_DIR = os.path.join(REVIEW_STATE_DIR, "snapshots")
 HISTORY_STATE_DIR = os.path.join(REVIEW_STATE_DIR, "history")
 GITHUB_AUTH_PATH = os.path.join(REVIEW_STATE_DIR, "github_auth.json")
 
