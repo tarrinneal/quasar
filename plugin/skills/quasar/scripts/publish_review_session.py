@@ -490,15 +490,19 @@ def main() -> None:
             merged["windowId"] = win_id
         if win_pid:
             merged["windowPid"] = win_pid
-    for cand_path in (args.input, args.artifact_out, merged.get("scratchDir")):
-        if cand_path:
-            m_conv = re.search(
-                r"/brain/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:/|$)",
-                os.path.abspath(str(cand_path)),
-            )
-            if m_conv:
-                merged["conversationId"] = m_conv.group(1)
-                break
+    env_conv_id = (os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or "").strip()
+    if env_conv_id:
+        merged["conversationId"] = env_conv_id
+    else:
+        for cand_path in (args.input, args.artifact_out, merged.get("scratchDir")):
+            if cand_path:
+                m_conv = re.search(
+                    r"/brain/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:/|$)",
+                    os.path.abspath(str(cand_path)),
+                )
+                if m_conv:
+                    merged["conversationId"] = m_conv.group(1)
+                    break
     md_content = render_cliffs_notes_markdown(merged)
     with open(active_session_path, "w", encoding="utf-8") as f:
         json.dump(merged, f, indent=2)

@@ -3127,12 +3127,16 @@ def main() -> None:
         session["windowId"] = win_id
     if win_pid:
         session["windowPid"] = win_pid
-    m_conv = re.search(
-        r"/brain/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:/|$)",
-        os.path.abspath(str(out_dir)),
-    )
-    if m_conv:
-        session["conversationId"] = m_conv.group(1)
+    env_conv_id = (os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or "").strip()
+    if env_conv_id:
+        session["conversationId"] = env_conv_id
+    else:
+        m_conv = re.search(
+            r"/brain/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:/|$)",
+            os.path.abspath(str(out_dir)),
+        )
+        if m_conv:
+            session["conversationId"] = m_conv.group(1)
     if comments_only:
         session["cliffsNotes"] = {
             "tldr": "Comments-Only Review — Study guide skipped; see Review Comments & Cart to stage comments for GitHub or queue them for Agent fixes.",

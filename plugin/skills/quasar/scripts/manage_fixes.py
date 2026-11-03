@@ -225,8 +225,11 @@ def main() -> None:
                     t["selectedForFix"] = True
                 elif args.selected == "false":
                     t["selectedForFix"] = False
+                    t.pop("fixStatus", None)
                 else:
                     t["selectedForFix"] = not bool(t.get("selectedForFix", False))
+                    if not t["selectedForFix"]:
+                        t.pop("fixStatus", None)
                 updated.append({"id": t.get("id"), "selectedForFix": t["selectedForFix"]})
         save_session(session, active_session_path, cliffs_notes_md_path)
         selected_count = sum(1 for t in threads if t.get("selectedForFix") and t.get("status") != "fixed")

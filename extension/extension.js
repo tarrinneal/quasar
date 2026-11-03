@@ -3,6 +3,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
+const http = require('node:http');
+const { pathToFileURL } = require('node:url');
 const { execFile, execFileSync } = require('node:child_process');
 
 const REVIEW_STATE_DIR = path.join(os.homedir(), '.gemini', 'quasar');
@@ -673,6 +675,186 @@ function isConversationBlockedOrUndeliverable(convId) {
 }
 
 /**
+ * Calls a Connect-RPC JSON method on the running Antigravity `language_server` over HTTP.
+ */
+function callAntigravityLsRpc(methodName, bodyObj, env, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    const lsAddr = env && env.ANTIGRAVITY_LS_ADDRESS;
+    const csrfToken = env && env.ANTIGRAVITY_CSRF_TOKEN;
+    if (!lsAddr || !csrfToken) {
+      reject(new Error('ANTIGRAVITY_LS_ADDRESS or ANTIGRAVITY_CSRF_TOKEN is unavailable'));
+      return;
+    }
+    const [hostPart, portPart] = String(lsAddr).split(':');
+    const hostname = hostPart || 'localhost';
+    const port = Number(portPart);
+    if (!port) {
+      reject(new Error(`Invalid ANTIGRAVITY_LS_ADDRESS: ${lsAddr}`));
+      return;
+    }
+    const payload = JSON.stringify(bodyObj || {});
+    const req = http.request(
+      {
+        hostname,
+        port,
+        path: `/exa.language_server_pb.LanguageServerService/${methodName}`,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Connect-Protocol-Version': '1',
+          'x-codeium-csrf-token': csrfToken,
+          'Content-Length': Buffer.byteLength(payload, 'utf8'),
+        },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf8').trim();
+          let parsed = {};
+          if (raw) {
+            try {
+              parsed = JSON.parse(raw);
+            } catch (_) {
+              parsed = { raw };
+            }
+          }
+          if (res.statusCode >= 400 || (parsed && parsed.code && parsed.message)) {
+            reject(
+              new Error(
+                (parsed && parsed.message) ||
+                  (parsed && parsed.error) ||
+                  raw ||
+                  `HTTP ${res.statusCode}`
+              )
+            );
+            return;
+          }
+          resolve(parsed);
+        });
+      }
+    );
+    req.on('timeout', () => {
+      req.destroy(new Error(`LanguageServer RPC ${methodName} timed out`));
+    });
+    req.on('error', (err) => reject(err));
+    req.write(payload);
+    req.end();
+  });
+}
+
+/**
+ * Starts a new Antigravity conversation directly via the LanguageServer Connect-RPC HTTP API
+ * using `workspaceUris` instead of `projectEnvConfig`. This avoids the `agentapi new-conversation`
+ * CLI bug where an empty `ANTIGRAVITY_PROJECT_ID` sends `project_env_config: { project_id: "" }`
+ * and fails with `project_id is required when providing project_env_config`.
+ */
+async function startNewCascadeViaLsHttp(prompt, title, effectiveWsRoot, effortLevel, env) {
+  let requestedModel = 'MODEL_PLACEHOLDER_M260';
+  try {
+    const modelData = await callAntigravityLsRpc('GetCascadeModelConfigData', {}, env, 6000);
+    const defaultModel =
+      modelData &&
+      modelData.defaultOverrideModelConfig &&
+      modelData.defaultOverrideModelConfig.modelOrAlias &&
+      modelData.defaultOverrideModelConfig.modelOrAlias.model;
+    if (defaultModel) {
+      requestedModel = defaultModel;
+    }
+    const configs = Array.isArray(modelData && modelData.clientModelConfigs)
+      ? modelData.clientModelConfigs
+      : [];
+    if (effortLevel === 'low') {
+      const flashCfg =
+        configs.find((c) => {
+          const id = String((c && c.modelId) || (c && c.label) || '').toLowerCase();
+          return id.includes('flash') && !id.includes('lite');
+        }) ||
+        configs.find((c) =>
+          String((c && c.modelId) || (c && c.label) || '')
+            .toLowerCase()
+            .includes('flash')
+        );
+      if (flashCfg && flashCfg.modelOrAlias && flashCfg.modelOrAlias.model) {
+        requestedModel = flashCfg.modelOrAlias.model;
+      }
+    } else if (!defaultModel) {
+      const recCfg = configs.find((c) => c && c.isRecommended && c.modelOrAlias && c.modelOrAlias.model);
+      if (recCfg) {
+        requestedModel = recCfg.modelOrAlias.model;
+      }
+    }
+  } catch (_) {}
+
+  const workspaceUris = [];
+  if (
+    effectiveWsRoot &&
+    typeof effectiveWsRoot === 'string' &&
+    !effectiveWsRoot.startsWith(REVIEW_STATE_DIR) &&
+    fs.existsSync(effectiveWsRoot)
+  ) {
+    try {
+      workspaceUris.push(pathToFileURL(resolveWorkspaceRootSync(effectiveWsRoot)).href.replace(/\/$/, ''));
+    } catch (_) {}
+  }
+
+  const startReq = {
+    baseTrajectoryIdentifier: { lastActiveDoc: true },
+    source: 'CORTEX_TRAJECTORY_SOURCE_AGENT_API',
+    trajectoryType: 'CORTEX_TRAJECTORY_TYPE_CASCADE',
+  };
+  if (workspaceUris.length > 0) {
+    startReq.workspaceUris = workspaceUris;
+  }
+
+  const startRes = await callAntigravityLsRpc('StartCascade', startReq, env, 10000);
+  const cascadeId = startRes && startRes.cascadeId ? String(startRes.cascadeId).trim() : '';
+  if (!cascadeId) {
+    throw new Error('StartCascade did not return a cascadeId');
+  }
+
+  if (title) {
+    try {
+      await callAntigravityLsRpc(
+        'UpdateConversationAnnotations',
+        {
+          cascadeId,
+          cascadeIds: [cascadeId],
+          annotations: { title: String(title) },
+          mergeAnnotations: true,
+        },
+        env,
+        5000
+      );
+    } catch (_) {}
+  }
+
+  await callAntigravityLsRpc(
+    'SendUserCascadeMessage',
+    {
+      cascadeId,
+      items: [{ text: String(prompt) }],
+      cascadeConfig: {
+        plannerConfig: {
+          conversational: {},
+          requestedModel: { model: requestedModel },
+        },
+      },
+      blocking: false,
+    },
+    env,
+    12000
+  );
+
+  return {
+    success: true,
+    stdout: JSON.stringify({ conversationId: cascadeId }),
+    conversationId: cascadeId,
+  };
+}
+
+/**
  * Finds the most recent active Antigravity root conversation ID belonging to the target workspace
  * (or THIS window's workspace), preferring the conversation ID recorded on the active Quasar session
  * as long as it is not blocked on a pending tool call or stuck with undelivered messages.
@@ -685,76 +867,16 @@ function detectActiveConversationId(targetWorkspaceRoot = null, env = null, pref
     if (!isConversationBlockedOrUndeliverable(resolvedSessConvId)) {
       return resolvedSessConvId;
     }
-  }
-
-  let wsRoot = targetWorkspaceRoot ? resolveWorkspaceRootSync(targetWorkspaceRoot) : null;
-  if (!wsRoot || wsRoot.startsWith(REVIEW_STATE_DIR)) {
-    wsRoot = getWindowWorkspaceRoot();
-  }
-  if (!wsRoot || wsRoot.startsWith(REVIEW_STATE_DIR)) {
-    if (sess && (sess.repoDir || sess.workspaceDir)) {
-      wsRoot = resolveWorkspaceRootSync(sess.repoDir || sess.workspaceDir);
+    // Session conversation is blocked or has undelivered messages: clean up its stuck queue
+    // and clear the stale conversationId from active_session.json so future calls start fresh.
+    clearUndeliveredMessages(resolvedSessConvId);
+    if (sess && sess.conversationId === sessConvId) {
+      try {
+        delete sess.conversationId;
+        saveActiveSession(sess);
+      } catch (_) {}
     }
   }
-
-  const geminiRoot = path.join(os.homedir(), '.gemini');
-  const brainDirs = [];
-  if (fs.existsSync(geminiRoot)) {
-    try {
-      for (const entry of fs.readdirSync(geminiRoot, { withFileTypes: true })) {
-        if (!entry.isDirectory()) continue;
-        const bCand = path.join(geminiRoot, entry.name, 'brain');
-        if (fs.existsSync(bCand)) brainDirs.push(bCand);
-      }
-    } catch (_) {}
-  }
-
-  const candidates = [];
-  for (const brainDir of brainDirs) {
-    try {
-      const entries = fs.readdirSync(brainDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (!entry.isDirectory()) continue;
-        const tPath = path.join(brainDir, entry.name, '.system_generated', 'logs', 'transcript.jsonl');
-        if (!fs.existsSync(tPath)) continue;
-        const stat = fs.statSync(tPath);
-        candidates.push({ id: entry.name, tPath, mtimeMs: stat.mtimeMs });
-      }
-    } catch (_) {}
-  }
-
-  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-  const inspected = [];
-  for (const cand of candidates.slice(0, 25)) {
-    try {
-      const fd = fs.openSync(cand.tPath, 'r');
-      const buf = Buffer.alloc(32768);
-      const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
-      fs.closeSync(fd);
-      const headText = buf.slice(0, bytesRead).toString('utf8');
-      const isRootUserConv = headText.includes('<ADDITIONAL_METADATA>');
-      const matchesWs = Boolean(
-        wsRoot &&
-          !wsRoot.startsWith(REVIEW_STATE_DIR) &&
-          (headText.includes(`${wsRoot}/`) || headText.includes(`${wsRoot}"`) || headText.includes(`${wsRoot}\n`))
-      );
-      inspected.push({ ...cand, isRootUserConv, matchesWs });
-    } catch (_) {}
-  }
-
-  // 1. Prefer an unblocked root user conversation matching the target workspace root
-  for (const c of inspected.filter((x) => x.matchesWs && x.isRootUserConv)) {
-    const resolved = resolveRootConversationId(c.id, env);
-    if (!isConversationBlockedOrUndeliverable(resolved)) return resolved;
-  }
-
-  // 2. Otherwise any unblocked conversation matching the target workspace root
-  for (const c of inspected.filter((x) => x.matchesWs)) {
-    const resolved = resolveRootConversationId(c.id, env);
-    if (!isConversationBlockedOrUndeliverable(resolved)) return resolved;
-  }
-
   return null;
 }
 
@@ -771,7 +893,8 @@ function sendPromptToQuasar(prompt, title = 'Quasar', targetWorkspaceRoot = null
       ...getQuasarScriptEnv(),
       ...lsEnv,
     };
-    const convId = detectActiveConversationId(effectiveWsRoot, env, sess);
+    const forceNew = Boolean(options && options.forceNewConversation);
+    const convId = forceNew ? null : detectActiveConversationId(effectiveWsRoot, env, sess);
     const effortLevel = normalizeEffortLevel(
       (options && options.effortLevel) || (sess && sess.effortLevel) || getDefaultEffortLevel()
     );
@@ -824,12 +947,41 @@ function sendPromptToQuasar(prompt, title = 'Quasar', targetWorkspaceRoot = null
     };
 
     const startNewConversation = () => {
+      const tryDirectHttpFallback = (fallbackErr) => {
+        startNewCascadeViaLsHttp(prompt, title, effectiveWsRoot, effortLevel, env)
+          .then((httpRes) => {
+            if (httpRes && httpRes.conversationId) {
+              persistNewConvId(httpRes.conversationId);
+            }
+            resolve(httpRes);
+          })
+          .catch((httpErr) => {
+            resolve({
+              success: false,
+              error:
+                (httpErr && httpErr.message) ||
+                (fallbackErr && fallbackErr.error) ||
+                'agentapi failed',
+            });
+          });
+      };
+
+      // When ANTIGRAVITY_PROJECT_ID is not set (standard IDE workspace mode),
+      // `agentapi new-conversation` always fails with `project_id is required when providing project_env_config`.
+      // Use the direct Connect-RPC StartCascade + SendUserCascadeMessage flow with workspaceUris.
+      if (!env.ANTIGRAVITY_PROJECT_ID) {
+        tryDirectHttpFallback(null);
+        return;
+      }
+
       runAgentApi(newConvArgs, (newRes) => {
         if (newRes.success) {
           const newCid = persistNewConvId(newRes.stdout);
           if (newCid) newRes.conversationId = newCid;
+          resolve(newRes);
+          return;
         }
-        resolve(newRes);
+        tryDirectHttpFallback(newRes);
       });
     };
 
@@ -2693,13 +2845,16 @@ function activate(context) {
         });
       }
 
-      const isQueuedForFix = t.status !== 'fixed' && Boolean(t.selectedForFix);
+      const isFixInProgress = t.status !== 'fixed' && t.fixStatus === 'in_progress';
+      const isQueuedForFix = t.status !== 'fixed' && (Boolean(t.selectedForFix) || isFixInProgress);
       const fixStateTag =
         t.status === 'fixed' ? 'fix_done' : isQueuedForFix ? 'fix_queued' : 'fix_unqueued';
       const cmdArg = encodeURIComponent(JSON.stringify({ threadId: t.id }));
       const fixActionBarMd =
         t.status === 'fixed'
           ? `\n\n---\n✅ **Fixed in Working Tree**${t.fixedSummary ? ` — ${t.fixedSummary}` : ''}`
+          : isFixInProgress
+          ? `\n\n---\n⏳ **🔧 Agent Fix in Progress...**  •  [$(debug-restart) Retry Fix Now](command:quasar.fixSingleComment?${cmdArg})  •  [$(close) Remove from Fix Queue](command:quasar.unqueueForFix?${cmdArg})`
           : isQueuedForFix
           ? `\n\n---\n✅ **🔧 Queued for Agent Fix**  •  [$(close) Remove from Fix Queue](command:quasar.unqueueForFix?${cmdArg})  •  [$(wrench) Fix Now](command:quasar.fixSingleComment?${cmdArg})`
           : `\n\n---\n[$(tools) Queue for Agent Fix](command:quasar.queueForFix?${cmdArg})  •  [$(wrench) Fix Now](command:quasar.fixSingleComment?${cmdArg})`;
@@ -2726,7 +2881,11 @@ function activate(context) {
       thread.relPath = t.path;
       thread.canReply = true;
 
-      const queuedSuffix = isQueuedForFix ? ' [🔧 QUEUED FOR FIX ✓]' : '';
+      const queuedSuffix = isFixInProgress
+        ? ' [🔧 FIXING...]'
+        : isQueuedForFix
+        ? ' [🔧 QUEUED FOR FIX ✓]'
+        : '';
 
       if (t.status === 'fixed') {
         thread.contextValue = `fixed:${fixStateTag}`;
@@ -6962,7 +7121,8 @@ function activate(context) {
       const dispatchRes = await sendPromptToQuasar(
         res.agentPrompt,
         `Quasar Fix (${targetIds.length} comment${targetIds.length === 1 ? '' : 's'})`,
-        res.repoDir || session.repoDir || null
+        res.repoDir || session.repoDir || null,
+        { forceNewConversation: true }
       );
 
       const prefNote =
@@ -6978,6 +7138,16 @@ function activate(context) {
           )}${prefNote}!`
         );
       } else {
+        const latestSess = loadActiveSession();
+        if (latestSess && Array.isArray(latestSess.threads)) {
+          for (const t of latestSess.threads) {
+            if (targetIds.includes(String(t.id)) && t.fixStatus === 'in_progress') {
+              delete t.fixStatus;
+            }
+          }
+          saveActiveSession(latestSess);
+          refreshAllUI(false);
+        }
         await vscode.env.clipboard.writeText(res.agentPrompt);
         vscode.window.showWarningMessage(
           `Could not auto-dispatch via agentapi (${

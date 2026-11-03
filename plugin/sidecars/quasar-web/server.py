@@ -314,6 +314,112 @@ def dispatch_to_agent(
         except Exception:
             pass
 
+    def _start_cascade_via_ls_http() -> Dict[str, Any]:
+        ls_addr = (env.get("ANTIGRAVITY_LS_ADDRESS") or "").strip()
+        csrf_token = (env.get("ANTIGRAVITY_CSRF_TOKEN") or "").strip()
+        if not ls_addr or not csrf_token:
+            raise RuntimeError("ANTIGRAVITY_LS_ADDRESS or ANTIGRAVITY_CSRF_TOKEN is unavailable")
+
+        def _call_ls_rpc(method: str, body_obj: Dict[str, Any], timeout_s: float = 10.0) -> Dict[str, Any]:
+            url = f"http://{ls_addr}/exa.language_server_pb.LanguageServerService/{method}"
+            data_bytes = json.dumps(body_obj).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=data_bytes,
+                headers={
+                    "Content-Type": "application/json",
+                    "Connect-Protocol-Version": "1",
+                    "x-codeium-csrf-token": csrf_token,
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                raw = resp.read().decode("utf-8", errors="replace").strip()
+                parsed = json.loads(raw) if raw else {}
+                if isinstance(parsed, dict) and parsed.get("code") and parsed.get("message"):
+                    raise RuntimeError(str(parsed.get("message")))
+                return parsed if isinstance(parsed, dict) else {}
+
+        requested_model = "MODEL_PLACEHOLDER_M260"
+        try:
+            model_data = _call_ls_rpc("GetCascadeModelConfigData", {}, 6.0)
+            def_m = (
+                ((model_data.get("defaultOverrideModelConfig") or {}).get("modelOrAlias") or {}).get("model")
+            )
+            if def_m:
+                requested_model = str(def_m)
+            else:
+                for cfg in model_data.get("clientModelConfigs") or []:
+                    if isinstance(cfg, dict) and cfg.get("isRecommended"):
+                        m = ((cfg.get("modelOrAlias") or {}).get("model") or "").strip()
+                        if m:
+                            requested_model = m
+                            break
+        except Exception:
+            pass
+
+        start_req: Dict[str, Any] = {
+            "baseTrajectoryIdentifier": {"lastActiveDoc": True},
+            "source": "CORTEX_TRAJECTORY_SOURCE_AGENT_API",
+            "trajectoryType": "CORTEX_TRAJECTORY_TYPE_CASCADE",
+        }
+        if resolved_ws and os.path.isdir(resolved_ws):
+            ws_uri = "file://" + urllib.parse.quote(os.path.realpath(resolved_ws))
+            start_req["workspaceUris"] = [ws_uri]
+
+        start_res = _call_ls_rpc("StartCascade", start_req, 10.0)
+        new_cid = str(start_res.get("cascadeId") or "").strip()
+        if not new_cid:
+            raise RuntimeError("StartCascade did not return a cascadeId")
+
+        if title:
+            try:
+                _call_ls_rpc(
+                    "UpdateConversationAnnotations",
+                    {
+                        "cascadeId": new_cid,
+                        "cascadeIds": [new_cid],
+                        "annotations": {"title": str(title)},
+                        "mergeAnnotations": True,
+                    },
+                    5.0,
+                )
+            except Exception:
+                pass
+
+        _call_ls_rpc(
+            "SendUserCascadeMessage",
+            {
+                "cascadeId": new_cid,
+                "items": [{"text": str(prompt)}],
+                "cascadeConfig": {
+                    "plannerConfig": {
+                        "conversational": {},
+                        "requestedModel": {"model": requested_model},
+                    }
+                },
+                "blocking": False,
+            },
+            12.0,
+        )
+        _record_active(new_cid, "new-conversation")
+        return {
+            "ok": True,
+            "mode": "new-conversation",
+            "conversationId": new_cid,
+            "projectId": project_id,
+            "workspaceDir": resolved_ws,
+            "stdout": json.dumps({"conversationId": new_cid}),
+        }
+
+    if not project_id:
+        try:
+            return _start_cascade_via_ls_http()
+        except Exception as http_err:
+            last_http_err = str(http_err)
+    else:
+        last_http_err = ""
+
     try:
         proc = subprocess.run(
             cmd_prefix + ["new-conversation", f"--title={title}", prompt],
@@ -335,9 +441,18 @@ def dispatch_to_agent(
                 "workspaceDir": resolved_ws,
                 "stdout": out_str,
             }
-        return {"ok": False, "error": (proc.stderr or proc.stdout or "agentapi failed").strip(), "prompt": prompt}
+        if project_id:
+            try:
+                return _start_cascade_via_ls_http()
+            except Exception:
+                pass
+        return {
+            "ok": False,
+            "error": (proc.stderr or proc.stdout or last_http_err or "agentapi failed").strip(),
+            "prompt": prompt,
+        }
     except Exception as e:
-        return {"ok": False, "error": str(e), "prompt": prompt}
+        return {"ok": False, "error": last_http_err or str(e), "prompt": prompt}
 
 
 def get_live_agent_status(session: Optional[Dict[str, Any]], all_sessions: List[Dict[str, Any]]) -> Dict[str, Any]:
