@@ -233,6 +233,18 @@
         "icon": "$(tools)"
       },
       {
+        "command": "quasar.queueForFix",
+        "title": "Queue Comment for Agent Fix",
+        "category": "Quasar",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "quasar.unqueueForFix",
+        "title": "✓ Queued for Agent Fix (Click to Remove from Queue)",
+        "category": "Quasar",
+        "icon": "$(pass-filled)"
+      },
+      {
         "command": "quasar.fixSingleComment",
         "title": "Fix This Issue with Quasar Now...",
         "category": "Quasar",
@@ -482,8 +494,13 @@
           "group": "inline@0_change"
         },
         {
-          "command": "quasar.toggleSelectForFix",
-          "when": "commentController == quasar && commentThread =~ /candidate|uncertain|staged|qa|existing/",
+          "command": "quasar.queueForFix",
+          "when": "commentController == quasar && commentThread =~ /candidate|uncertain|staged|qa|existing/ && commentThread =~ /fix_unqueued/",
+          "group": "inline@0_queue"
+        },
+        {
+          "command": "quasar.unqueueForFix",
+          "when": "commentController == quasar && commentThread =~ /candidate|uncertain|staged|qa|existing/ && commentThread =~ /fix_queued/",
           "group": "inline@0_queue"
         },
         {
@@ -528,6 +545,16 @@
         }
       ],
       "comments/comment/title": [
+        {
+          "command": "quasar.queueForFix",
+          "when": "commentController == quasar && comment =~ /fix_unqueued/",
+          "group": "inline@0_queue"
+        },
+        {
+          "command": "quasar.unqueueForFix",
+          "when": "commentController == quasar && comment =~ /fix_queued/",
+          "group": "inline@0_queue"
+        },
         {
           "command": "quasar.commentOnComment",
           "when": "commentController == quasar",

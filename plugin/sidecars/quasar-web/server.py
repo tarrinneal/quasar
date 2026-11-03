@@ -224,7 +224,72 @@ def dispatch_to_agent(
             "completedAt": None,
         })
 
-    if conv_id:
+    def _is_conv_deliverable(cid_check: Optional[str]) -> bool:
+        if not cid_check:
+            return False
+        brain_base = os.path.expanduser("~/.gemini/jetski/brain")
+        c_dir = os.path.join(brain_base, cid_check)
+        if not os.path.isdir(c_dir):
+            return True
+        undeliv_dir = os.path.join(c_dir, ".system_generated", "messages", "undelivered")
+        if os.path.isdir(undeliv_dir):
+            try:
+                if [n for n in os.listdir(undeliv_dir) if not n.startswith(".")]:
+                    return False
+            except Exception:
+                pass
+        t_path = os.path.join(c_dir, ".system_generated", "logs", "transcript.jsonl")
+        if os.path.isfile(t_path):
+            try:
+                with open(t_path, "r", encoding="utf-8", errors="replace") as tf:
+                    tail_lines = tf.readlines()[-20:]
+                parsed_steps = []
+                for ln in tail_lines:
+                    ln = ln.strip()
+                    if ln.startswith("{") and ln.endswith("}"):
+                        try:
+                            parsed_steps.append(json.loads(ln))
+                        except Exception:
+                            pass
+                for idx in range(len(parsed_steps) - 1, -1, -1):
+                    if parsed_steps[idx].get("type") == "PLANNER_RESPONSE":
+                        tcs = parsed_steps[idx].get("tool_calls") or []
+                        if tcs:
+                            gen_after = sum(
+                                1 for s in parsed_steps[idx + 1 :] if s.get("type") == "GENERIC"
+                            )
+                            if gen_after < len(tcs):
+                                return False
+                        break
+            except Exception:
+                pass
+        return True
+
+    def _clear_undelivered(cid_clean: Optional[str]) -> None:
+        if not cid_clean:
+            return
+        c_dir = os.path.join(os.path.expanduser("~/.gemini/jetski/brain"), cid_clean)
+        undeliv_dir = os.path.join(c_dir, ".system_generated", "messages", "undelivered")
+        msg_dir = os.path.join(c_dir, ".system_generated", "messages")
+        if os.path.isdir(undeliv_dir):
+            try:
+                for fn in os.listdir(undeliv_dir):
+                    if fn.startswith("."):
+                        continue
+                    try:
+                        os.unlink(os.path.join(undeliv_dir, fn))
+                    except Exception:
+                        pass
+                    meta_json = os.path.join(msg_dir, f"{fn}.json")
+                    if os.path.isfile(meta_json):
+                        try:
+                            os.unlink(meta_json)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+    if conv_id and _is_conv_deliverable(conv_id):
         try:
             proc = subprocess.run(
                 cmd_prefix + ["send-message", f"--title={title}", conv_id, prompt],
@@ -234,15 +299,18 @@ def dispatch_to_agent(
                 timeout=12,
             )
             if proc.returncode == 0 and '"error"' not in (proc.stdout or "").lower():
-                _record_active(conv_id, "send-message")
-                return {
-                    "ok": True,
-                    "mode": "send-message",
-                    "conversationId": conv_id,
-                    "projectId": project_id,
-                    "workspaceDir": resolved_ws,
-                    "stdout": proc.stdout.strip(),
-                }
+                time.sleep(1.2)
+                if _is_conv_deliverable(conv_id):
+                    _record_active(conv_id, "send-message")
+                    return {
+                        "ok": True,
+                        "mode": "send-message",
+                        "conversationId": conv_id,
+                        "projectId": project_id,
+                        "workspaceDir": resolved_ws,
+                        "stdout": proc.stdout.strip(),
+                    }
+                _clear_undelivered(conv_id)
         except Exception:
             pass
 

@@ -569,15 +569,122 @@ function extractSessionConversationId(sess) {
   return null;
 }
 
+function findConversationBrainDir(convId) {
+  if (!convId || typeof convId !== 'string') return null;
+  const geminiRoot = path.join(os.homedir(), '.gemini');
+  if (!fs.existsSync(geminiRoot)) return null;
+  try {
+    for (const entry of fs.readdirSync(geminiRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const cand = path.join(geminiRoot, entry.name, 'brain', convId);
+      if (fs.existsSync(cand)) return cand;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function getUndeliveredMessageFiles(convId) {
+  const convDir = findConversationBrainDir(convId);
+  if (!convDir) return [];
+  const undeliveredDir = path.join(convDir, '.system_generated', 'messages', 'undelivered');
+  if (!fs.existsSync(undeliveredDir)) return [];
+  try {
+    return fs
+      .readdirSync(undeliveredDir)
+      .filter((name) => !name.startsWith('.'))
+      .map((name) => path.join(undeliveredDir, name));
+  } catch (_) {
+    return [];
+  }
+}
+
+function clearUndeliveredMessages(convId) {
+  const convDir = findConversationBrainDir(convId);
+  if (!convDir) return;
+  const undeliveredFiles = getUndeliveredMessageFiles(convId);
+  const messagesDir = path.join(convDir, '.system_generated', 'messages');
+  for (const filePath of undeliveredFiles) {
+    try {
+      const msgId = path.basename(filePath);
+      fs.unlinkSync(filePath);
+      const jsonMeta = path.join(messagesDir, `${msgId}.json`);
+      if (fs.existsSync(jsonMeta)) {
+        fs.unlinkSync(jsonMeta);
+      }
+    } catch (_) {}
+  }
+}
+
+/**
+ * Checks whether a conversation is currently blocked on a pending tool call (such as `ask_question`
+ * or `ask_permission`) or already has stuck undelivered messages in `.system_generated/messages/undelivered`.
+ */
+function isConversationBlockedOrUndeliverable(convId) {
+  if (!convId) return true;
+  if (getUndeliveredMessageFiles(convId).length > 0) {
+    return true;
+  }
+  const convDir = findConversationBrainDir(convId);
+  if (!convDir) return false;
+  const tPath = path.join(convDir, '.system_generated', 'logs', 'transcript.jsonl');
+  if (!fs.existsSync(tPath)) return false;
+  try {
+    const stat = fs.statSync(tPath);
+    const readSize = Math.min(stat.size, 65536);
+    const startOffset = Math.max(0, stat.size - readSize);
+    const fd = fs.openSync(tPath, 'r');
+    const buf = Buffer.alloc(readSize);
+    const bytesRead = fs.readSync(fd, buf, 0, readSize, startOffset);
+    fs.closeSync(fd);
+    const tailText = buf.slice(0, bytesRead).toString('utf8');
+    const lines = tailText
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith('{') && l.endsWith('}'));
+    let lastPlannerIdx = -1;
+    let lastPlannerToolCalls = 0;
+    const parsedSteps = [];
+    for (const line of lines) {
+      try {
+        parsedSteps.push(JSON.parse(line));
+      } catch (_) {}
+    }
+    for (let i = parsedSteps.length - 1; i >= 0; i--) {
+      if (parsedSteps[i].type === 'PLANNER_RESPONSE') {
+        lastPlannerIdx = i;
+        const tcs = parsedSteps[i].tool_calls;
+        lastPlannerToolCalls = Array.isArray(tcs) ? tcs.length : 0;
+        break;
+      }
+    }
+    if (lastPlannerIdx >= 0 && lastPlannerToolCalls > 0) {
+      let genericResponsesAfter = 0;
+      for (let j = lastPlannerIdx + 1; j < parsedSteps.length; j++) {
+        if (parsedSteps[j].type === 'GENERIC') {
+          genericResponsesAfter++;
+        }
+      }
+      if (genericResponsesAfter < lastPlannerToolCalls) {
+        return true;
+      }
+    }
+  } catch (_) {}
+  return false;
+}
+
 /**
  * Finds the most recent active Antigravity root conversation ID belonging to the target workspace
- * (or THIS window's workspace), preferring the conversation ID recorded on the active Quasar session.
+ * (or THIS window's workspace), preferring the conversation ID recorded on the active Quasar session
+ * as long as it is not blocked on a pending tool call or stuck with undelivered messages.
  */
 function detectActiveConversationId(targetWorkspaceRoot = null, env = null, preferredSession = null) {
   const sess = preferredSession || loadActiveSession();
   const sessConvId = extractSessionConversationId(sess);
   if (sessConvId) {
-    return resolveRootConversationId(sessConvId, env);
+    const resolvedSessConvId = resolveRootConversationId(sessConvId, env);
+    if (!isConversationBlockedOrUndeliverable(resolvedSessConvId)) {
+      return resolvedSessConvId;
+    }
   }
 
   let wsRoot = targetWorkspaceRoot ? resolveWorkspaceRootSync(targetWorkspaceRoot) : null;
@@ -636,25 +743,19 @@ function detectActiveConversationId(targetWorkspaceRoot = null, env = null, pref
     } catch (_) {}
   }
 
-  // 1. Prefer a root user conversation matching the target workspace root
-  const rootWsMatch = inspected.find((c) => c.matchesWs && c.isRootUserConv);
-  if (rootWsMatch) {
-    return resolveRootConversationId(rootWsMatch.id, env);
+  // 1. Prefer an unblocked root user conversation matching the target workspace root
+  for (const c of inspected.filter((x) => x.matchesWs && x.isRootUserConv)) {
+    const resolved = resolveRootConversationId(c.id, env);
+    if (!isConversationBlockedOrUndeliverable(resolved)) return resolved;
   }
 
-  // 2. Otherwise any conversation matching the target workspace root (resolved to its rootConversationId)
-  const anyWsMatch = inspected.find((c) => c.matchesWs);
-  if (anyWsMatch) {
-    return resolveRootConversationId(anyWsMatch.id, env);
+  // 2. Otherwise any unblocked conversation matching the target workspace root
+  for (const c of inspected.filter((x) => x.matchesWs)) {
+    const resolved = resolveRootConversationId(c.id, env);
+    if (!isConversationBlockedOrUndeliverable(resolved)) return resolved;
   }
 
-  // 3. Fallback to most recent root user conversation
-  const anyRootMatch = inspected.find((c) => c.isRootUserConv);
-  if (anyRootMatch) {
-    return resolveRootConversationId(anyRootMatch.id, env);
-  }
-
-  return candidates.length > 0 ? resolveRootConversationId(candidates[0].id, env) : null;
+  return null;
 }
 
 function sendPromptToQuasar(prompt, title = 'Quasar', targetWorkspaceRoot = null, options = {}) {
@@ -679,6 +780,23 @@ function sendPromptToQuasar(prompt, title = 'Quasar', targetWorkspaceRoot = null
       newConvArgs.push('--model=flash');
     }
     newConvArgs.push(prompt);
+
+    const persistNewConvId = (outStr) => {
+      const mUuid = String(outStr || '').match(
+        /([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/
+      );
+      const newCid = mUuid ? mUuid[1] : null;
+      if (newCid) {
+        try {
+          const latestSess = loadActiveSession();
+          if (latestSess) {
+            latestSess.conversationId = newCid;
+            saveActiveSession(latestSess);
+          }
+        } catch (_) {}
+      }
+      return newCid;
+    };
 
     const runAgentApi = (args, cb) => {
       execFile(exe, args, { timeout: 15000, env }, (err, stdout, stderr) => {
@@ -705,17 +823,36 @@ function sendPromptToQuasar(prompt, title = 'Quasar', targetWorkspaceRoot = null
       });
     };
 
-    if (convId) {
-      runAgentApi(['send-message', `--title=${title}`, convId, prompt], (res) => {
-        if (res.success) {
-          resolve(res);
-        } else {
-          // Fallback to starting a new conversation if send-message to convId failed
-          runAgentApi(newConvArgs, resolve);
+    const startNewConversation = () => {
+      runAgentApi(newConvArgs, (newRes) => {
+        if (newRes.success) {
+          const newCid = persistNewConvId(newRes.stdout);
+          if (newCid) newRes.conversationId = newCid;
         }
+        resolve(newRes);
+      });
+    };
+
+    if (convId && !isConversationBlockedOrUndeliverable(convId)) {
+      runAgentApi(['send-message', `--title=${title}`, convId, prompt], (res) => {
+        if (!res.success) {
+          startNewConversation();
+          return;
+        }
+        // Verify that the target conversation actually dequeued the message within 1.2s;
+        // if it remains in `.system_generated/messages/undelivered`, the conversation is
+        // inactive/blocked, so clean up the stuck message and start a new conversation.
+        setTimeout(() => {
+          if (getUndeliveredMessageFiles(convId).length > 0) {
+            clearUndeliveredMessages(convId);
+            startNewConversation();
+          } else {
+            resolve(res);
+          }
+        }, 1200);
       });
     } else {
-      runAgentApi(newConvArgs, resolve);
+      startNewConversation();
     }
   });
 }
@@ -2556,15 +2693,27 @@ function activate(context) {
         });
       }
 
-      const comments = rawMessages.map((m) => {
-        const md = new vscode.MarkdownString(m.body || '');
+      const isQueuedForFix = t.status !== 'fixed' && Boolean(t.selectedForFix);
+      const fixStateTag =
+        t.status === 'fixed' ? 'fix_done' : isQueuedForFix ? 'fix_queued' : 'fix_unqueued';
+      const cmdArg = encodeURIComponent(JSON.stringify({ threadId: t.id }));
+      const fixActionBarMd =
+        t.status === 'fixed'
+          ? `\n\n---\n✅ **Fixed in Working Tree**${t.fixedSummary ? ` — ${t.fixedSummary}` : ''}`
+          : isQueuedForFix
+          ? `\n\n---\n✅ **🔧 Queued for Agent Fix**  •  [$(close) Remove from Fix Queue](command:quasar.unqueueForFix?${cmdArg})  •  [$(wrench) Fix Now](command:quasar.fixSingleComment?${cmdArg})`
+          : `\n\n---\n[$(tools) Queue for Agent Fix](command:quasar.queueForFix?${cmdArg})  •  [$(wrench) Fix Now](command:quasar.fixSingleComment?${cmdArg})`;
+
+      const comments = rawMessages.map((m, idx) => {
+        const bodyText = (m.body || '') + (idx === 0 ? fixActionBarMd : '');
+        const md = new vscode.MarkdownString(bodyText, true);
         md.isTrusted = true;
         return {
           author: { name: m.author || 'Quasar' },
           body: md,
           mode: vscode.CommentMode.Preview,
           threadId: t.id,
-          contextValue: 'quasar-comment',
+          contextValue: `quasar-comment:${fixStateTag}`,
         };
       });
 
@@ -2577,19 +2726,18 @@ function activate(context) {
       thread.relPath = t.path;
       thread.canReply = true;
 
-      const queuedSuffix =
-        t.status !== 'fixed' && t.selectedForFix ? ' [🔧 Queued for Fix]' : '';
+      const queuedSuffix = isQueuedForFix ? ' [🔧 QUEUED FOR FIX ✓]' : '';
 
       if (t.status === 'fixed') {
-        thread.contextValue = 'fixed';
+        thread.contextValue = `fixed:${fixStateTag}`;
         thread.label = `✅ Fixed in Working Tree — ${t.title || ''}`;
         thread.collapsibleState = vscode.CommentThreadCollapsibleState.Collapsed;
       } else if (t.status === 'uncertain') {
-        thread.contextValue = 'uncertain';
-        thread.label = `🤔 Uncertain (Calibrate Preference)${queuedSuffix} — ${t.title || ''}`;
+        thread.contextValue = `uncertain:${fixStateTag}`;
+        thread.label = `🤔 Flagged to Review (Calibrate Preference)${queuedSuffix} — ${t.title || ''}`;
         thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
       } else if (t.status === 'staged') {
-        thread.contextValue = 'staged';
+        thread.contextValue = `staged:${fixStateTag}`;
         const sev = (t.severity || '').toUpperCase();
         const badge = sev.includes('BLOCK')
           ? '🔴 Blocking'
@@ -2601,7 +2749,7 @@ function activate(context) {
         thread.label = `✅ Staged for GitHub Review (${badge})${queuedSuffix} — ${t.title || ''}`;
         thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
       } else if (t.kind === 'ai_candidate') {
-        thread.contextValue = 'candidate';
+        thread.contextValue = `candidate:${fixStateTag}`;
         const sev = (t.severity || '').toUpperCase();
         const badge = sev.includes('BLOCK')
           ? '🔴 Blocking'
@@ -2611,11 +2759,11 @@ function activate(context) {
         thread.label = `${badge} Draft (Unstaged)${queuedSuffix} — ${t.title || ''}`;
         thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
       } else if (t.kind === 'user_qa') {
-        thread.contextValue = 'qa';
+        thread.contextValue = `qa:${fixStateTag}`;
         thread.label = `💬 Quasar Q&A${queuedSuffix} — ${t.title || ''}`;
         thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
       } else {
-        thread.contextValue = 'existing';
+        thread.contextValue = `existing:${fixStateTag}`;
         const triageHeader = ghTriage ? ghTriage.triageBadge : '👀 Existing GitHub Comment';
         const cleanThreadTitle = String(t.title || '').replace(
           /^(?:🛠️|⚠️|✅|💬|❓|👀|🤔|🔴|🟡|🟢)\s*\[[^\]]+\]\s*/,
@@ -5050,8 +5198,24 @@ function activate(context) {
       try {
         if (!fs.existsSync(filePath)) continue;
         const fileLines = fs.readFileSync(filePath, 'utf-8').split('\n');
-        const s = Math.max(0, (startLine || 1) - 8);
-        const e = Math.min(fileLines.length, (endLine || startLine || 1) + 8);
+        let effStart = startLine || 1;
+        let effEnd = endLine || effStart;
+        // If a comment is anchored at line 1 (e.g. file-level comment) and the user has the file open
+        // in the active editor, include the code around their cursor/selection as well.
+        if (effStart <= 1 && effEnd <= 1 && vscode.window.activeTextEditor) {
+          const activeDoc = vscode.window.activeTextEditor.document;
+          if (activeDoc && matchesSessionPath(activeDoc.uri.fsPath, relPath, session)) {
+            const sel = vscode.window.activeTextEditor.selection;
+            if (sel && sel.active.line > 0) {
+              effStart = Math.max(1, sel.start.line + 1);
+              effEnd = Math.max(effStart, sel.end.line + 1);
+            }
+          }
+        }
+        const padBefore = effStart <= 1 && effEnd <= 1 ? 0 : 12;
+        const padAfter = effStart <= 1 && effEnd <= 1 ? 60 : 18;
+        const s = Math.max(0, effStart - 1 - padBefore);
+        const e = Math.min(fileLines.length, effEnd + padAfter);
         return fileLines
           .slice(s, e)
           .map((l, idx) => `${s + idx + 1}: ${l}`)
@@ -5079,7 +5243,9 @@ function activate(context) {
     ).trim();
 
     if (!questionText) {
-      const isChangeMode = Boolean(options.changeCommentMode || existingThread);
+      const isChangeMode = Boolean(
+        options.changeCommentMode && (!existingThread || existingThread.kind !== 'github_existing')
+      );
       const targetTitle = existingThread
         ? existingThread.title || path.basename(existingThread.path || '')
         : 'This Code';
@@ -5088,17 +5254,17 @@ function activate(context) {
         : '';
       const input = await vscode.window.showInputBox({
         title: isChangeMode
-          ? `💬 Comment on "${targetTitle}" (Ask Quasar to Change)`
-          : `💬 Ask Quasar About ${targetTitle}`,
+          ? `💬 Comment on "${targetTitle}" (Ask Quasar to Change or Explain)`
+          : `💬 Ask Quasar About "${targetTitle}"`,
         prompt:
           isChangeMode && currentDraftPreview
             ? `Current draft: "${currentDraftPreview}${
                 (existingThread.draftComment || '').length > 110 ? '…' : ''
-              }" — Comment on how the agent should change or revise this comment`
-            : 'Enter your comment or question for Quasar',
+              }" — Ask a question about this code chunk or tell Quasar how to revise the comment`
+            : 'Ask Quasar for more info about this code chunk or comment',
         placeHolder: isChangeMode
-          ? 'e.g. "Make this shorter", "Change to suggest WeakReference instead", or "Phrase as a question"'
-          : 'e.g. "Is this null-safe?" or "Change this comment to suggest final instead"',
+          ? 'e.g. "Explain what this code chunk is doing", "Make this shorter", or "Phrase as a question"'
+          : 'e.g. "Can you explain how this code chunk works?" or "Is this null-safe?"',
       });
       if (!input || !input.trim()) return;
       questionText = input.trim();
@@ -5122,6 +5288,10 @@ function activate(context) {
       : ((thread && thread.range ? thread.range.end.line : startLine - 1) + 1);
 
     const codeSnippet = extractThreadCodeSnippet(session, relPath, startLine, endLine, docFsPath);
+    const headSnapshotFile =
+      session.headSnapshotRoot && relPath ? path.join(session.headSnapshotRoot, relPath) : '';
+    const repoWorkingFile =
+      session.repoDir && relPath ? path.join(session.repoDir, relPath) : '';
 
     let threadId = preResolvedId;
     const nowIso = new Date().toISOString();
@@ -5169,8 +5339,8 @@ function activate(context) {
         {
           author: 'Quasar',
           body: options.changeCommentMode
-            ? '_⏳ Quasar is updating this comment based on your feedback..._'
-            : '_⏳ Quasar is analyzing your comment..._',
+            ? '_⏳ Quasar is analyzing your comment / request..._'
+            : '_⏳ Quasar is analyzing this code chunk & comment..._',
           timestamp: nowIso,
           pending: true,
         }
@@ -5182,6 +5352,9 @@ function activate(context) {
 
     const answerScript = path.join(PLUGIN_SCRIPTS_DIR, 'answer_comment_question.py');
     const windowWsRoot = getWindowWorkspaceRoot();
+    const fileLocationsNote =
+      (headSnapshotFile ? `- **PR Head Snapshot File**: \`${headSnapshotFile}\`\n` : '') +
+      (repoWorkingFile ? `- **Local Repo File**: \`${repoWorkingFile}\`\n` : '');
 
     let prompt = '';
     if (isUpdatingExisting && existingThread) {
@@ -5190,22 +5363,29 @@ function activate(context) {
         .slice(-6)
         .map((m) => `- **${m.author || 'User'}**: ${String(m.body || '').replace(/\n+/g, ' ')}`)
         .join('\n');
+      const isGithubExisting = existingThread.kind === 'github_existing';
+      const wantsDraftUpdate = Boolean(options.changeCommentMode && !isGithubExisting);
 
       prompt =
-        `The reviewer commented on Quasar review comment \`${threadId}\` in \`${relPath}\` (lines ${startLine}-${endLine}) on PR #${
+        `The reviewer asked a question or commented on thread \`${threadId}\` in \`${relPath}\` (lines ${startLine}-${endLine}) on PR #${
           (session.pr && session.pr.number) || 'local'
         }:\n\n` +
-        `Reviewer's Comment / Change Request:\n"${questionText}"\n\n` +
-        `Current Quasar Comment State:\n` +
-        `- **Thread ID**: \`${threadId}\`\n` +
+        `Reviewer's Question / Request:\n"${questionText}"\n\n` +
+        `Comment Thread Context:\n` +
+        `- **Thread ID**: \`${threadId}\` (${isGithubExisting ? 'Existing GitHub PR Comment' : 'Quasar Review Comment'})\n` +
         `- **Title**: ${existingThread.title || ''}\n` +
         `- **Severity**: ${existingThread.severity || 'DESIGN'} (Status: ${existingThread.status || 'staged'})\n` +
+        fileLocationsNote +
         `- **CliffsNotes Context (whyItMatters)**: ${existingThread.whyItMatters || ''}\n` +
-        `- **Current Draft GitHub Comment**:\n\`\`\`\n${existingThread.draftComment || ''}\n\`\`\`\n\n` +
+        `- **Comment Text**:\n\`\`\`\n${existingThread.draftComment || ''}\n\`\`\`\n\n` +
         (priorHistory ? `Recent Thread History:\n${priorHistory}\n\n` : '') +
         (codeSnippet ? `Code Context (\`${relPath}:L${startLine}-${endLine}\`):\n\`\`\`\n${codeSnippet}\n\`\`\`\n\n` : '') +
-        `Please update the Quasar comment (or answer their comment) directly in place by running:\n` +
-        `\`python3 "${answerScript}" --thread-id "${threadId}" --workspace-dir "${windowWsRoot}" --updated-draft "<REVISED_GITHUB_COMMENT>" --answer "<BRIEF_CONFIRMATION_OR_ANSWER>"\`\n\n` +
+        (wantsDraftUpdate
+          ? `If the reviewer is asking for more information or an explanation about the code chunk or comment, investigate the code and reply via \`--answer "<YOUR_DETAILED_ANSWER>"\`. If they asked to change or revise the Quasar draft comment, also pass \`--updated-draft "<REVISED_GITHUB_COMMENT>"\`:\n` +
+            `\`python3 "${answerScript}" --thread-id "${threadId}" --workspace-dir "${windowWsRoot}" --answer "<YOUR_ANSWER_OR_CONFIRMATION>" [--updated-draft "<REVISED_GITHUB_COMMENT>"]\`\n\n`
+          : `Please inspect the code chunk if needed and reply directly into the inline comment thread by running:\n` +
+            `\`python3 "${answerScript}" --thread-id "${threadId}" --workspace-dir "${windowWsRoot}" --answer "<YOUR_DETAILED_MARKDOWN_ANSWER>"\`\n` +
+            `*(Only pass \`--updated-draft "<REVISED_GITHUB_COMMENT>"\` if the reviewer explicitly asked to change the draft comment text.)*\n\n`) +
         `Optional flags if requested by the reviewer's comment:\n` +
         `- \`--updated-title "<NEW_TITLE>"\` (if the title should also change)\n` +
         `- \`--updated-why "<NEW_RATIONALE>"\` (if the CliffsNotes context/rationale should change)\n` +
@@ -5219,6 +5399,7 @@ function activate(context) {
           (session.pr && session.pr.number) || 'local'
         }:\n\n` +
         `Question: "${questionText}"\n\n` +
+        (fileLocationsNote ? `File Paths:\n${fileLocationsNote}\n` : '') +
         `Code Context:\n\`\`\`\n${codeSnippet}\n\`\`\`\n\n` +
         `Please investigate the codebase if needed and reply directly into the inline comment thread by running:\n` +
         `\`python3 "${answerScript}" --thread-id "${threadId}" --workspace-dir "${windowWsRoot}" --answer "<YOUR_CONCISE_MARKDOWN_ANSWER>"\`\n` +
@@ -5228,18 +5409,33 @@ function activate(context) {
     const dispatchRes = await sendPromptToQuasar(
       prompt,
       isUpdatingExisting
-        ? `Update Quasar Comment: ${path.basename(relPath)}:${startLine}`
+        ? `Quasar Comment Q&A: ${path.basename(relPath)}:${startLine}`
         : `Comment Question: ${path.basename(relPath)}:${startLine}`
     );
 
     if (dispatchRes && dispatchRes.success) {
       vscode.window.setStatusBarMessage(
-        isUpdatingExisting
-          ? `💬 Sent your comment to Quasar to update "${existingThread.title || path.basename(relPath)}"...`
-          : `💬 Sent question to Quasar (${path.basename(relPath)}:L${startLine})...`,
+        `💬 Sent question to Quasar (${path.basename(relPath)}:L${startLine})...`,
         4000
       );
     } else {
+      // Remove the stuck pending placeholder so the thread doesn't stay stuck on "analyzing"
+      const latestSession = loadActiveSession();
+      if (latestSession && Array.isArray(latestSession.threads)) {
+        const targetT = latestSession.threads.find((t) => t.id === threadId);
+        if (targetT && Array.isArray(targetT.messages)) {
+          targetT.messages = targetT.messages.filter((m) => !m.pending);
+          targetT.messages.push({
+            author: 'Quasar',
+            body: `⚠️ *Could not auto-dispatch to Antigravity agent (${
+              (dispatchRes && dispatchRes.error) || 'agentapi unavailable'
+            }). The prompt has been copied to your clipboard — paste it into the chat window to run.*`,
+            timestamp: new Date().toISOString(),
+          });
+          saveActiveSession(latestSession);
+          refreshAllUI(false);
+        }
+      }
       await vscode.env.clipboard.writeText(prompt);
       vscode.window.showWarningMessage(
         'Could not auto-dispatch via agentapi. Prompt copied to clipboard — paste it into the Antigravity chat!'
@@ -6616,21 +6812,41 @@ function activate(context) {
   );
 
   // 9. Self-Review Fix Workflow: Queue Comments & Dispatch to Quasar Agent
+  async function setCommentQueuedForFix(arg, explicitSelected = null) {
+    const id = resolveThreadId(arg);
+    if (!id) return;
+    const args = ['--toggle-select', '--thread-id', String(id)];
+    if (typeof explicitSelected === 'boolean') {
+      args.push('--selected', explicitSelected ? 'true' : 'false');
+    }
+    const res = await runManageFixes(args);
+    refreshAllUI(false);
+    if (res && res.ok && Array.isArray(res.updated) && res.updated.length > 0) {
+      const isQueued = res.updated[0].selectedForFix;
+      vscode.window.setStatusBarMessage(
+        isQueued
+          ? `✅ 🔧 Queued comment for Quasar fix (${res.selectedCount || 1} total queued)`
+          : `Removed comment from fix queue (${res.selectedCount || 0} total queued)`,
+        3500
+      );
+    }
+  }
+
   context.subscriptions.push(
     vscode.commands.registerCommand('quasar.toggleSelectForFix', async (arg) => {
-      const id = resolveThreadId(arg);
-      if (!id) return;
-      const res = await runManageFixes(['--toggle-select', '--thread-id', String(id)]);
-      refreshAllUI(false);
-      if (res && res.ok && Array.isArray(res.updated) && res.updated.length > 0) {
-        const isQueued = res.updated[0].selectedForFix;
-        vscode.window.setStatusBarMessage(
-          isQueued
-            ? `🔧 Queued comment for Quasar fix (${res.selectedCount || 1} total queued)`
-            : `Removed comment from fix queue (${res.selectedCount || 0} total queued)`,
-          3500
-        );
-      }
+      await setCommentQueuedForFix(arg, null);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.queueForFix', async (arg) => {
+      await setCommentQueuedForFix(arg, true);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.unqueueForFix', async (arg) => {
+      await setCommentQueuedForFix(arg, false);
     })
   );
 
