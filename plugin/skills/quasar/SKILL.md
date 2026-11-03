@@ -54,14 +54,7 @@ Inspect `effort_level` (`"low"`, `"medium"`, or `"high"`), `comments_only` (`tru
 ### Owned PR Git Branch Check (`isOwnedByUser` & `needsBranchSwitch`)
 When the user provides a GitHub PR link or number, inspect `pr_metadata` in `pr_context.json`:
 - If `pr_metadata.isOwnedByUser` is `true` and `pr_metadata.needsBranchSwitch` is `true` (meaning the PR belongs to the user, a matching local git repository was found at `repo_dir`, and it is currently checked out on `pr_metadata.localCurrentBranch` instead of the PR's head branch `pr_metadata.headRefName`):
-  - **Ask the user** (using `ask_question`) whether they would like you to switch their local git repository (`repo_dir`) from `<localCurrentBranch>` to the PR branch `<headRefName>` (offering options: `(Recommended) Yes, switch to branch '<headRefName>'` and `No, stay on '<localCurrentBranch>'`).
-  - If the user chooses to switch to `<headRefName>`, run:
-    ```bash
-    python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/collect_pr_context.py \
-      --checkout-pr-branch \
-      [--stash-if-dirty] \
-      --workspace-dir <ACTIVE_WORKSPACE_PATH>
-    ```
+  - **Do NOT interrupt the review with `ask_question`**. The native Quasar extension automatically prompts the user with a non-blocking notification toast to switch branches, and you can mention in your final post-review summary that they can switch `<repo_dir>` from `<localCurrentBranch>` to `<headRefName>` (or ask you to run `collect_pr_context.py --checkout-pr-branch [--stash-if-dirty] --workspace-dir <ACTIVE_WORKSPACE_PATH>`).
 
 ---
 
@@ -103,15 +96,15 @@ Verify every candidate finding against the actual codebase callers/callees, `exi
   - `"triageStatus": "recommended_fix"` (`"triageBadge": "🛠️ Good Catch — Should Fix"`): The comment points out a valid bug, warning, edge case, or clean improvement (`suggestion` block, naming/readability/doc fix) that should be applied.
   - `"triageStatus": "needs_attention"` (`"triageBadge": "❓ Question — Needs Answer"` or `"👀 Needs Look (Design)"`): The comment asks an open question that needs answering or raises an architectural/design trade-off that requires human decision.
   - `"triageStatus": "addressed_or_refuted"` (`"triageBadge": "⚠️ Disputed / No Fix"` or `"💬 Author Replied"`): The comment was already addressed, replied to by the PR author, or relies on a mistaken premise.
-- **Mark as Uncertain (`"status": "uncertain"`)** 1–3 borderline or preference-sensitive findings where the technical observation is valid, but whether to post it depends on the reviewer's taste/convention (e.g., private-helper unit test strictness, API surface trade-offs, defensive guards on internal callers, or borderline nits) and is **not yet covered** by `reviewer_preferences`. Each uncertain finding MUST include:
+- **Flag as Uncertain (`"status": "uncertain"`) for Post-Review Inspection in the UI** 1–3 borderline, questionable, or preference-sensitive findings where the technical observation is valid, but whether to post it depends on the reviewer's taste/convention or closer code inspection (e.g., private-helper unit test strictness, API surface trade-offs, defensive guards on internal callers, or borderline nits) and is **not yet covered** by `reviewer_preferences`. **Never interrupt the review with `ask_question` in chat** — instead, flag these findings in `review_synthesis.json` so the user can view the code and comments together in the Quasar UI after the review completes. Each uncertain finding MUST include:
   - `"status": "uncertain"`
   - `"preferenceCategory"`: e.g. `"test_strictness"`, `"api_design"`, `"nit_threshold"`, `"null_defensiveness"`, `"comment_tone"`, `"repo_hygiene"`
-  - `"uncertaintyQuestion"`: A crisp 1-sentence question asking the reviewer's general preference on this kind of feedback.
+  - `"uncertaintyQuestion"`: A crisp 1-sentence question explaining what needs the reviewer's judgment or asking their general preference on this kind of feedback.
   - `"preferenceOptions"`: 2–3 actionable choices (e.g. `["Flag this & similar cases in future reviews", "Skip this pattern in future reviews", "Keep this comment once, don't save a rule"]`).
 
 ---
 
-## Phase 3: Publish the CliffsNotes Session & Calibrate Uncertain Preferences
+## Phase 3: Publish the CliffsNotes Session & Highlight Flagged Comments for UI Review
 
 Write `<SCRATCH_DIR>/review_synthesis.json` and publish it using `publish_review_session.py` (when `comments_only` is `true`, set `"commentsOnly": true` and omit `"cliffsNotes"` and `"chapters"`):
 
@@ -229,13 +222,11 @@ python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/publish_review_ses
 > - `[📖 Open Quasar Review](sidecar://quasar/quasar-web/)` (opens the Quasar Web UI sidecar pane inside Jetski)
 > - Direct browser URL: `http://127.0.0.1:49341` (or the exported `quasar_review.html` artifact)
 
-### Interactive Preference Calibration (`ask_question`)
-If your review produced any `"status": "uncertain"` findings (or if you have 1–2 high-leverage questions about the reviewer's preferences for this repo/style), **call the `ask_question` tool** right after publishing the session!
-- Present each uncertain finding's `uncertaintyQuestion` (linking to the file/line) with options like:
-  1. `"Yes — stage this comment and flag similar cases in future reviews"`
-  2. `"No — dismiss this and skip similar patterns in future reviews"`
-  3. `"Keep this comment once for this PR, but don't save a global rule"`
-- As soon as the user responds to `ask_question`, persist their preference and update the live session by running `manage_preferences.py`:
+### Flagging Uncertain Comments for Post-Review Inspection (Do NOT Call `ask_question` During Review)
+- **Never call `ask_question` while conducting or finishing a review.** Always let the review complete and publish to the Quasar UI first so the user can view the code diff and comments in the UI while considering any flagged items.
+- Any findings with `"status": "uncertain"` are automatically flagged in the Quasar UI under **🤔 Flagged to Review / Calibrate**, inside the Study Guide, and inline on the diff lines with **🤔 Calibrate**, **Stage**, and **🗑️ Dismiss** buttons.
+- In your final response after `publish_review_session.py` completes, briefly list any flagged `"status": "uncertain"` comments (with clickable file/line links and their `uncertaintyQuestion`) and let the user know they can inspect and calibrate them directly in the Quasar UI (or reply in chat).
+- Whenever the user later tells you their decision on a flagged/uncertain comment in chat, persist their preference and update the live session by running `manage_preferences.py`:
 
 ```bash
 # If the user chose to keep & prefer this pattern:

@@ -321,6 +321,9 @@ function buildEffortPromptInstruction(effortLevel, commentsOnly = false) {
   const totalHighLenses = 4 + customAgents.length;
   const totalHighWave = 3 + customAgents.length;
 
+  const noChatQuestionsRule =
+    ` Do NOT call \`ask_question\` during the review — complete and publish the review uninterrupted, and flag any borderline or preference-dependent comments with \`"status": "uncertain"\` so the user can review them in the UI alongside the code.`;
+
   if (commentsOnly) {
     const modePrefix =
       `REVIEW MODE: COMMENTS ONLY (NO STUDY GUIDE OR READING TOUR). ` +
@@ -330,37 +333,43 @@ function buildEffortPromptInstruction(effortLevel, commentsOnly = false) {
       return (
         modePrefix +
         `EFFORT LEVEL: LOW (FAST SINGLE-PASS — NO SUBAGENTS). ` +
-        `Do NOT call \`invoke_subagent\`. Read \`pr_context.json\` and \`pr.diff\` directly in a single fast pass, produce only high-confidence review comments (\`findings\`) and \`existingCommentAssessments\`, and immediately run \`publish_review_session.py --comments-only\`.`
+        `Do NOT call \`invoke_subagent\`. Read \`pr_context.json\` and \`pr.diff\` directly in a single fast pass, produce only high-confidence review comments (\`findings\`) and \`existingCommentAssessments\`, and immediately run \`publish_review_session.py --comments-only\`.` +
+        noChatQuestionsRule
       );
     }
     if (level === 'high') {
       return (
         modePrefix +
         `EFFORT LEVEL: HIGH (DEEP ${totalHighLenses}-LENS COMMENTS-ONLY PIPELINE). ` +
-        `Spawn \`review-bug-hunter\`, \`review-test-critic\`, and \`review-architect\` (instructing \`review-architect\` to skip the reading tour/mental model and only return API/design findings)${customListText} in parallel with \`Model: "inherit"\`, filter false positives, and run \`publish_review_session.py --comments-only\`.`
+        `Spawn \`review-bug-hunter\`, \`review-test-critic\`, and \`review-architect\` (instructing \`review-architect\` to skip the reading tour/mental model and only return API/design findings)${customListText} in parallel with \`Model: "inherit"\`, filter false positives, and run \`publish_review_session.py --comments-only\`.` +
+        noChatQuestionsRule
       );
     }
     return (
       modePrefix +
       `EFFORT LEVEL: MEDIUM (BALANCED COMMENTS-ONLY — ${totalMed} FAST FLASH SUBAGENTS). ` +
-      `Spawn \`review-bug-hunter\` and \`review-architect\` (instructing \`review-architect\` to skip the reading tour/mental model and only return API/design findings)${customListText} in a single parallel \`invoke_subagent\` call using \`Model: "flash"\`, filter their findings directly, and immediately run \`publish_review_session.py --comments-only\`.`
+      `Spawn \`review-bug-hunter\` and \`review-architect\` (instructing \`review-architect\` to skip the reading tour/mental model and only return API/design findings)${customListText} in a single parallel \`invoke_subagent\` call using \`Model: "flash"\`, filter their findings directly, and immediately run \`publish_review_session.py --comments-only\`.` +
+      noChatQuestionsRule
     );
   }
   if (level === 'low') {
     return (
       `EFFORT LEVEL: LOW (FAST SINGLE-PASS — NO SUBAGENTS). ` +
-      `Do NOT call \`invoke_subagent\`. Read \`pr_context.json\` and \`pr.diff\` directly in a single fast pass, synthesize the concise CliffsNotes Study Guide and Guided Tour plus only obvious high-confidence bugs/blockers, and immediately run \`publish_review_session.py\`.`
+      `Do NOT call \`invoke_subagent\`. Read \`pr_context.json\` and \`pr.diff\` directly in a single fast pass, synthesize the concise CliffsNotes Study Guide and Guided Tour plus only obvious high-confidence bugs/blockers, and immediately run \`publish_review_session.py\`.` +
+      noChatQuestionsRule
     );
   }
   if (level === 'high') {
     return (
       `EFFORT LEVEL: HIGH (DEEP ${totalHighLenses}-LENS PIPELINE). ` +
-      `Run the full parallel ${totalHighWave}-subagent wave (\`review-architect\`, \`review-bug-hunter\`, \`review-test-critic\`${customListText} with \`Model: "inherit"\`) followed by thorough false-positive filtering before running \`publish_review_session.py\`.`
+      `Run the full parallel ${totalHighWave}-subagent wave (\`review-architect\`, \`review-bug-hunter\`, \`review-test-critic\`${customListText} with \`Model: "inherit"\`) followed by thorough false-positive filtering before running \`publish_review_session.py\`.` +
+      noChatQuestionsRule
     );
   }
   return (
     `EFFORT LEVEL: MEDIUM (BALANCED — ${totalMed} FAST FLASH SUBAGENTS). ` +
-    `Spawn \`review-architect\` and \`review-bug-hunter\`${customListText} in a single parallel \`invoke_subagent\` call using \`Model: "flash"\` (do NOT spawn \`review-test-critic\` or a second sequential \`review-advocate\` wave), filter their findings directly, and immediately run \`publish_review_session.py\`.`
+    `Spawn \`review-architect\` and \`review-bug-hunter\`${customListText} in a single parallel \`invoke_subagent\` call using \`Model: "flash"\` (do NOT spawn \`review-test-critic\` or a second sequential \`review-advocate\` wave), filter their findings directly, and immediately run \`publish_review_session.py\`.` +
+    noChatQuestionsRule
   );
 }
 
@@ -1786,7 +1795,7 @@ class CommentsTreeProvider {
           ? [
               {
                 id: 'uncertain',
-                label: `Uncertain — Calibrate Your Preference (${uncertain.length})`,
+                label: `Flagged to Review / Calibrate (${uncertain.length})`,
                 icon: 'question',
                 items: uncertain,
                 expanded: true,
@@ -1866,7 +1875,7 @@ class CommentsTreeProvider {
         const prefix = isFixed
           ? '✅ [Fixed]'
           : isUncertain
-          ? '🤔 [Calibrate]'
+          ? '🤔 [Flagged]'
           : isExistingGh && ghTriage
           ? ghTriage.triageStatus === 'recommended_fix'
             ? cat === 'suggestion'
@@ -3004,7 +3013,7 @@ function activate(context) {
           t.status === 'fixed'
             ? '✅ Fixed'
             : t.status === 'uncertain'
-            ? '🤔 Calibrate'
+            ? '🤔 Flagged to Review'
             : isExisting && ghTriage
             ? ghTriage.triageBadge
             : `${t.status === 'staged' ? '📤 Staged • ' : '📝 Draft • '}${sev}`;
@@ -3083,8 +3092,15 @@ function activate(context) {
               </div>
             </div>
             ${
+              t.status === 'uncertain' && t.uncertaintyQuestion
+                ? `<div class="q-stop-meta" style="margin-top:6px;color:var(--q-warn);"><strong>🤔 Flagged Question:</strong> ${formatInlineMd(
+                    t.uncertaintyQuestion
+                  )}</div>`
+                : ''
+            }
+            ${
               t.whyItMatters || t.draftComment
-                ? `<details class="q-stop-details">
+                ? `<details class="q-stop-details" ${t.status === 'uncertain' ? 'open' : ''}>
                     <summary>Comment &amp; rationale</summary>
                     <div class="q-stop-details-body">
                       ${
