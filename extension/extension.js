@@ -750,7 +750,7 @@ function callAntigravityLsRpc(methodName, bodyObj, env, timeoutMs = 10000) {
  * CLI bug where an empty `ANTIGRAVITY_PROJECT_ID` sends `project_env_config: { project_id: "" }`
  * and fails with `project_id is required when providing project_env_config`.
  */
-async function startNewCascadeViaLsHttp(prompt, title, effectiveWsRoot, effortLevel, env) {
+async function resolveRequestedModelForEffort(effortLevel, env) {
   let requestedModel = 'MODEL_PLACEHOLDER_M260';
   try {
     const modelData = await callAntigravityLsRpc('GetCascadeModelConfigData', {}, env, 6000);
@@ -786,6 +786,49 @@ async function startNewCascadeViaLsHttp(prompt, title, effectiveWsRoot, effortLe
       }
     }
   } catch (_) {}
+  return requestedModel;
+}
+
+/**
+ * Sends a user prompt directly into an existing Antigravity chat session (`cascadeId`)
+ * via LanguageServer `SendUserCascadeMessage` RPC when `agentapi send-message` cannot wake it.
+ */
+async function sendToExistingCascadeViaLsHttp(cascadeId, prompt, effortLevel, env) {
+  if (!cascadeId) {
+    throw new Error('cascadeId is required');
+  }
+  const requestedModel = await resolveRequestedModelForEffort(effortLevel, env);
+  await callAntigravityLsRpc(
+    'SendUserCascadeMessage',
+    {
+      cascadeId: String(cascadeId).trim(),
+      items: [{ text: String(prompt) }],
+      cascadeConfig: {
+        plannerConfig: {
+          conversational: {},
+          requestedModel: { model: requestedModel },
+        },
+      },
+      blocking: false,
+    },
+    env,
+    12000
+  );
+  return {
+    success: true,
+    stdout: JSON.stringify({ conversationId: cascadeId }),
+    conversationId: cascadeId,
+  };
+}
+
+/**
+ * Starts a new Antigravity conversation directly via the LanguageServer Connect-RPC HTTP API
+ * using `workspaceUris` instead of `projectEnvConfig`. This avoids the `agentapi new-conversation`
+ * CLI bug where an empty `ANTIGRAVITY_PROJECT_ID` sends `project_env_config: { project_id: "" }`
+ * and fails with `project_id is required when providing project_env_config`.
+ */
+async function startNewCascadeViaLsHttp(prompt, title, effectiveWsRoot, effortLevel, env) {
+  const requestedModel = await resolveRequestedModelForEffort(effortLevel, env);
 
   const workspaceUris = [];
   if (
@@ -864,12 +907,13 @@ function detectActiveConversationId(targetWorkspaceRoot = null, env = null, pref
   const sessConvId = extractSessionConversationId(sess);
   if (sessConvId) {
     const resolvedSessConvId = resolveRootConversationId(sessConvId, env);
+    if (getUndeliveredMessageFiles(resolvedSessConvId).length > 0) {
+      clearUndeliveredMessages(resolvedSessConvId);
+    }
     if (!isConversationBlockedOrUndeliverable(resolvedSessConvId)) {
       return resolvedSessConvId;
     }
-    // Session conversation is blocked or has undelivered messages: clean up its stuck queue
-    // and clear the stale conversationId from active_session.json so future calls start fresh.
-    clearUndeliveredMessages(resolvedSessConvId);
+    // Session conversation is blocked on a pending tool call: clear the stale conversationId
     if (sess && sess.conversationId === sessConvId) {
       try {
         delete sess.conversationId;
@@ -877,6 +921,103 @@ function detectActiveConversationId(targetWorkspaceRoot = null, env = null, pref
       } catch (_) {}
     }
   }
+
+  // Fallback: scan recent conversations in ~/.gemini/*/brain to find the most recently active
+  // root conversation belonging to the target workspace (or this window's workspace).
+  const rawWs =
+    targetWorkspaceRoot ||
+    (sess && (sess.workspaceDir || sess.repoDir)) ||
+    getWindowWorkspaceRoot();
+  const normTargetWs =
+    rawWs && !String(rawWs).startsWith(REVIEW_STATE_DIR) ? resolveWorkspaceRootSync(rawWs) : null;
+
+  const geminiRoot = path.join(os.homedir(), '.gemini');
+  if (!fs.existsSync(geminiRoot)) return null;
+
+  try {
+    const candidates = [];
+    for (const appEntry of fs.readdirSync(geminiRoot, { withFileTypes: true })) {
+      if (!appEntry.isDirectory()) continue;
+      const brainDir = path.join(geminiRoot, appEntry.name, 'brain');
+      if (!fs.existsSync(brainDir)) continue;
+      for (const convEntry of fs.readdirSync(brainDir, { withFileTypes: true })) {
+        if (!convEntry.isDirectory()) continue;
+        const cid = convEntry.name;
+        if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(cid)) {
+          continue;
+        }
+        const tPath = path.join(brainDir, cid, '.system_generated', 'logs', 'transcript.jsonl');
+        if (fs.existsSync(tPath)) {
+          try {
+            const st = fs.statSync(tPath);
+            candidates.push({ cid, mtimeMs: st.mtimeMs });
+          } catch (_) {}
+        }
+      }
+    }
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    const exe = getAgentApiBinary();
+    const seenRoots = new Set();
+
+    for (const cand of candidates.slice(0, 8)) {
+      let rootId = cand.cid;
+      let matchesWorkspace = !normTargetWs;
+      if (env && env.ANTIGRAVITY_LS_ADDRESS) {
+        try {
+          const out = execFileSync(exe, ['get-conversation-metadata', cand.cid], {
+            env,
+            encoding: 'utf8',
+            timeout: 2500,
+          });
+          const jsonStart = out.indexOf('{');
+          if (jsonStart >= 0) {
+            const parsed = JSON.parse(out.slice(jsonStart));
+            const meta =
+              parsed &&
+              parsed.response &&
+              parsed.response.conversationMetadata &&
+              parsed.response.conversationMetadata.metadata;
+            if (meta) {
+              if (meta.rootConversationId) {
+                rootId = meta.rootConversationId;
+              }
+              if (normTargetWs) {
+                const wsUris = Array.isArray(meta.workspaceUris) ? meta.workspaceUris : [];
+                matchesWorkspace = wsUris.some((u) => {
+                  if (typeof u !== 'string' || !u.startsWith('file://')) return false;
+                  try {
+                    const fsP = resolveWorkspaceRootSync(decodeURIComponent(u.slice('file://'.length)));
+                    return (
+                      fsP === normTargetWs ||
+                      normTargetWs.startsWith(fsP + path.sep) ||
+                      fsP.startsWith(normTargetWs + path.sep)
+                    );
+                  } catch (_) {
+                    return false;
+                  }
+                });
+              }
+            }
+          }
+        } catch (_) {}
+      }
+      if (!matchesWorkspace || seenRoots.has(rootId)) continue;
+      seenRoots.add(rootId);
+      if (getUndeliveredMessageFiles(rootId).length > 0) {
+        clearUndeliveredMessages(rootId);
+      }
+      if (!isConversationBlockedOrUndeliverable(rootId)) {
+        if (sess) {
+          try {
+            sess.conversationId = rootId;
+            saveActiveSession(sess);
+          } catch (_) {}
+        }
+        return rootId;
+      }
+    }
+  } catch (_) {}
+
   return null;
 }
 
@@ -985,19 +1126,35 @@ function sendPromptToQuasar(prompt, title = 'Quasar', targetWorkspaceRoot = null
       });
     };
 
+    const tryExistingCascadeHttpBeforeNew = () => {
+      if (!convId || isConversationBlockedOrUndeliverable(convId)) {
+        startNewConversation();
+        return;
+      }
+      sendToExistingCascadeViaLsHttp(convId, prompt, effortLevel, env)
+        .then((existingRes) => {
+          persistNewConvId(convId);
+          resolve(existingRes);
+        })
+        .catch(() => {
+          startNewConversation();
+        });
+    };
+
     if (convId && !isConversationBlockedOrUndeliverable(convId)) {
       runAgentApi(['send-message', `--title=${title}`, convId, prompt], (res) => {
         if (!res.success) {
-          startNewConversation();
+          tryExistingCascadeHttpBeforeNew();
           return;
         }
         // Verify that the target conversation actually dequeued the message within 1.2s;
-        // if it remains in `.system_generated/messages/undelivered`, the conversation is
-        // inactive/blocked, so clean up the stuck message and start a new conversation.
+        // if it remains in `.system_generated/messages/undelivered`, clean up the stuck
+        // message and try sending directly via SendUserCascadeMessage to the same session
+        // before falling back to starting a new conversation.
         setTimeout(() => {
           if (getUndeliveredMessageFiles(convId).length > 0) {
             clearUndeliveredMessages(convId);
-            startNewConversation();
+            tryExistingCascadeHttpBeforeNew();
           } else {
             resolve(res);
           }
@@ -7121,8 +7278,7 @@ function activate(context) {
       const dispatchRes = await sendPromptToQuasar(
         res.agentPrompt,
         `Quasar Fix (${targetIds.length} comment${targetIds.length === 1 ? '' : 's'})`,
-        res.repoDir || session.repoDir || null,
-        { forceNewConversation: true }
+        res.repoDir || session.repoDir || null
       );
 
       const prefNote =

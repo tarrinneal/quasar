@@ -289,6 +289,50 @@ def dispatch_to_agent(
             except Exception:
                 pass
 
+    def _call_ls_rpc(method: str, body_obj: Dict[str, Any], timeout_s: float = 10.0) -> Dict[str, Any]:
+        ls_addr = (env.get("ANTIGRAVITY_LS_ADDRESS") or "").strip()
+        csrf_token = (env.get("ANTIGRAVITY_CSRF_TOKEN") or "").strip()
+        if not ls_addr or not csrf_token:
+            raise RuntimeError("ANTIGRAVITY_LS_ADDRESS or ANTIGRAVITY_CSRF_TOKEN is unavailable")
+        url = f"http://{ls_addr}/exa.language_server_pb.LanguageServerService/{method}"
+        data_bytes = json.dumps(body_obj).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data_bytes,
+            headers={
+                "Content-Type": "application/json",
+                "Connect-Protocol-Version": "1",
+                "x-codeium-csrf-token": csrf_token,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8", errors="replace").strip()
+            parsed = json.loads(raw) if raw else {}
+            if isinstance(parsed, dict) and parsed.get("code") and parsed.get("message"):
+                raise RuntimeError(str(parsed.get("message")))
+            return parsed if isinstance(parsed, dict) else {}
+
+    def _resolve_requested_model() -> str:
+        requested_model = "MODEL_PLACEHOLDER_M260"
+        try:
+            model_data = _call_ls_rpc("GetCascadeModelConfigData", {}, 6.0)
+            def_m = (
+                ((model_data.get("defaultOverrideModelConfig") or {}).get("modelOrAlias") or {}).get("model")
+            )
+            if def_m:
+                requested_model = str(def_m)
+            else:
+                for cfg in model_data.get("clientModelConfigs") or []:
+                    if isinstance(cfg, dict) and cfg.get("isRecommended"):
+                        m = ((cfg.get("modelOrAlias") or {}).get("model") or "").strip()
+                        if m:
+                            requested_model = m
+                            break
+        except Exception:
+            pass
+        return requested_model
+
     if conv_id and _is_conv_deliverable(conv_id):
         try:
             proc = subprocess.run(
@@ -314,49 +358,38 @@ def dispatch_to_agent(
         except Exception:
             pass
 
+        if _is_conv_deliverable(conv_id):
+            try:
+                requested_model = _resolve_requested_model()
+                _call_ls_rpc(
+                    "SendUserCascadeMessage",
+                    {
+                        "cascadeId": conv_id,
+                        "items": [{"text": str(prompt)}],
+                        "cascadeConfig": {
+                            "plannerConfig": {
+                                "conversational": {},
+                                "requestedModel": {"model": requested_model},
+                            }
+                        },
+                        "blocking": False,
+                    },
+                    12.0,
+                )
+                _record_active(conv_id, "send-message")
+                return {
+                    "ok": True,
+                    "mode": "send-message",
+                    "conversationId": conv_id,
+                    "projectId": project_id,
+                    "workspaceDir": resolved_ws,
+                    "stdout": json.dumps({"conversationId": conv_id}),
+                }
+            except Exception:
+                pass
+
     def _start_cascade_via_ls_http() -> Dict[str, Any]:
-        ls_addr = (env.get("ANTIGRAVITY_LS_ADDRESS") or "").strip()
-        csrf_token = (env.get("ANTIGRAVITY_CSRF_TOKEN") or "").strip()
-        if not ls_addr or not csrf_token:
-            raise RuntimeError("ANTIGRAVITY_LS_ADDRESS or ANTIGRAVITY_CSRF_TOKEN is unavailable")
-
-        def _call_ls_rpc(method: str, body_obj: Dict[str, Any], timeout_s: float = 10.0) -> Dict[str, Any]:
-            url = f"http://{ls_addr}/exa.language_server_pb.LanguageServerService/{method}"
-            data_bytes = json.dumps(body_obj).encode("utf-8")
-            req = urllib.request.Request(
-                url,
-                data=data_bytes,
-                headers={
-                    "Content-Type": "application/json",
-                    "Connect-Protocol-Version": "1",
-                    "x-codeium-csrf-token": csrf_token,
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                raw = resp.read().decode("utf-8", errors="replace").strip()
-                parsed = json.loads(raw) if raw else {}
-                if isinstance(parsed, dict) and parsed.get("code") and parsed.get("message"):
-                    raise RuntimeError(str(parsed.get("message")))
-                return parsed if isinstance(parsed, dict) else {}
-
-        requested_model = "MODEL_PLACEHOLDER_M260"
-        try:
-            model_data = _call_ls_rpc("GetCascadeModelConfigData", {}, 6.0)
-            def_m = (
-                ((model_data.get("defaultOverrideModelConfig") or {}).get("modelOrAlias") or {}).get("model")
-            )
-            if def_m:
-                requested_model = str(def_m)
-            else:
-                for cfg in model_data.get("clientModelConfigs") or []:
-                    if isinstance(cfg, dict) and cfg.get("isRecommended"):
-                        m = ((cfg.get("modelOrAlias") or {}).get("model") or "").strip()
-                        if m:
-                            requested_model = m
-                            break
-        except Exception:
-            pass
+        requested_model = _resolve_requested_model()
 
         start_req: Dict[str, Any] = {
             "baseTrajectoryIdentifier": {"lastActiveDoc": True},
