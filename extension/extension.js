@@ -1301,6 +1301,8 @@ function listPastReviews() {
   return Array.from(byId.values()).sort((a, b) => b.updatedMs - a.updatedMs);
 }
 
+let suppressSelfWatchUntil = 0;
+
 function saveActiveSession(session) {
   try {
     const stateDir = getWindowStateDir();
@@ -1310,6 +1312,7 @@ function saveActiveSession(session) {
     session.stateDir = stateDir;
     session.windowId = THIS_WINDOW_ID;
     session.windowPid = THIS_WINDOW_PID;
+    suppressSelfWatchUntil = Date.now() + 650;
     fs.writeFileSync(getWindowActiveSessionPath(), JSON.stringify(session, null, 2), 'utf-8');
     archiveSessionToHistory(session, getWindowCliffsNotesMdPath());
   } catch (err) {
@@ -3227,9 +3230,53 @@ function activate(context) {
   };
 
   let activeCommentThreads = new Map();
+  let activeThreadMeta = new Map();
+  let activeRevealToken = 0;
   let lastSessionId = null;
   let lastAnalysisStatus = null;
   let codeLensEmitter = new vscode.EventEmitter();
+
+  /**
+   * Reliably scrolls the visible editor for `targetFsPath` so `targetRange` (and any expanded
+   * inline CommentThread widget right below it) stays centered on screen even after Monaco's
+   * async diff chunks, folded unchanged regions, and ZoneWidget heights finish laying out.
+   */
+  function revealRangeInVisibleEditor(targetFsPath, targetRange, focusCursor = true) {
+    if (!targetFsPath || !targetRange) return;
+    const myToken = ++activeRevealToken;
+    const normTarget = path.resolve(targetFsPath);
+    const applyReveal = () => {
+      if (myToken !== activeRevealToken) return;
+      const editor = vscode.window.visibleTextEditors.find(
+        (ed) => ed && ed.document && path.resolve(ed.document.uri.fsPath) === normTarget
+      );
+      if (!editor) return;
+      const maxLine = Math.max(0, editor.document.lineCount - 1);
+      const clampedStart = new vscode.Position(
+        Math.min(maxLine, Math.max(0, targetRange.start.line)),
+        0
+      );
+      const clampedEnd = new vscode.Position(
+        Math.min(maxLine, Math.max(clampedStart.line, targetRange.end.line)),
+        0
+      );
+      const safeRange = new vscode.Range(clampedStart, clampedEnd);
+      if (focusCursor) {
+        const curSel = editor.selection;
+        if (
+          !curSel ||
+          curSel.active.line !== clampedStart.line ||
+          curSel.anchor.line !== clampedStart.line
+        ) {
+          editor.selection = new vscode.Selection(clampedStart, clampedStart);
+        }
+      }
+      editor.revealRange(safeRange, vscode.TextEditorRevealType.InCenter);
+    };
+    applyReveal();
+    setTimeout(applyReveal, 80);
+    setTimeout(applyReveal, 240);
+  }
 
   function updateStatusBar(session) {
     if (!session || !session.pr) {
@@ -3264,25 +3311,35 @@ function activate(context) {
 
   /**
    * Synchronizes the native vscode.CommentThread instances in the diff editor
-   * with `session.threads` (Review Findings, Uncertain Preference Checks, Staged Comments, In-Code Q&A, Existing GitHub Comments).
+   * with `session.threads` IN PLACE so asking questions, receiving agent answers,
+   * or staging/queuing comments never tears down ZoneWidgets or jumps the scroll viewport.
    */
   function syncNativeCommentThreads(session) {
-    for (const oldThread of activeCommentThreads.values()) {
-      oldThread.dispose();
+    if (!session || !Array.isArray(session.threads)) {
+      for (const oldThread of activeCommentThreads.values()) {
+        try {
+          oldThread.dispose();
+        } catch (_) {}
+      }
+      activeCommentThreads.clear();
+      activeThreadMeta.clear();
+      return;
     }
-    activeCommentThreads.clear();
 
-    if (!session || !Array.isArray(session.threads)) return;
     const isOwned = !session.pr || session.pr.isOwnedByUser !== false;
+    const validThreadIds = new Set();
 
     for (const t of session.threads) {
-      if (t.status === 'dismissed' || !t.path) continue;
+      if (!t || !t.id || t.status === 'dismissed' || !t.path) continue;
       const headFilePath = session.headSnapshotRoot
         ? path.join(session.headSnapshotRoot, t.path)
         : session.repoDir
         ? path.join(session.repoDir, t.path)
         : null;
       if (!headFilePath || !fs.existsSync(headFilePath)) continue;
+
+      const threadKey = String(t.id);
+      validThreadIds.add(threadKey);
 
       const startLine = Math.max(0, (t.startLine || 1) - 1);
       const endLine = Math.max(startLine, (t.endLine || t.startLine || 1) - 1);
@@ -3382,28 +3439,22 @@ function activate(context) {
                 : rawMessages.length - 1
             )
           : 0;
-      const comments = rawMessages.map((m, idx) => {
-        const bodyText =
-          (m.body || '') + (idx === actionTargetIdx ? solutionOptionsMd + fixActionBarMd : '');
-        const md = new vscode.MarkdownString(bodyText, true);
+      const commentPayloads = rawMessages.map((m, idx) => ({
+        authorName: m.author || 'Quasar',
+        bodyText: (m.body || '') + (idx === actionTargetIdx ? solutionOptionsMd + fixActionBarMd : ''),
+        contextValue: `quasar-comment:${fixStateTag}`,
+      }));
+      const comments = commentPayloads.map((cp) => {
+        const md = new vscode.MarkdownString(cp.bodyText, true);
         md.isTrusted = true;
         return {
-          author: { name: m.author || 'Quasar' },
+          author: { name: cp.authorName },
           body: md,
           mode: vscode.CommentMode.Preview,
           threadId: t.id,
-          contextValue: `quasar-comment:${fixStateTag}`,
+          contextValue: cp.contextValue,
         };
       });
-
-      const thread = commentController.createCommentThread(
-        vscode.Uri.file(headFilePath),
-        range,
-        comments
-      );
-      thread.threadId = t.id;
-      thread.relPath = t.path;
-      thread.canReply = true;
 
       const queuedSuffix = isFixInProgress
         ? ' [🔧 FIXING...]'
@@ -3419,16 +3470,19 @@ function activate(context) {
             : ''
           : '';
 
+      let desiredContextValue = '';
+      let desiredLabel = '';
+      let initialCollapsible = vscode.CommentThreadCollapsibleState.Expanded;
+
       if (t.status === 'fixed') {
-        thread.contextValue = `fixed:${fixStateTag}`;
-        thread.label = `✅ Fixed in Working Tree — ${t.title || ''}`;
-        thread.collapsibleState = vscode.CommentThreadCollapsibleState.Collapsed;
+        desiredContextValue = `fixed:${fixStateTag}`;
+        desiredLabel = `✅ Fixed in Working Tree — ${t.title || ''}`;
+        initialCollapsible = vscode.CommentThreadCollapsibleState.Collapsed;
       } else if (t.status === 'uncertain') {
-        thread.contextValue = `uncertain:${fixStateTag}${hasSolutionsTag}`;
-        thread.label = `🤔 Flagged to Review (Calibrate Preference)${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
-        thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+        desiredContextValue = `uncertain:${fixStateTag}${hasSolutionsTag}`;
+        desiredLabel = `🤔 Flagged to Review (Calibrate Preference)${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
       } else if (t.status === 'staged') {
-        thread.contextValue = `staged:${fixStateTag}${hasSolutionsTag}`;
+        desiredContextValue = `staged:${fixStateTag}${hasSolutionsTag}`;
         const sev = (t.severity || '').toUpperCase();
         const badge = sev.includes('BLOCK')
           ? '🔴 Blocking'
@@ -3437,38 +3491,201 @@ function activate(context) {
           : sev.includes('NIT')
           ? '🟢 Nit'
           : '💬 Review';
-        thread.label = `✅ Staged for GitHub Review (${badge})${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
-        thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+        desiredContextValue = `staged:${fixStateTag}${hasSolutionsTag}`;
+        desiredLabel = `✅ Staged for GitHub Review (${badge})${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
       } else if (t.kind === 'ai_candidate') {
-        thread.contextValue = `candidate:${fixStateTag}${hasSolutionsTag}`;
+        desiredContextValue = `candidate:${fixStateTag}${hasSolutionsTag}`;
         const sev = (t.severity || '').toUpperCase();
         const badge = sev.includes('BLOCK')
           ? '🔴 Blocking'
           : sev.includes('DESIGN')
           ? '🟡 Design'
           : '🟢 Nit';
-        thread.label = `${badge} Draft (Unstaged)${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
-        thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+        desiredLabel = `${badge} Draft (Unstaged)${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
       } else if (t.kind === 'user_qa') {
-        thread.contextValue = `qa:${fixStateTag}${hasSolutionsTag}`;
-        thread.label = `💬 Quasar Q&A${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
-        thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+        desiredContextValue = `qa:${fixStateTag}${hasSolutionsTag}`;
+        desiredLabel = `💬 Quasar Q&A${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
       } else {
-        thread.contextValue = `existing:${fixStateTag}${hasSolutionsTag}`;
+        desiredContextValue = `existing:${fixStateTag}${hasSolutionsTag}`;
         const triageHeader = ghTriage ? ghTriage.triageBadge : '👀 Existing GitHub Comment';
         const cleanThreadTitle = String(t.title || '').replace(
           /^(?:🛠️|⚠️|✅|💬|❓|👀|🤔|🔴|🟡|🟢)\s*\[[^\]]+\]\s*/,
           ''
         );
-        thread.label = `${triageHeader}${queuedSuffix}${solutionSuffix} — ${cleanThreadTitle}`;
-        thread.collapsibleState =
+        desiredLabel = `${triageHeader}${queuedSuffix}${solutionSuffix} — ${cleanThreadTitle}`;
+        initialCollapsible =
           ghTriage && ghTriage.triageStatus === 'addressed_or_refuted'
             ? vscode.CommentThreadCollapsibleState.Collapsed
             : vscode.CommentThreadCollapsibleState.Expanded;
       }
 
-      activeCommentThreads.set(t.id, thread);
+      const normHeadFsPath = path.resolve(headFilePath);
+      const signature = JSON.stringify({
+        p: normHeadFsPath,
+        s: startLine,
+        e: endLine,
+        cv: desiredContextValue,
+        l: desiredLabel,
+        c: commentPayloads,
+      });
+
+      let thread = activeCommentThreads.get(threadKey);
+      const prevMeta = activeThreadMeta.get(threadKey);
+
+      if (thread && prevMeta && prevMeta.uriFsPath !== normHeadFsPath) {
+        try {
+          thread.dispose();
+        } catch (_) {}
+        thread = null;
+      }
+
+      if (!thread) {
+        thread = commentController.createCommentThread(
+          vscode.Uri.file(headFilePath),
+          range,
+          comments
+        );
+        thread.threadId = t.id;
+        thread.relPath = t.path;
+        thread.canReply = true;
+        thread.contextValue = desiredContextValue;
+        thread.label = desiredLabel;
+        thread.collapsibleState = initialCollapsible;
+        activeCommentThreads.set(threadKey, thread);
+      } else if (!prevMeta || prevMeta.signature !== signature) {
+        thread.threadId = t.id;
+        thread.relPath = t.path;
+        thread.canReply = true;
+        if (
+          !thread.range ||
+          thread.range.start.line !== startLine ||
+          thread.range.end.line !== endLine
+        ) {
+          thread.range = range;
+        }
+        if (thread.contextValue !== desiredContextValue) {
+          thread.contextValue = desiredContextValue;
+        }
+        if (thread.label !== desiredLabel) {
+          thread.label = desiredLabel;
+        }
+        if (!prevMeta || prevMeta.commentsSig !== JSON.stringify(commentPayloads)) {
+          thread.comments = comments;
+        }
+        // Preserve the user's current expanded/collapsed state, except collapse newly fixed threads
+        // or expand a thread when a new Q&A message / reply was just added to it.
+        if (t.status === 'fixed' && (!prevMeta || prevMeta.status !== 'fixed')) {
+          thread.collapsibleState = vscode.CommentThreadCollapsibleState.Collapsed;
+        } else if (prevMeta && comments.length > prevMeta.commentCount) {
+          thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+        } else if (!prevMeta) {
+          thread.collapsibleState = initialCollapsible;
+        }
+      }
+
+      activeThreadMeta.set(threadKey, {
+        uriFsPath: normHeadFsPath,
+        signature,
+        commentsSig: JSON.stringify(commentPayloads),
+        status: t.status,
+        commentCount: comments.length,
+      });
     }
+
+    for (const [oldId, oldThread] of activeCommentThreads.entries()) {
+      if (!validThreadIds.has(oldId)) {
+        try {
+          oldThread.dispose();
+        } catch (_) {}
+        activeCommentThreads.delete(oldId);
+        activeThreadMeta.delete(oldId);
+      }
+    }
+  }
+
+  /**
+   * Opens a comment thread's file in the diff editor, expands the target CommentThread,
+   * and centers the anchored line + comment widget reliably after diff & ZoneWidget layout.
+   */
+  async function jumpToCommentThread(threadData, opts = {}) {
+    const session = loadActiveSession();
+    if (!session || !threadData) return;
+    const rawT = threadData.threadData || threadData;
+    const t =
+      (rawT &&
+        rawT.id &&
+        Array.isArray(session.threads) &&
+        session.threads.find((cand) => String(cand.id) === String(rawT.id))) ||
+      rawT;
+    if (!t) return;
+
+    const preserveFocus = Boolean(opts.preserveFocus);
+    const liveThread = t.id ? activeCommentThreads.get(String(t.id)) : null;
+    if (liveThread) {
+      liveThread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+    }
+
+    const startLine0 = liveThread
+      ? liveThread.range.start.line
+      : Math.max(0, (t.startLine || 1) - 1);
+    const endLine0 = liveThread
+      ? Math.max(startLine0, liveThread.range.end.line)
+      : Math.max(startLine0, (t.endLine || t.startLine || 1) - 1);
+    const targetRange = new vscode.Range(startLine0, 0, endLine0, 0);
+
+    if (!t.path) {
+      const tf = t.targetFile || '';
+      const localFile = tf && session.repoDir ? path.join(session.repoDir, tf) : '';
+      if (localFile && fs.existsSync(localFile)) {
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(localFile));
+        await vscode.window.showTextDocument(doc, {
+          selection: targetRange,
+          preserveFocus,
+          preview: true,
+        });
+        revealRangeInVisibleEditor(localFile, targetRange, !preserveFocus);
+        return;
+      }
+      await vscode.commands.executeCommand('quasar.openCliffsNotes');
+      return;
+    }
+
+    const baseFilePath = path.join(session.baseSnapshotRoot || '', t.path);
+    const headFilePath = session.headSnapshotRoot
+      ? path.join(session.headSnapshotRoot, t.path)
+      : session.repoDir
+      ? path.join(session.repoDir, t.path)
+      : '';
+    if (!headFilePath || !fs.existsSync(headFilePath)) return;
+
+    if (!session.baseSnapshotRoot || !fs.existsSync(baseFilePath)) {
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(headFilePath));
+      await vscode.window.showTextDocument(doc, {
+        selection: targetRange,
+        preserveFocus,
+        preview: true,
+      });
+      revealRangeInVisibleEditor(headFilePath, targetRange, !preserveFocus);
+      return;
+    }
+
+    const baseUri = vscode.Uri.file(baseFilePath);
+    const headUri = vscode.Uri.file(headFilePath);
+    await vscode.commands.executeCommand(
+      'vscode.diff',
+      baseUri,
+      headUri,
+      `${path.basename(t.path)} (PR Diff)`,
+      {
+        selection: targetRange,
+        preserveFocus,
+        preview: true,
+      }
+    );
+    if (liveThread) {
+      liveThread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+    }
+    revealRangeInVisibleEditor(headFilePath, targetRange, !preserveFocus);
   }
 
   /**
@@ -3478,12 +3695,10 @@ function activate(context) {
     const session = loadActiveSession();
     if (!session || !stop) return;
 
-    const baseUri = vscode.Uri.file(
-      stop.baseSnapshotPath || path.join(session.baseSnapshotRoot || '', stop.path)
-    );
-    const headUri = vscode.Uri.file(
-      stop.headSnapshotPath || path.join(session.headSnapshotRoot || '', stop.path)
-    );
+    const baseFilePath = stop.baseSnapshotPath || path.join(session.baseSnapshotRoot || '', stop.path);
+    const headFilePath = stop.headSnapshotPath || path.join(session.headSnapshotRoot || '', stop.path);
+    const baseUri = vscode.Uri.file(baseFilePath);
+    const headUri = vscode.Uri.file(headFilePath);
 
     const diffTitle = `[Stop ${stop.stopNumber}] ${path.basename(stop.path)} — ${
       stop.cliffsNotes || stop.description || ''
@@ -3491,12 +3706,14 @@ function activate(context) {
 
     const startLine0 = Math.max(0, (stop.startLine || 1) - 1);
     const endLine0 = Math.max(startLine0, (stop.endLine || stop.startLine || 1) - 1);
+    const targetRange = new vscode.Range(startLine0, 0, endLine0, 0);
 
     await vscode.commands.executeCommand('vscode.diff', baseUri, headUri, diffTitle, {
-      selection: new vscode.Range(startLine0, 0, endLine0, 0),
+      selection: targetRange,
       preserveFocus,
       preview: true,
     });
+    revealRangeInVisibleEditor(headFilePath, targetRange, !preserveFocus);
 
     // Mark stop as read
     let updated = false;
@@ -5050,34 +5267,46 @@ function activate(context) {
     codeLensEmitter.fire();
     updateCliffsNotesWebviewContent();
 
-    if (session && autoOpenIfNew) {
-      const isNewSession = session.sessionId !== lastSessionId;
-      const justFinishedAnalysis =
-        lastAnalysisStatus === 'analyzing' && session.analysisStatus === 'ready';
+    if (!session) {
+      lastSessionId = null;
+      lastAnalysisStatus = null;
+      return;
+    }
+
+    if (!autoOpenIfNew) {
+      // Always track the current session on silent/startup refreshes so subsequent fs.watch
+      // updates (like inline Q&A answers) do NOT mistake an already-open session for a brand-new one!
       lastSessionId = session.sessionId;
       lastAnalysisStatus = session.analysisStatus;
+      return;
+    }
 
-      if (isNewSession) {
-        maybePromptToCheckoutOwnedPrBranch(session);
-      }
+    const isNewSession = session.sessionId !== lastSessionId;
+    const justFinishedAnalysis =
+      lastAnalysisStatus === 'analyzing' && session.analysisStatus === 'ready';
+    lastSessionId = session.sessionId;
+    lastAnalysisStatus = session.analysisStatus;
 
-      if (isNewSession || justFinishedAnalysis) {
-        if (session.commentsOnly) {
-          const activeThreads = (session.threads || []).filter((t) => t.status !== 'dismissed');
-          if (activeThreads.length > 0 && typeof jumpToThreadInDiff === 'function') {
-            jumpToThreadInDiff(activeThreads[0]);
-          }
-          if (justFinishedAnalysis) {
-            vscode.commands.executeCommand('quasar.commentsTree.focus').catch(() => {});
-          }
-        } else {
-          const stops = getAllTourStops(session);
-          if (stops.length > 0) {
-            openTourStopInDiff(stops[0], true);
-          }
-          if (justFinishedAnalysis) {
-            openInteractiveCliffsNotesPanel().catch(() => {});
-          }
+    if (isNewSession) {
+      maybePromptToCheckoutOwnedPrBranch(session);
+    }
+
+    if (isNewSession || justFinishedAnalysis) {
+      if (session.commentsOnly) {
+        const activeThreads = (session.threads || []).filter((t) => t.status !== 'dismissed');
+        if (activeThreads.length > 0) {
+          jumpToCommentThread(activeThreads[0], { preserveFocus: true }).catch(() => {});
+        }
+        if (justFinishedAnalysis) {
+          vscode.commands.executeCommand('quasar.commentsTree.focus').catch(() => {});
+        }
+      } else {
+        const stops = getAllTourStops(session);
+        if (stops.length > 0) {
+          openTourStopInDiff(stops[0], true);
+        }
+        if (justFinishedAnalysis) {
+          openInteractiveCliffsNotesPanel().catch(() => {});
         }
       }
     }
@@ -5175,8 +5404,12 @@ function activate(context) {
     try {
       windowStateWatcher = fs.watch(myStateDir, (_eventType, filename) => {
         if (!filename || filename === 'active_session.json') {
+          if (Date.now() < suppressSelfWatchUntil) return;
           if (watchDebounce) clearTimeout(watchDebounce);
-          watchDebounce = setTimeout(() => refreshAllUI(true), 180);
+          watchDebounce = setTimeout(() => {
+            if (Date.now() < suppressSelfWatchUntil) return;
+            refreshAllUI(true);
+          }, 180);
         }
       });
     } catch (_) {}
@@ -5913,36 +6146,7 @@ function activate(context) {
   // 5. Jump to Comment Thread
   context.subscriptions.push(
     vscode.commands.registerCommand('quasar.jumpToThread', async (threadData) => {
-      const session = loadActiveSession();
-      if (!session || !threadData) return;
-      const t = threadData.threadData || threadData;
-      const line0 = Math.max(0, (t.startLine || 1) - 1);
-      if (!t.path) {
-        const tf = t.targetFile || '';
-        const localFile = tf && session.repoDir ? path.join(session.repoDir, tf) : '';
-        if (localFile && fs.existsSync(localFile)) {
-          const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(localFile));
-          await vscode.window.showTextDocument(doc, {
-            selection: new vscode.Range(line0, 0, line0, 0),
-            preview: true,
-          });
-          return;
-        }
-        await vscode.commands.executeCommand('quasar.openCliffsNotes');
-        return;
-      }
-      const baseUri = vscode.Uri.file(path.join(session.baseSnapshotRoot || '', t.path));
-      const headUri = vscode.Uri.file(path.join(session.headSnapshotRoot || '', t.path));
-      await vscode.commands.executeCommand(
-        'vscode.diff',
-        baseUri,
-        headUri,
-        `[Comment] ${path.basename(t.path)}:L${t.startLine || 1}`,
-        {
-          selection: new vscode.Range(line0, 0, line0, 0),
-          preview: true,
-        }
-      );
+      await jumpToCommentThread(threadData, { preserveFocus: false });
     })
   );
 
@@ -6092,7 +6296,14 @@ function activate(context) {
 
     if (!threadId || !existingThread) {
       threadId = `qa-${Date.now()}`;
-      if (thread) thread.threadId = threadId;
+      if (thread) {
+        thread.threadId = threadId;
+        thread.relPath = relPath;
+        if (thread.uri && typeof thread.dispose === 'function') {
+          thread.canReply = true;
+          activeCommentThreads.set(threadId, thread);
+        }
+      }
       session.threads = session.threads || [];
       session.threads.push({
         id: threadId,
@@ -8627,6 +8838,7 @@ function activate(context) {
       } catch (_) {}
     }
     activeCommentThreads.clear();
+    activeThreadMeta.clear();
     lastSessionId = null;
     lastAnalysisStatus = null;
     refreshAllUI(false);

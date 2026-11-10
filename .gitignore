@@ -3,4 +3,7 @@ __pycache__/
 .DS_Store
 node_modules/
 *.vsix
+*.tar.gz
+plugin/sidecars/quasar-web/flutter_web/
+plugin/sidecars/quasar-web/mermaid-preview.js
 release.sh

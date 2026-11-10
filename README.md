@@ -51,6 +51,22 @@ After reloading the window, you can open **Quasar** from **3 places**:
    - `Quasar: Manage & Calibrate Reviewer Preferences...`
 3. **Source Control (`Git`) Sidebar Header**: Click the **branch** or **PR** icon buttons at the top-right of the Source Control panel.
 
+### 🌐 Standalone Mode (Zero-Install Web App or Native Flutter Desktop — Powered by `agy` CLI)
+Don't want to use an IDE extension or install Flutter? You can install just the prebuilt **Standalone Web App + `quasar` CLI** in one command:
+```bash
+curl -fsSL https://github.com/tarrinneal/quasar/releases/latest/download/install-standalone.sh | bash
+```
+Or from a local checkout (`./install.sh --standalone-only` skips VS Code extensions; `./install.sh --vscode-only` installs only the IDE extension):
+```bash
+# Zero-install Web mode (serves the compiled Flutter Web app on http://127.0.0.1:49341 and opens a standalone app window):
+quasar
+quasar https://github.com/org/repo/pull/123 --repo /path/to/repo
+quasar --branch main --repo /path/to/repo
+
+# Native macOS Desktop mode (builds/launches the native Flutter macOS app):
+quasar --desktop
+```
+
 ---
 
 ## 🤖 Agent Setup Playbook (Copy-Paste Instructions for an AI Agent)

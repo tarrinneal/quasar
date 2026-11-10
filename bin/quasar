@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# Quasar Standalone Launcher (Web App & macOS Desktop App) powered by Antigravity CLI (`agy`)
+#
+# Usage:
+#   quasar                                    # Launch Quasar Web App (zero install) on http://127.0.0.1:49341
+#   quasar https://github.com/org/repo/pull/1 # Start a PR review via `agy` CLI & open Quasar
+#   quasar --branch [branch] [--repo <dir>]   # Start a local branch review via `agy` CLI & open Quasar
+#   quasar --desktop                          # Launch native Flutter macOS Desktop App (`Quasar.app`)
+#   quasar --tutorial                         # Open the interactive sandbox tutorial
+set -euo pipefail
+
+SCRIPT_PATH="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SERVER_PY="${REPO_ROOT}/plugin/sidecars/quasar-web/server.py"
+if [ ! -f "${SERVER_PY}" ]; then
+  SERVER_PY="${REPO_ROOT}/sidecars/quasar-web/server.py"
+fi
+if [ ! -f "${SERVER_PY}" ]; then
+  SERVER_PY="${HOME}/.gemini/config/plugins/quasar/sidecars/quasar-web/server.py"
+fi
+
+PORT="${QUASAR_PORT:-49341}"
+URL="http://127.0.0.1:${PORT}"
+PR_URL=""
+BRANCH_MODE=0
+BRANCH_NAME=""
+REPO_DIR="$(pwd)"
+EFFORT="medium"
+COMMENTS_ONLY=0
+DESKTOP_MODE=0
+TUTORIAL_MODE=0
+NO_OPEN=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --desktop)
+      DESKTOP_MODE=1
+      shift
+      ;;
+    --tutorial)
+      TUTORIAL_MODE=1
+      shift
+      ;;
+    --branch)
+      BRANCH_MODE=1
+      if [ $# -ge 2 ] && [[ ! "$2" =~ ^-- ]]; then
+        BRANCH_NAME="$2"
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --repo|--workspace-dir)
+      REPO_DIR="$2"
+      shift 2
+      ;;
+    --effort)
+      EFFORT="$2"
+      shift 2
+      ;;
+    --comments-only)
+      COMMENTS_ONLY=1
+      shift
+      ;;
+    --no-open)
+      NO_OPEN=1
+      shift
+      ;;
+    -v|--version)
+      PLUGIN_JSON="${REPO_ROOT}/plugin/plugin.json"
+      if [ ! -f "${PLUGIN_JSON}" ]; then
+        PLUGIN_JSON="${REPO_ROOT}/plugin.json"
+      fi
+      if [ ! -f "${PLUGIN_JSON}" ]; then
+        PLUGIN_JSON="${HOME}/.gemini/config/plugins/quasar/plugin.json"
+      fi
+      if [ -f "${PLUGIN_JSON}" ]; then
+        python3 -c 'import json, sys; print("quasar v" + json.load(open(sys.argv[1]))["version"])' "${PLUGIN_JSON}"
+      else
+        echo "quasar (standalone)"
+      fi
+      exit 0
+      ;;
+    -h|--help)
+      sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      PR_URL="$1"
+      shift
+      ;;
+  esac
+done
+
+ensure_server_running() {
+  if curl -fsS "${URL}/api/state" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "🚀 Starting Quasar local backend on ${URL}..."
+  PORT="${PORT}" nohup python3 "${SERVER_PY}" --standalone-daemon >/tmp/quasar-standalone.log 2>&1 &
+  for _ in $(seq 1 25); do
+    if curl -fsS "${URL}/api/state" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "⚠️  Quasar backend did not respond on ${URL}; check /tmp/quasar-standalone.log" >&2
+  return 1
+}
+
+ensure_server_running
+
+if [ "${TUTORIAL_MODE}" = "1" ]; then
+  echo "🎓 Generating interactive sandbox tutorial..."
+  curl -fsS -X POST "${URL}/api/tutorial" -H "Content-Type: application/json" -d '{}' >/dev/null
+elif [ -n "${PR_URL}" ] || [ "${BRANCH_MODE}" = "1" ]; then
+  echo "🔬 Dispatching review to Antigravity CLI (agy)..."
+  CO_BOOL="false"
+  if [ "${COMMENTS_ONLY}" = "1" ]; then CO_BOOL="true"; fi
+  python3 - "${URL}" "${PR_URL}" "${REPO_DIR}" "${BRANCH_NAME}" "${EFFORT}" "${CO_BOOL}" <<'PY'
+import json, sys, urllib.request
+url, pr_url, repo_dir, branch, effort, co_str = sys.argv[1:7]
+payload = {
+    "prUrl": pr_url,
+    "repoDir": repo_dir,
+    "branch": branch,
+    "effort": effort,
+    "commentsOnly": co_str == "true",
+}
+req = urllib.request.Request(
+    f"{url}/api/start-review",
+    data=json.dumps(payload).encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(req, timeout=15) as resp:
+    print("  ✅ Dispatched:", resp.read().decode("utf-8"))
+PY
+fi
+
+if [ "${NO_OPEN}" = "1" ]; then
+  echo "✅ Quasar ready at ${URL}"
+  exit 0
+fi
+
+if [ "${DESKTOP_MODE}" = "1" ]; then
+  MAC_APP="${REPO_ROOT}/app/build/macos/Build/Products/Release/quasar_app.app"
+  if [ ! -d "${MAC_APP}" ]; then
+    MAC_APP="${REPO_ROOT}/app/build/macos/Build/Products/Debug/quasar_app.app"
+  fi
+  if [ -d "${MAC_APP}" ]; then
+    echo "🖥️  Opening native macOS Quasar app..."
+    open "${MAC_APP}"
+    exit 0
+  else
+    echo "ℹ️  Native macOS bundle not built yet; run 'cd ${REPO_ROOT}/app && flutter build macos' (opening Web App now)..."
+  fi
+fi
+
+echo "🌐 Opening Quasar Web App at ${URL}..."
+if [ -d "/Applications/Google Chrome.app" ]; then
+  open -na "Google Chrome" --args "--app=${URL}" >/dev/null 2>&1 || open "${URL}"
+else
+  open "${URL}"
+fi

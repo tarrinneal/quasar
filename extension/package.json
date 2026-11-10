@@ -2,7 +2,7 @@
   "name": "codeium-dev",
   "displayName": "Quasar",
   "description": "Comprehension-first GitHub PR & local branch review tool. Features interactive CliffsNotes study guides with expandable code snippets, clickable SVG flowcharts, logical reading tours, native side-by-side diffs, inline Ask-Quasar comment threads, and 1-click GitHub Review publishing.",
-  "version": "1.2.5",
+  "version": "1.3.0",
   "publisher": "codeium",
   "icon": "media/quasar-icon.png",
   "license": "MIT",
@@ -246,7 +246,7 @@
       },
       {
         "command": "quasar.unqueueForFix",
-        "title": "✓ Queued for Agent Fix (Click to Remove from Queue)",
+        "title": "\u2713 Queued for Agent Fix (Click to Remove from Queue)",
         "category": "Quasar",
         "icon": "$(pass-filled)"
       },

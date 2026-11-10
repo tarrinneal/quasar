@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="1.2.5"
+VERSION="1.3.0"
 EXT_NAME="codeium.codeium-dev-${VERSION}"
 OLD_CODEIUM_EXT_NAME="codeium.codeium-dev-1.0.0"
 OLD_EXT_NAME="antigravity.antigravity-code-review-1.0.0"
@@ -12,8 +12,28 @@ OLD_PLUGIN_DEST="${HOME}/.gemini/config/plugins/code-review"
 STATE_DIR="${HOME}/.gemini/quasar"
 
 CHECK_ONLY=0
-if [ "${1:-}" = "--check" ] || [ "${1:-}" = "--verify" ]; then
-  CHECK_ONLY=1
+STANDALONE_ONLY=0
+VSCODE_ONLY=0
+for arg in "$@"; do
+  case "${arg}" in
+    --check|--verify)
+      CHECK_ONLY=1
+      ;;
+    --standalone-only)
+      STANDALONE_ONLY=1
+      ;;
+    --vscode-only)
+      VSCODE_ONLY=1
+      ;;
+    -h|--help)
+      echo "Usage: ./install.sh [--standalone-only | --vscode-only | --check]"
+      exit 0
+      ;;
+  esac
+done
+
+if [ ! -d "${SCRIPT_DIR}/extension" ]; then
+  STANDALONE_ONLY=1
 fi
 
 run_doctor() {
@@ -61,6 +81,14 @@ run_doctor() {
     echo "  ✅ Quasar Web UI Sidecar: Installed at ${PLUGIN_DEST}/sidecars/quasar-web (sidecar://quasar/quasar-web/ & http://127.0.0.1:49341)"
   else
     echo "  ⚠️  Quasar Web UI Sidecar: Missing at ${PLUGIN_DEST}/sidecars/quasar-web"
+  fi
+
+  if [ -f "${PLUGIN_DEST}/sidecars/quasar-web/flutter_web/index.html" ] || [ -f "${SCRIPT_DIR}/app/build/web/index.html" ]; then
+    echo "  ✅ Quasar Standalone Flutter Web App: Ready (launch with 'quasar' or open http://127.0.0.1:49341)"
+  fi
+
+  if [ -x "${HOME}/.gemini/bin/quasar" ] || [ -x "${SCRIPT_DIR}/bin/quasar" ]; then
+    echo "  ✅ Quasar Standalone CLI Launcher: Installed (${HOME}/.gemini/bin/quasar & ./bin/quasar)"
   fi
 
   local ext_found=0
@@ -115,8 +143,30 @@ if [ -d "${SCRIPT_DIR}/plugin/agents" ]; then
 fi
 
 if [ -d "${SCRIPT_DIR}/plugin/sidecars/quasar-web" ]; then
-  cp "${SCRIPT_DIR}/extension/media/mermaid-preview.js" "${SCRIPT_DIR}/plugin/sidecars/quasar-web/mermaid-preview.js" 2>/dev/null || true
+  if [ -f "${SCRIPT_DIR}/extension/media/mermaid-preview.js" ]; then
+    cp "${SCRIPT_DIR}/extension/media/mermaid-preview.js" "${SCRIPT_DIR}/plugin/sidecars/quasar-web/mermaid-preview.js" 2>/dev/null || true
+  fi
   cp -R "${SCRIPT_DIR}/plugin/sidecars/quasar-web/"* "${PLUGIN_DEST}/sidecars/quasar-web/" 2>/dev/null || true
+  if [ "${VSCODE_ONLY}" -eq 0 ]; then
+    if [ -f "${SCRIPT_DIR}/app/build/web/index.html" ]; then
+      rm -rf "${PLUGIN_DEST}/sidecars/quasar-web/flutter_web" 2>/dev/null || true
+      mkdir -p "${PLUGIN_DEST}/sidecars/quasar-web/flutter_web"
+      cp -R "${SCRIPT_DIR}/app/build/web/"* "${PLUGIN_DEST}/sidecars/quasar-web/flutter_web/"
+    elif [ -f "${SCRIPT_DIR}/plugin/sidecars/quasar-web/flutter_web/index.html" ]; then
+      mkdir -p "${PLUGIN_DEST}/sidecars/quasar-web/flutter_web"
+      cp -R "${SCRIPT_DIR}/plugin/sidecars/quasar-web/flutter_web/"* "${PLUGIN_DEST}/sidecars/quasar-web/flutter_web/"
+    fi
+    if [ -f "${SCRIPT_DIR}/bin/quasar" ]; then
+      mkdir -p "${PLUGIN_DEST}/bin"
+      cp "${SCRIPT_DIR}/bin/quasar" "${PLUGIN_DEST}/bin/quasar"
+      chmod +x "${PLUGIN_DEST}/bin/quasar"
+      mkdir -p "${HOME}/.gemini/bin"
+      ln -sf "${PLUGIN_DEST}/bin/quasar" "${HOME}/.gemini/bin/quasar" 2>/dev/null || true
+      if [ -d "${HOME}/.local/bin" ]; then
+        ln -sf "${PLUGIN_DEST}/bin/quasar" "${HOME}/.local/bin/quasar" 2>/dev/null || true
+      fi
+    fi
+  fi
   chmod +x "${PLUGIN_DEST}/sidecars/quasar-web/server.py" 2>/dev/null || true
   # Auto-enable the Quasar plugin and start its sidecar in any running Jetski / Antigravity Language Server
   SIDECAR_MANAGED=0
@@ -208,6 +258,7 @@ fi
 # Initialize default preferences.json & PREFERENCES.md if not present
 python3 "${PLUGIN_DEST}/skills/quasar/scripts/manage_preferences.py" --show >/dev/null 2>&1 || true
 
+if [ "${STANDALONE_ONLY}" -eq 0 ] && [ -d "${SCRIPT_DIR}/extension" ]; then
 # Package VSIX for official CLI installation (includes README.md, CHANGELOG.md, and bundled_plugin/ so VSIX-only installs work standalone)
 VSIX_PATH="/tmp/quasar-${VERSION}.vsix"
 python3 - "${SCRIPT_DIR}/extension" "${SCRIPT_DIR}/plugin" "${SCRIPT_DIR}" "${VSIX_PATH}" "${VERSION}" <<'PY'
@@ -280,7 +331,8 @@ with zipfile.ZipFile(vsix_path, "w", zipfile.ZIP_DEFLATED) as zf:
                     rel_plugin_path = os.path.relpath(full_path, plugin_dir)
                     zf.write(full_path, os.path.join("extension", "bundled_plugin", rel_plugin_path))
         else:
-            for root, _, files in os.walk(plugin_dir):
+            for root, dirs, files in os.walk(plugin_dir):
+                dirs[:] = [d for d in dirs if d not in ("flutter_web", "__pycache__")]
                 for file in files:
                     full_path = os.path.join(root, file)
                     rel_path = os.path.relpath(full_path, plugin_dir)
@@ -372,6 +424,7 @@ done
 
 # Clear cached extension scanner lists so Reload Window picks up Quasar immediately
 rm -f "${HOME}/Library/Application Support/"*/CachedProfilesData/*/extensions.user.cache 2>/dev/null || true
+fi
 
 echo ""
 run_doctor

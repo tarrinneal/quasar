@@ -2,6 +2,20 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [1.3.0] - 2026-11-10
+
+### Added
+- **Standalone Flutter App (Zero-Install Web + Native Desktop) Powered by Antigravity CLI (`agy`)**:
+  - Added [`app/`](app/) (Flutter Web & Desktop client) and [`bin/quasar`](bin/quasar) launcher so Quasar runs completely standalone—either in any browser at `http://127.0.0.1:49341` (with zero IDE or desktop install required) or as a native desktop app (`./bin/quasar --desktop`).
+  - Upgraded `plugin/sidecars/quasar-web/server.py` with direct headless Antigravity CLI (`agy --print --output-format stream-json`) auto-dispatch and live NDJSON progress streaming whenever no IDE language server is active, plus static serving of compiled `app/build/web` (`flutter_web`) and `/api/reply-thread` + `/api/open-in-editor` endpoints.
+- **Dual-Artifact Release Packaging & One-Line Standalone Installer**:
+  - Added [`install-standalone.sh`](install-standalone.sh) and `--standalone-only` / `--vscode-only` modes in [`install.sh`](install.sh) so releases publish both `quasar-<version>.vsix` (VS Code / Antigravity IDE) and `quasar-standalone-<version>.tar.gz` (precompiled Web App + `quasar` CLI).
+
+### Fixed
+- **Smooth Comment Navigation & Zero-Jump Inline Q&A Updates**:
+  - Clicking any comment in the sidebar or Study Guide now expands collapsed threads and re-centers the diff editor viewport after Monaco finishes laying out diff hunks and inline `CommentThread` widgets (`revealRangeInVisibleEditor`).
+  - `syncNativeCommentThreads` now updates `CommentThread` instances in place (reusing native `'+'` gutter widgets, preserving user expand/collapse state, initializing `lastSessionId` on startup, and suppressing self-triggered `fs.watch` bounces) so asking inline questions and receiving agent replies never tear down widgets or jump your scroll position.
+
 ## [1.2.5] - 2026-11-09
 
 ### Added

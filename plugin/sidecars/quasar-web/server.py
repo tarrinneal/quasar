@@ -51,6 +51,56 @@ def find_mermaid_js_path() -> Optional[str]:
     return None
 
 
+def find_flutter_web_dir() -> Optional[str]:
+    candidates = [
+        os.path.abspath(os.path.join(THIS_DIR, "..", "..", "..", "app", "build", "web")),
+        os.path.join(THIS_DIR, "flutter_web"),
+        os.path.expanduser("~/.gemini/config/plugins/quasar/sidecars/quasar-web/flutter_web"),
+    ]
+    for d in candidates:
+        if os.path.isfile(os.path.join(d, "index.html")):
+            return d
+    return None
+
+
+def find_agy_binary() -> Optional[str]:
+    import shutil
+
+    candidates = [
+        os.environ.get("AGY_BIN") or "",
+        os.path.expanduser("~/.gemini/bin/agy"),
+        shutil.which("agy") or "",
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def list_all_brain_dirs() -> List[str]:
+    gemini_root = os.path.expanduser("~/.gemini")
+    dirs: List[str] = []
+    if os.path.isdir(gemini_root):
+        try:
+            for name in os.listdir(gemini_root):
+                cand = os.path.join(gemini_root, name, "brain")
+                if os.path.isdir(cand):
+                    dirs.append(cand)
+        except Exception:
+            pass
+    return dirs
+
+
+def find_brain_conversation_dir(cid: str) -> Optional[str]:
+    if not cid:
+        return None
+    for bdir in list_all_brain_dirs():
+        cand = os.path.join(bdir, cid)
+        if os.path.isdir(cand):
+            return cand
+    return None
+
+
 def get_agentapi_cmd() -> List[str]:
     for cand in glob.glob(os.path.expanduser("~/.gemini/*/bin/agentapi")):
         if os.path.isfile(cand):
@@ -218,19 +268,151 @@ def resolve_conversation_context(
 ACTIVE_AGENT_JOB: Dict[str, Any] = {}
 
 
+def dispatch_via_agy_cli(
+    prompt: str,
+    title: str = "Quasar Code Review",
+    conversation_id: Optional[str] = None,
+    workspace_dir: Optional[str] = None,
+    effort: str = "medium",
+    allow_edits: bool = True,
+    baseline_mtime: float = 0.0,
+) -> Dict[str, Any]:
+    import time
+
+    agy_bin = find_agy_binary()
+    if not agy_bin:
+        return {"ok": False, "error": "Antigravity CLI (`agy`) binary not found at ~/.gemini/bin/agy or PATH."}
+
+    eff = effort.lower().strip() if effort else "medium"
+    if eff not in ("low", "medium", "high", "xhigh", "max"):
+        eff = "medium"
+
+    cmd: List[str] = [
+        agy_bin,
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--mode",
+        "accept-edits" if allow_edits else "auto",
+        f"--effort={eff}",
+    ]
+    if workspace_dir and os.path.isdir(workspace_dir):
+        cmd.extend(["--add-dir", workspace_dir])
+    if conversation_id:
+        cmd.extend(["--conversation", conversation_id])
+    cmd.append(prompt)
+
+    ACTIVE_AGENT_JOB.clear()
+    ACTIVE_AGENT_JOB.update({
+        "active": True,
+        "title": title,
+        "promptPreview": prompt.splitlines()[0][:120] if prompt else title,
+        "startedAt": time.time(),
+        "baselineMtime": baseline_mtime,
+        "conversationId": conversation_id or "",
+        "mode": "agy-cli",
+        "cliStage": "🚀 Running Antigravity CLI (`agy`)...",
+        "cliDetail": f"Starting {title} ({eff} effort)...",
+        "subagents": [],
+        "completedAt": None,
+    })
+
+    def _run_stream() -> None:
+        try:
+            run_cwd = workspace_dir if (workspace_dir and os.path.isdir(workspace_dir)) else os.getcwd()
+            proc = subprocess.Popen(
+                cmd,
+                cwd=run_cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            ACTIVE_AGENT_JOB["pid"] = proc.pid
+            if proc.stdout:
+                for raw_line in proc.stdout:
+                    ln = raw_line.strip()
+                    if not ln:
+                        continue
+                    m_uuid = re.search(
+                        r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+                        ln,
+                    )
+                    if m_uuid and not ACTIVE_AGENT_JOB.get("conversationId"):
+                        ACTIVE_AGENT_JOB["conversationId"] = m_uuid.group(1)
+                    if ln.startswith("{") and ln.endswith("}"):
+                        try:
+                            ev = json.loads(ln)
+                            cid_cand = (
+                                ev.get("conversation_id")
+                                or ev.get("conversationId")
+                                or ev.get("session_id")
+                                or ""
+                            )
+                            if cid_cand:
+                                ACTIVE_AGENT_JOB["conversationId"] = str(cid_cand)
+                            if "collect_pr_context" in ln:
+                                ACTIVE_AGENT_JOB["cliStage"] = "📥 Phase 1/3 — Fetching PR context & snapshots"
+                                ACTIVE_AGENT_JOB["cliDetail"] = "Materializing base/head file snapshots..."
+                            elif "invoke_subagent" in ln or "review-" in ln:
+                                ACTIVE_AGENT_JOB["cliStage"] = "🔬 Phase 2/3 — Running specialist review lenses"
+                                for m_ag in re.findall(r"review-[a-z-]+", ln):
+                                    subs = ACTIVE_AGENT_JOB.setdefault("subagents", [])
+                                    if m_ag not in subs:
+                                        subs.append(m_ag)
+                                ACTIVE_AGENT_JOB["cliDetail"] = "Analyzing architecture, bugs, & edge cases..."
+                            elif "publish_review_session" in ln:
+                                ACTIVE_AGENT_JOB["cliStage"] = "📖 Phase 3/3 — Publishing CliffsNotes & comments"
+                                ACTIVE_AGENT_JOB["cliDetail"] = "Writing session & rendering diffs..."
+                            elif "answer_comment_question" in ln:
+                                ACTIVE_AGENT_JOB["cliStage"] = "💬 Posting inline answer to thread"
+                                ACTIVE_AGENT_JOB["cliDetail"] = "Updating comment thread in place..."
+                        except Exception:
+                            pass
+            proc.wait()
+        except Exception as exc:
+            ACTIVE_AGENT_JOB["cliError"] = str(exc)
+        finally:
+            ACTIVE_AGENT_JOB["active"] = False
+            ACTIVE_AGENT_JOB["completedAt"] = time.time()
+
+    threading.Thread(target=_run_stream, daemon=True).start()
+    return {
+        "ok": True,
+        "mode": "agy-cli",
+        "conversationId": conversation_id or "",
+        "workspaceDir": workspace_dir or "",
+    }
+
+
 def dispatch_to_agent(
     prompt: str,
     title: str = "Quasar Code Review",
     conversation_id: Optional[str] = None,
     workspace_dir: Optional[str] = None,
+    effort: str = "medium",
+    allow_edits: bool = True,
 ) -> Dict[str, Any]:
     import time
 
     cmd_prefix = get_agentapi_cmd()
     conv_id, project_id, resolved_ws, env = resolve_conversation_context(conversation_id, workspace_dir)
+    if workspace_dir and os.path.isdir(workspace_dir):
+        resolved_ws = workspace_dir
 
     all_sess = list_all_sessions()
     baseline_mtime = max((s["mtime"] for s in all_sess), default=0.0)
+
+    if os.environ.get("QUASAR_PREFER_AGY_CLI") == "1":
+        return dispatch_via_agy_cli(
+            prompt=prompt,
+            title=title,
+            conversation_id=conv_id,
+            workspace_dir=resolved_ws,
+            effort=effort,
+            allow_edits=allow_edits,
+            baseline_mtime=baseline_mtime,
+        )
 
     def _record_active(cid: Optional[str], mode: str) -> None:
         ACTIVE_AGENT_JOB.clear()
@@ -248,9 +430,8 @@ def dispatch_to_agent(
     def _is_conv_deliverable(cid_check: Optional[str]) -> bool:
         if not cid_check:
             return False
-        brain_base = os.path.expanduser("~/.gemini/jetski/brain")
-        c_dir = os.path.join(brain_base, cid_check)
-        if not os.path.isdir(c_dir):
+        c_dir = find_brain_conversation_dir(cid_check)
+        if not c_dir or not os.path.isdir(c_dir):
             return True
         undeliv_dir = os.path.join(c_dir, ".system_generated", "messages", "undelivered")
         if os.path.isdir(undeliv_dir):
@@ -289,7 +470,9 @@ def dispatch_to_agent(
     def _clear_undelivered(cid_clean: Optional[str]) -> None:
         if not cid_clean:
             return
-        c_dir = os.path.join(os.path.expanduser("~/.gemini/jetski/brain"), cid_clean)
+        c_dir = find_brain_conversation_dir(cid_clean)
+        if not c_dir:
+            return
         undeliv_dir = os.path.join(c_dir, ".system_generated", "messages", "undelivered")
         msg_dir = os.path.join(c_dir, ".system_generated", "messages")
         if os.path.isdir(undeliv_dir):
@@ -500,13 +683,36 @@ def dispatch_to_agent(
                 return _start_cascade_via_ls_http()
             except Exception:
                 pass
+        # Fallback to direct standalone Antigravity CLI (`agy`) when no IDE server is running!
+        cli_res = dispatch_via_agy_cli(
+            prompt=prompt,
+            title=title,
+            conversation_id=conv_id,
+            workspace_dir=resolved_ws,
+            effort=effort,
+            allow_edits=allow_edits,
+            baseline_mtime=baseline_mtime,
+        )
+        if cli_res.get("ok"):
+            return cli_res
         return {
             "ok": False,
-            "error": (proc.stderr or proc.stdout or last_http_err or "agentapi failed").strip(),
+            "error": (proc.stderr or proc.stdout or last_http_err or cli_res.get("error") or "agentapi failed").strip(),
             "prompt": prompt,
         }
     except Exception as e:
-        return {"ok": False, "error": last_http_err or str(e), "prompt": prompt}
+        cli_res = dispatch_via_agy_cli(
+            prompt=prompt,
+            title=title,
+            conversation_id=conv_id,
+            workspace_dir=resolved_ws,
+            effort=effort,
+            allow_edits=allow_edits,
+            baseline_mtime=baseline_mtime,
+        )
+        if cli_res.get("ok"):
+            return cli_res
+        return {"ok": False, "error": last_http_err or cli_res.get("error") or str(e), "prompt": prompt}
 
 
 def get_live_agent_status(session: Optional[Dict[str, Any]], all_sessions: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -519,10 +725,10 @@ def get_live_agent_status(session: Optional[Dict[str, Any]], all_sessions: List[
     if ACTIVE_AGENT_JOB.get("active"):
         started_at = float(ACTIVE_AGENT_JOB.get("startedAt") or now)
         baseline_mtime = float(ACTIVE_AGENT_JOB.get("baselineMtime") or 0.0)
-        if current_max_mtime > baseline_mtime + 0.5 and (now - started_at) > 1.0:
+        if ACTIVE_AGENT_JOB.get("mode") != "agy-cli" and current_max_mtime > baseline_mtime + 0.5 and (now - started_at) > 1.0:
             ACTIVE_AGENT_JOB["active"] = False
             ACTIVE_AGENT_JOB["completedAt"] = now
-        elif (now - started_at) > 300:
+        elif (now - started_at) > 600:
             ACTIVE_AGENT_JOB["active"] = False
 
     if not ACTIVE_AGENT_JOB.get("active") and ACTIVE_AGENT_JOB.get("completedAt"):
@@ -538,8 +744,7 @@ def get_live_agent_status(session: Optional[Dict[str, Any]], all_sessions: List[
                 "elapsedSeconds": int(comp_at - float(ACTIVE_AGENT_JOB.get("startedAt") or comp_at)),
             }
 
-    # Inspect recent transcript activity to provide real-time pipeline stage & tool action
-    brain_dir = os.path.expanduser("~/.gemini/jetski/brain")
+    # Inspect recent transcript activity across all ~/.gemini/*/brain directories
     target_cid = (
         ACTIVE_AGENT_JOB.get("conversationId")
         or (session or {}).get("conversationId")
@@ -547,28 +752,31 @@ def get_live_agent_status(session: Optional[Dict[str, Any]], all_sessions: List[
     ).strip()
 
     transcript_path = None
-    if target_cid and os.path.isdir(brain_dir):
-        cand = os.path.join(brain_dir, target_cid, ".system_generated", "logs", "transcript.jsonl")
-        if os.path.isfile(cand):
-            transcript_path = cand
+    if target_cid:
+        c_dir = find_brain_conversation_dir(target_cid)
+        if c_dir:
+            cand = os.path.join(c_dir, ".system_generated", "logs", "transcript.jsonl")
+            if os.path.isfile(cand):
+                transcript_path = cand
 
-    if not transcript_path and os.path.isdir(brain_dir):
+    if not transcript_path:
         recent: List[Tuple[float, str]] = []
-        try:
-            for entry in os.listdir(brain_dir):
-                tp = os.path.join(brain_dir, entry, ".system_generated", "logs", "transcript.jsonl")
-                if os.path.isfile(tp):
-                    recent.append((os.path.getmtime(tp), tp))
-            recent.sort(reverse=True)
-            if recent and (now - recent[0][0]) < 45:
-                transcript_path = recent[0][1]
-        except Exception:
-            pass
+        for bdir in list_all_brain_dirs():
+            try:
+                for entry in os.listdir(bdir):
+                    tp = os.path.join(bdir, entry, ".system_generated", "logs", "transcript.jsonl")
+                    if os.path.isfile(tp):
+                        recent.append((os.path.getmtime(tp), tp))
+            except Exception:
+                pass
+        recent.sort(reverse=True)
+        if recent and (now - recent[0][0]) < 45:
+            transcript_path = recent[0][1]
 
-    stage = "Initializing Quasar Agent..."
-    detail = "Waiting for agent response..."
-    percent = 15
-    subagents: List[str] = []
+    stage = ACTIVE_AGENT_JOB.get("cliStage") or "Initializing Quasar Agent..."
+    detail = ACTIVE_AGENT_JOB.get("cliDetail") or "Waiting for agent response..."
+    percent = 20
+    subagents: List[str] = list(ACTIVE_AGENT_JOB.get("subagents") or [])
     transcript_is_running = False
     transcript_started_at = None
 
@@ -819,7 +1027,7 @@ def compute_file_diffs(session: Optional[Dict[str, Any]]) -> List[Dict[str, Any]
             if tag == "equal":
                 for offset in range(i2 - i1):
                     rows.append({
-                        "type": " context",
+                        "type": "context",
                         "baseLine": i1 + offset + 1,
                         "headLine": j1 + offset + 1,
                         "baseText": base_lines[i1 + offset],
@@ -866,7 +1074,7 @@ def compute_file_diffs(session: Optional[Dict[str, Any]]) -> List[Dict[str, Any]
             "path": rel,
             "additions": additions,
             "deletions": deletions,
-            "rows": rows[:1500],
+            "rows": rows[:10000],
         })
     return result
 
@@ -2282,6 +2490,39 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
             self._send_json(200, build_state_payload(sid, cid))
             return
 
+        if pathname == "/legacy":
+            self._send_html(WEB_UI_HTML)
+            return
+
+        flutter_web_dir = find_flutter_web_dir()
+        if flutter_web_dir:
+            import mimetypes
+
+            clean_rel = pathname.lstrip("/")
+            if clean_rel.startswith("flutter/"):
+                clean_rel = clean_rel[len("flutter/") :]
+            if pathname in ("/", "/index.html", "/flutter", "/flutter/"):
+                clean_rel = "index.html"
+            cand_static = os.path.realpath(os.path.join(flutter_web_dir, clean_rel))
+            root_real = os.path.realpath(flutter_web_dir)
+            if (cand_static == root_real or cand_static.startswith(root_real + os.sep)) and os.path.isfile(cand_static):
+                mime, _ = mimetypes.guess_type(cand_static)
+                if cand_static.endswith(".wasm"):
+                    mime = "application/wasm"
+                elif cand_static.endswith(".js"):
+                    mime = "application/javascript; charset=utf-8"
+                elif cand_static.endswith(".json"):
+                    mime = "application/json; charset=utf-8"
+                with open(cand_static, "rb") as sf:
+                    raw_bytes = sf.read()
+                self.send_response(200)
+                self.send_header("Content-Type", mime or "application/octet-stream")
+                self.send_header("Content-Length", str(len(raw_bytes)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(raw_bytes)
+                return
+
         if pathname in ("/", "/full", "/index.html", "/ui") or pathname.startswith("/c/") or pathname.startswith("/s/") or pathname.startswith("/_sidecar/"):
             self._send_html(WEB_UI_HTML)
             return
@@ -2671,6 +2912,95 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"ok": False, "error": f"GitHub token check failed: {e}"})
             return
 
+        if pathname == "/api/reply-thread":
+            import datetime
+
+            session, session_path = load_target_session(data.get("sessionId"))
+            if not session:
+                self._send_json(404, {"ok": False, "error": "No active session"})
+                return
+            tid = str(data.get("threadId") or "").strip()
+            question = str(data.get("question") or "").strip()
+            change_mode = bool(data.get("changeMode", False))
+            target = next((t for t in (session.get("threads") or []) if str(t.get("id")) == tid), None)
+            if not target or not question:
+                self._send_json(400, {"ok": False, "error": "Missing threadId or question"})
+                return
+            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            msgs = [
+                m
+                for m in (target.get("messages") or [])
+                if not m.get("pending") and "⏳ Quasar is " not in str(m.get("body") or "")
+            ]
+            msgs.append({"author": "You", "body": question, "timestamp": now_iso})
+            msgs.append({
+                "author": "Quasar",
+                "body": "⏳ Quasar is analyzing your comment / question...",
+                "timestamp": now_iso,
+                "pending": True,
+            })
+            target["messages"] = msgs
+            save_session_everywhere(session, session_path)
+
+            ws_dir = session.get("workspaceDir") or session.get("repoDir")
+            rel_path = target.get("targetFile") or target.get("path") or ""
+            start_l = target.get("startLine") or 1
+            is_gh_existing = target.get("kind") == "github_existing"
+            prompt = (
+                f"Using the `quasar` skill, respond to my comment on thread `{tid}` in `{rel_path}:L{start_l}`:\n\n"
+                f"Reviewer Question / Request:\n\"{question}\"\n\n"
+                f"Thread Title: {target.get('title') or ''}\n"
+                f"Current Comment Text:\n```\n{target.get('draftComment') or ''}\n```\n\n"
+                + (
+                    f"Investigate the code and reply in place by running:\n"
+                    f"`python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/answer_comment_question.py "
+                    f"--workspace-dir \"{ws_dir or ''}\" --thread-id \"{tid}\" --answer \"<DETAILED_MARKDOWN_ANSWER>\" "
+                    + ("" if is_gh_existing else "[--updated-draft \"<REVISED_COMMENT_IF_REQUESTED>\"]")
+                    + "`"
+                )
+            )
+            if change_mode and not is_gh_existing:
+                prompt += "\n(The user asked to revise or refine this comment; pass `--updated-draft` if the draft text should change.)"
+
+            res = dispatch_to_agent(
+                prompt,
+                title=f"Quasar Thread Q&A: {os.path.basename(rel_path)}:L{start_l}",
+                conversation_id=data.get("conversationId") or session.get("conversationId"),
+                workspace_dir=ws_dir,
+                effort=session.get("effortLevel") or "medium",
+            )
+            self._send_json(200 if res.get("ok") else 500, {"ok": bool(res.get("ok")), "error": res.get("error"), "dispatch": res})
+            return
+
+        if pathname == "/api/open-in-editor":
+            import shutil
+
+            session, _ = load_target_session(data.get("sessionId"))
+            rel_path = str(data.get("path") or "").strip()
+            line = int(data.get("line") or 1)
+            repo_dir = (
+                str(data.get("repoDir") or "").strip()
+                or ((session or {}).get("repoDir") or "")
+                or ((session or {}).get("workspaceDir") or "")
+            )
+            head_root = (session or {}).get("headSnapshotRoot") or ""
+            full_path = ""
+            if repo_dir and rel_path and os.path.isfile(os.path.join(repo_dir, rel_path)):
+                full_path = os.path.join(repo_dir, rel_path)
+            elif head_root and rel_path and os.path.isfile(os.path.join(head_root, rel_path)):
+                full_path = os.path.join(head_root, rel_path)
+            if not full_path:
+                self._send_json(404, {"ok": False, "error": f"File not found on disk: {rel_path}"})
+                return
+            code_bin = shutil.which("code") or "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+            if os.path.isfile(code_bin):
+                subprocess.Popen([code_bin, "-g", f"{full_path}:{line}"])
+                self._send_json(200, {"ok": True, "opened": f"{full_path}:{line}"})
+                return
+            subprocess.Popen(["open", full_path])
+            self._send_json(200, {"ok": True, "opened": full_path})
+            return
+
         if pathname == "/api/start-review":
             conv_id, _, default_ws, _ = resolve_conversation_context(data.get("conversationId"))
             pr_url = (data.get("prUrl") or "").strip()
@@ -2679,14 +3009,18 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
             comments_only = bool(data.get("commentsOnly", False))
             mode_str = " (comments only)" if comments_only else ""
             if pr_url:
-                prompt = f"Review {pr_url} on {effort} effort{mode_str}"
+                prompt = f"Using the `quasar` skill, review {pr_url} on {effort} effort{mode_str} with --workspace-dir \"{repo_dir}\""
             else:
-                prompt = f"Review local branch in {repo_dir} on {effort} effort{mode_str}"
+                branch_name = (data.get("branch") or "").strip()
+                branch_part = f" branch `{branch_name}`" if branch_name else " local branch"
+                prompt = f"Using the `quasar` skill, review{branch_part} in {repo_dir} on {effort} effort{mode_str}"
             res = dispatch_to_agent(
                 prompt,
                 title="Quasar Code Review",
                 conversation_id=conv_id,
                 workspace_dir=repo_dir,
+                effort=effort,
+                allow_edits=True,
             )
             self._send_json(200 if res.get("ok") else 500, {"ok": bool(res.get("ok")), "error": res.get("error"), "dispatch": res})
             return
