@@ -100,10 +100,17 @@ Choose the analysis pipeline below that matches `effort_level` (`"low"`, `"mediu
 Verify every candidate finding against the actual codebase callers/callees, `existing_comments`, and `reviewer_preferences` (in `high` effort you may invoke `review-advocate` or verify directly; in `low`/`medium` effort always filter directly):
 - **Drop** any finding that is guaranteed safe by upstream checks/types, pre-existing untouched code, already commented on, or suppressed by `avoidRules` in `reviewer_preferences`.
 - **Keep (`"status": "candidate"`)** verified bugs, regressions, and design issues that clearly align with high-signal review standards or `preferRules`.
-- **Triage Existing GitHub Comments (`"existingCommentAssessments"`)**: For each inline comment in `existing_comments`, evaluate it against the codebase and classify it so the user immediately sees whether Quasar thinks the suggested fix should be made or if it requires human attention:
-  - `"triageStatus": "recommended_fix"` (`"triageBadge": "🛠️ Good Catch — Should Fix"`): The comment points out a valid bug, warning, edge case, or clean improvement (`suggestion` block, naming/readability/doc fix) that should be applied.
-  - `"triageStatus": "needs_attention"` (`"triageBadge": "❓ Question — Needs Answer"` or `"👀 Needs Look (Design)"`): The comment asks an open question that needs answering or raises an architectural/design trade-off that requires human decision.
-  - `"triageStatus": "addressed_or_refuted"` (`"triageBadge": "⚠️ Disputed / No Fix"` or `"💬 Author Replied"`): The comment was already addressed, replied to by the PR author, or relies on a mistaken premise.
+- **Triage Existing GitHub Comments Against Current Code (`"existingCommentAssessments"`)**: For **every** inline comment in `existing_comments`, inspect the actual code in `head_snapshot_root` (and compare against `diff_hunk` / `code_check` / `base_snapshot_root` — do **not** rely solely on GitHub thread replies or resolved checkboxes!) so Quasar appends a structured follow-up comment right below each GitHub comment stating **what is done**, **what isn't done**, and **what should be done**:
+  - `"triageStatus": "addressed_or_refuted"` (`"triageCategory": "addressed"` or `"refuted"`, `"triageBadge": "✅ Addressed in Code"` or `"⚠️ Disputed / No Fix"`): Current HEAD code already resolves the comment cleanly (or the premise does not apply).
+  - `"triageStatus": "partially_addressed"` (`"triageBadge": "🟡 Partially Addressed — Edge Case Left"` or `"🟡 Could Be Resolved Better"`): Code was changed toward the comment, **but** a secondary question, edge case, or cleaner resolution still remains. Always acknowledge what the author already changed in `"whatIsDone"` so it never looks like Quasar missed their fix!
+  - `"triageStatus": "recommended_fix"` (`"triageBadge": "🛠️ Not Addressed — Should Fix"`): The code at HEAD has **not** yet addressed a valid bug, warning, edge case, or concrete improvement.
+  - `"triageStatus": "needs_attention"` (`"triageBadge": "❓ Question — Needs Answer"` or `"👀 Needs Look (Design)"`): The comment asks an open question or design trade-off that still needs an answer or human decision.
+  - Every entry in `"existingCommentAssessments"` MUST include:
+    - `"id"`: The existing comment ID (e.g. `"gh-inline-123456"`).
+    - `"triageStatus"`, `"triageCategory"` (optional), and `"triageBadge"`.
+    - `"whatIsDone"`: Concrete 1-sentence summary of what has already been changed in HEAD or replied in thread (cite `file:line`, or state `"No code changes at this location yet"`).
+    - `"whatIsNotDone"`: Concrete 1-sentence summary of what remains unaddressed or what edge case / improvement is still open (or `"None — fully resolved in current code"`).
+    - `"whatShouldBeDone"`: Specific recommended action (e.g. exact code refinement, reply to leave, or `"No further code changes needed"`).
 - **Present Selectable Solution Options on User-Owned Reviews (`"solutionOptions"` when `pr_metadata.isOwnedByUser` is `true`)**:
   - Whenever `pr_metadata.isOwnedByUser` is `true` (a local branch review or a GitHub PR authored by the user), check each candidate/uncertain finding (`findings`) and each triaged existing GitHub comment (`existingCommentAssessments`) to see whether there are **multiple genuinely distinct, valid ways to solve it** (2–4 reasonable implementation approaches, API shapes, or error-handling strategies — do **not** invent artificial options for single-way trivial fixes like typos or obvious 1-line suggestions).
   - When 2+ distinct valid solutions exist on a user-owned review, include `"solutionOptions"` on that finding or `existingCommentAssessment` so the user can select their preferred approach directly in the Quasar UI instead of hoping the agent guesses how they want it solved:
@@ -201,6 +208,16 @@ Write `<SCRATCH_DIR>/review_synthesis.json` and publish it using `publish_review
       "title": "No direct unit test for private _sanitizePackage helper",
       "whyItMatters": "`_sanitizePackage` is only exercised indirectly through `generate()`.",
       "draftComment": "Consider adding a direct unit test for edge cases in `_sanitizePackage` (e.g. reserved Kotlin keywords)."
+    }
+  ],
+  "existingCommentAssessments": [
+    {
+      "id": "gh-inline-123456",
+      "triageStatus": "partially_addressed",
+      "triageBadge": "🟡 Partially Addressed — Edge Case Left",
+      "whatIsDone": "Added `if (options.package != null)` guard in `kotlin_generator.dart:142`.",
+      "whatIsNotDone": "Empty string `package: ''` still emits an invalid `package ;` declaration.",
+      "whatShouldBeDone": "Check `options.package != null && options.package!.isNotEmpty` instead."
     }
   ],
   "coverageMatrix": [

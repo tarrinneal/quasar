@@ -608,6 +608,10 @@ def fetch_pr_via_rest(
             else:
                 orphan_replies.append((reply_to, reply_entry, rc))
         else:
+            is_outdated = (
+                rc.get("line") is None
+                or (rc.get("position") is None and rc.get("original_position") is not None)
+            )
             entry = {
                 "id": f"gh-inline-{raw_id}",
                 "raw_id": raw_id,
@@ -615,6 +619,12 @@ def fetch_pr_via_rest(
                 "author": rc_author,
                 "path": rc.get("path"),
                 "line": rc.get("line") or rc.get("original_line") or 1,
+                "raw_line": rc.get("line"),
+                "original_line": rc.get("original_line"),
+                "is_outdated": bool(is_outdated),
+                "commit_id": rc.get("commit_id"),
+                "original_commit_id": rc.get("original_commit_id"),
+                "diff_hunk": (rc.get("diff_hunk") or "")[-1200:],
                 "side": rc.get("side", "RIGHT"),
                 "created_at": rc.get("created_at"),
                 "body": rc_body,
@@ -628,6 +638,10 @@ def fetch_pr_via_rest(
         if parent is not None:
             parent.setdefault("replies", []).append(reply_entry)
         else:
+            is_outdated = (
+                rc.get("line") is None
+                or (rc.get("position") is None and rc.get("original_position") is not None)
+            )
             comments.append(
                 {
                     "id": reply_entry["id"],
@@ -637,6 +651,12 @@ def fetch_pr_via_rest(
                     "author": reply_entry["author"],
                     "path": rc.get("path"),
                     "line": rc.get("line") or rc.get("original_line") or 1,
+                    "raw_line": rc.get("line"),
+                    "original_line": rc.get("original_line"),
+                    "is_outdated": bool(is_outdated),
+                    "commit_id": rc.get("commit_id"),
+                    "original_commit_id": rc.get("original_commit_id"),
+                    "diff_hunk": (rc.get("diff_hunk") or "")[-1200:],
                     "side": rc.get("side", "RIGHT"),
                     "created_at": reply_entry["created_at"],
                     "body": reply_entry["body"],
@@ -663,6 +683,319 @@ def fetch_pr_via_rest(
     return metadata, comments, files_list, diff_text
 
 
+def inspect_comment_code_state(
+    rel_path: str,
+    line: int = 1,
+    body: str = "",
+    diff_hunk: str = "",
+    is_outdated: bool = False,
+    head_root: str = "",
+    base_root: str = "",
+    repo_dir: str = "",
+    files_in_diff: Optional[set] = None,
+) -> Dict[str, Any]:
+    """Inspects the actual HEAD/base files on disk against an existing GitHub comment's
+    `diff_hunk` and any ` ```suggestion ` block to check what has already changed in code.
+    """
+    rel_path = (rel_path or "").strip()
+    has_diff_scope = bool(
+        (files_in_diff is not None and len(files_in_diff) > 0)
+        or (head_root and os.path.isdir(head_root))
+    )
+    head_file = os.path.join(head_root, rel_path) if (head_root and rel_path) else ""
+    file_in_pr_diff = (
+        (rel_path in files_in_diff)
+        if files_in_diff is not None
+        else (bool(head_file and os.path.isfile(head_file)) if has_diff_scope else True)
+    )
+    target_file_on_disk = ""
+    if head_file and os.path.isfile(head_file):
+        target_file_on_disk = head_file
+    elif repo_dir and rel_path and os.path.isfile(os.path.join(repo_dir, rel_path)):
+        target_file_on_disk = os.path.join(repo_dir, rel_path)
+
+    file_lines: List[str] = []
+    if target_file_on_disk:
+        try:
+            with open(target_file_on_disk, "r", encoding="utf-8", errors="replace") as f:
+                file_lines = f.read().splitlines()
+        except Exception:
+            file_lines = []
+
+    stripped_file_lines = [ln.strip() for ln in file_lines]
+
+    # 1. Check whether a ```suggestion block is already applied in current code
+    suggestion_lines: List[str] = []
+    suggestion_applied_in_head = False
+    m_sugg = re.search(r"```suggestion[ \t]*\r?\n(.*?)```", body or "", flags=re.DOTALL)
+    if m_sugg:
+        suggestion_lines = [ln.strip() for ln in m_sugg.group(1).splitlines() if ln.strip()]
+        if suggestion_lines and stripped_file_lines:
+            n_sugg = len(suggestion_lines)
+            for i in range(0, max(0, len(stripped_file_lines) - n_sugg + 1)):
+                window = [w for w in stripped_file_lines[i : i + n_sugg + 2] if w]
+                if window[:n_sugg] == suggestion_lines:
+                    suggestion_applied_in_head = True
+                    break
+            if not suggestion_applied_in_head and n_sugg == 1 and len(suggestion_lines[0]) >= 6:
+                suggestion_applied_in_head = suggestion_lines[0] in stripped_file_lines
+
+    # 2. Extract the commented right-side code line from GitHub's diff_hunk and check if it changed in HEAD
+    commented_code_line = ""
+    if diff_hunk:
+        right_lines: List[str] = []
+        for raw_hl in diff_hunk.splitlines():
+            if raw_hl.startswith("@@") or raw_hl.startswith("+++") or raw_hl.startswith("---"):
+                continue
+            if raw_hl.startswith("-"):
+                continue
+            if raw_hl.startswith("+") or raw_hl.startswith(" "):
+                right_lines.append(raw_hl[1:])
+        for cand_ln in reversed(right_lines):
+            s_cand = cand_ln.strip()
+            if s_cand:
+                commented_code_line = s_cand
+                break
+
+    commented_line_changed_in_head = False
+    if file_in_pr_diff and file_lines:
+        if commented_code_line and len(commented_code_line) >= 5:
+            win_start = max(0, int(line or 1) - 16)
+            win_end = min(len(stripped_file_lines), int(line or 1) + 16)
+            nearby = stripped_file_lines[win_start:win_end]
+            if commented_code_line not in nearby:
+                if is_outdated or commented_code_line not in stripped_file_lines:
+                    commented_line_changed_in_head = True
+                else:
+                    commented_line_changed_in_head = True
+        elif is_outdated:
+            commented_line_changed_in_head = True
+
+    # 3. Capture a concise current HEAD snippet around `line` so the AI agent can inspect immediately
+    current_head_snippet = ""
+    if file_lines:
+        center = max(1, min(len(file_lines), int(line or 1)))
+        s_idx = max(0, center - 4)
+        e_idx = min(len(file_lines), center + 4)
+        current_head_snippet = "\n".join(
+            f"{idx + 1}: {file_lines[idx]}" for idx in range(s_idx, e_idx)
+        )
+
+    return {
+        "has_diff_scope": has_diff_scope,
+        "file_in_pr_diff": file_in_pr_diff,
+        "is_outdated_on_github": bool(is_outdated),
+        "has_suggestion_block": bool(m_sugg),
+        "suggestion_applied_in_head": suggestion_applied_in_head,
+        "commented_code_line": commented_code_line,
+        "commented_line_changed_in_head": commented_line_changed_in_head,
+        "current_head_snippet": current_head_snippet,
+    }
+
+
+def enrich_comments_with_code_state(
+    comments: List[Dict[str, Any]],
+    base_root: str,
+    head_root: str,
+    repo_dir: str,
+    files_list: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """Attaches `code_check` metadata from HEAD/base snapshots onto inline GitHub comments in place."""
+    files_in_diff = {f.get("path", "") for f in (files_list or []) if f.get("path")} if files_list is not None else None
+    for c in comments:
+        if c.get("type") != "inline_comment" or not c.get("path"):
+            continue
+        c["code_check"] = inspect_comment_code_state(
+            rel_path=c.get("path") or "",
+            line=int(c.get("line") or 1),
+            body=c.get("body") or "",
+            diff_hunk=c.get("diff_hunk") or "",
+            is_outdated=bool(c.get("is_outdated")),
+            head_root=head_root,
+            base_root=base_root,
+            repo_dir=repo_dir,
+            files_in_diff=files_in_diff,
+        )
+
+
+def normalize_and_format_quasar_followup(
+    triage: Dict[str, Any],
+    author: str = "reviewer",
+    rel_path: str = "",
+    line: int = 1,
+    code_state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalizes existing-comment triage metadata and builds a structured Quasar follow-up
+    comment explicitly stating:
+      - ✅ What's Done
+      - ⚠️ What Isn't Done
+      - 👉 What Should Be Done
+    """
+    out = dict(triage or {})
+    raw_status = str(out.get("triageStatus") or out.get("verdict") or "needs_attention").strip().lower()
+    if raw_status in ("good", "should_fix", "needs_fix", "fix", "recommended_fix"):
+        status = "recommended_fix"
+    elif raw_status in (
+        "partially_addressed",
+        "partial",
+        "could_be_better",
+        "refinement_needed",
+        "needs_refinement",
+    ):
+        status = "partially_addressed"
+    elif raw_status in ("question", "needs_look", "needs_attention", "discussion"):
+        status = "needs_attention"
+    elif raw_status in ("addressed", "refuted", "disputed", "replied", "skip", "addressed_or_refuted"):
+        status = "addressed_or_refuted"
+    else:
+        status = "needs_attention"
+
+    cat = str(out.get("triageCategory") or raw_status or status).strip()
+    default_badge = {
+        "recommended_fix": "🛠️ Not Addressed — Should Fix",
+        "partially_addressed": "🟡 Partially Addressed — Refinement Suggested",
+        "needs_attention": "❓ Open Question / Needs Look",
+        "addressed_or_refuted": (
+            "⚠️ Disputed / No Fix"
+            if cat == "refuted"
+            else ("✅ Addressed in Code" if cat == "addressed" else "💬 Author Replied")
+        ),
+    }[status]
+    default_label = {
+        "recommended_fix": "🛠️ Not Yet Addressed — Suggested Fix Should Be Made",
+        "partially_addressed": "🟡 Partially Addressed in Code — Could Be Resolved Better",
+        "needs_attention": "❓ Needs Attention — Open Question or Design Decision",
+        "addressed_or_refuted": (
+            "⚠️ Premise Disputed — No Fix Needed"
+            if cat == "refuted"
+            else ("✅ Addressed — No Further Fix Needed" if cat == "addressed" else "💬 Replied in Thread — No Fix Queued")
+        ),
+    }[status]
+
+    badge = str(out.get("triageBadge") or default_badge).strip()
+    label = str(out.get("triageLabel") or default_label).strip()
+    summary = str(
+        out.get("triageSummary") or out.get("reason") or out.get("rationale") or ""
+    ).strip()
+    rec_fix = bool(
+        out.get("recommendedForFix", status in ("recommended_fix", "partially_addressed"))
+    )
+
+    if status == "recommended_fix":
+        left_tag = "🛠️ [Suggestion]" if cat == "suggestion" else "🛠️ [Should Fix]"
+    elif status == "partially_addressed":
+        left_tag = "🟡 [Partially Addressed]"
+    elif status == "addressed_or_refuted":
+        left_tag = (
+            "⚠️ [Disputed]"
+            if cat == "refuted"
+            else ("✅ [Addressed]" if cat == "addressed" else "💬 [Replied]")
+        )
+    else:
+        left_tag = "❓ [Question]" if "question" in cat else "👀 [Needs Look]"
+
+    loc_short = f"{os.path.basename(rel_path) or rel_path}:L{line}" if rel_path else f"line {line}"
+    changed_in_head = bool((code_state or {}).get("commented_line_changed_in_head"))
+
+    what_done = str(out.get("whatIsDone") or out.get("what_is_done") or "").strip()
+    what_not_done = str(
+        out.get("whatIsNotDone") or out.get("what_is_not_done") or out.get("what_isnt_done") or ""
+    ).strip()
+    what_should = str(
+        out.get("whatShouldBeDone") or out.get("what_should_be_done") or ""
+    ).strip()
+
+    if status == "addressed_or_refuted":
+        if not what_done:
+            what_done = summary or (
+                f"Author explained why the premise does not apply on `{loc_short}`."
+                if cat == "refuted"
+                else f"Already addressed in current code / thread on `{loc_short}`."
+            )
+        if not what_not_done:
+            what_not_done = (
+                "None — premise disputed / intentional design."
+                if cat == "refuted"
+                else "None — comment has been addressed."
+            )
+        if not what_should:
+            what_should = "No code changes needed."
+    elif status == "partially_addressed":
+        if not what_done:
+            what_done = (
+                f"Code around `{loc_short}` was updated after @{author}'s comment."
+                if changed_in_head
+                else f"Initial changes were made near `{loc_short}` toward @{author}'s comment."
+            )
+        if not what_not_done:
+            what_not_done = (
+                summary
+                or "An edge case or secondary part of the comment remains open or could be handled more cleanly."
+            )
+        if not what_should:
+            what_should = "Refine the implementation to cover the remaining case (or reply if intentional)."
+    elif status == "recommended_fix":
+        if not what_done:
+            what_done = (
+                f"Code near `{loc_short}` shifted since @{author}'s comment, but the issue itself is still present."
+                if changed_in_head
+                else f"No code changes made at `{loc_short}` for this comment yet."
+            )
+        if not what_not_done:
+            what_not_done = summary or f"@{author}'s feedback on `{loc_short}` has not been addressed in HEAD."
+        if not what_should:
+            what_should = (
+                "Apply the suggested code change."
+                if cat == "suggestion"
+                else "Update the code to address this comment."
+            )
+    else:
+        if not what_done:
+            what_done = (
+                f"Code near `{loc_short}` changed since @{author}'s comment; no author reply in thread yet."
+                if changed_in_head
+                else f"No code change or author reply recorded for `{loc_short}` yet."
+            )
+        if not what_not_done:
+            what_not_done = summary or f"@{author}'s question / design point on `{loc_short}` is still open."
+        if not what_should:
+            what_should = "Inspect the code context and either reply in the PR thread or update the implementation."
+
+    if not summary:
+        if status == "addressed_or_refuted":
+            summary = what_done
+        elif status == "partially_addressed":
+            summary = f"Done: {what_done} Remaining: {what_not_done}"
+        else:
+            summary = what_not_done
+
+    body_lines = [f"**🤖 Quasar Follow-Up — {label}**", ""]
+    if summary and summary not in (what_done, what_not_done, what_should):
+        body_lines.append(summary)
+        body_lines.append("")
+    body_lines.append(f"- **✅ What's Done:** {what_done}")
+    body_lines.append(f"- **⚠️ What Isn't Done:** {what_not_done}")
+    body_lines.append(f"- **👉 What Should Be Done:** {what_should}")
+
+    out.update(
+        {
+            "triageStatus": status,
+            "triageCategory": cat,
+            "triageBadge": badge,
+            "triageLabel": label,
+            "triageSummary": summary,
+            "recommendedForFix": rec_fix,
+            "triageLeftTag": left_tag,
+            "whatIsDone": what_done,
+            "whatIsNotDone": what_not_done,
+            "whatShouldBeDone": what_should,
+            "followupAuthor": f"Quasar Follow-Up ({badge})",
+            "followupBody": "\n".join(body_lines),
+        }
+    )
+    return out
+
+
 def assess_existing_github_comment(
     author: str,
     body: str,
@@ -670,16 +1003,79 @@ def assess_existing_github_comment(
     pr_author: str = "",
     rel_path: str = "",
     line: int = 1,
+    diff_hunk: str = "",
+    is_outdated: bool = False,
+    head_root: str = "",
+    base_root: str = "",
+    repo_dir: str = "",
+    code_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Classifies an existing GitHub PR inline comment so the user immediately sees whether:
-    - `recommended_fix` (`🛠️ Should Fix`): Quasar thinks the comment is good and the suggested fix should be made.
-    - `needs_attention` (`❓ Question` / `👀 Needs Look`): The comment asks a question that needs answering or raises a design discussion requiring human attention.
-    - `addressed_or_refuted` (`⚠️ Disputed` / `💬 Replied`): The PR author already replied or refuted the premise.
+    """Evaluates an existing GitHub PR inline comment against thread replies AND the actual
+    code in HEAD (`code_state` / `head_root`), returning normalized triage metadata plus
+    structured `whatIsDone`, `whatIsNotDone`, and `whatShouldBeDone` fields:
+    - `addressed_or_refuted` (`✅ Addressed` / `⚠️ Disputed` / `💬 Replied`)
+    - `partially_addressed` (`🟡 Partially Addressed — Could Be Resolved Better`)
+    - `recommended_fix` (`🛠️ Not Addressed — Should Fix`)
+    - `needs_attention` (`❓ Question` / `👀 Needs Look`)
     """
     replies = replies or []
     text = (body or "").strip()
     lower = text.lower()
     pr_author_norm = (pr_author or "").strip().lower()
+    loc_short = f"{os.path.basename(rel_path) or rel_path}:L{line}" if rel_path else f"line {line}"
+
+    if code_state is None and (head_root or repo_dir or diff_hunk or "```suggestion" in lower):
+        code_state = inspect_comment_code_state(
+            rel_path=rel_path,
+            line=line,
+            body=text,
+            diff_hunk=diff_hunk,
+            is_outdated=is_outdated,
+            head_root=head_root,
+            base_root=base_root,
+            repo_dir=repo_dir,
+        )
+    cs = code_state or {}
+
+    # 0. Code-level check: Is the commented file no longer modified in this PR's diff?
+    if cs.get("has_diff_scope") and rel_path and not cs.get("file_in_pr_diff", True):
+        return normalize_and_format_quasar_followup(
+            {
+                "triageStatus": "addressed_or_refuted",
+                "triageCategory": "addressed",
+                "triageBadge": "✅ File Unchanged in HEAD",
+                "triageLabel": "✅ Addressed — File No Longer Modified in PR Diff",
+                "triageSummary": f"`{rel_path}` is no longer part of this PR's diff (changes reverted or split out).",
+                "whatIsDone": f"`{rel_path}` is untouched in the current PR diff vs base (reverted or landed separately).",
+                "whatIsNotDone": "None — commented diff hunk is no longer in this PR.",
+                "whatShouldBeDone": "No code changes needed in this PR.",
+                "recommendedForFix": False,
+            },
+            author=author,
+            rel_path=rel_path,
+            line=line,
+            code_state=cs,
+        )
+
+    # 0b. Code-level check: Was a concrete ```suggestion block already applied in HEAD?
+    if cs.get("has_suggestion_block") and cs.get("suggestion_applied_in_head"):
+        return normalize_and_format_quasar_followup(
+            {
+                "triageStatus": "addressed_or_refuted",
+                "triageCategory": "addressed",
+                "triageBadge": "✅ Suggestion Applied in Code",
+                "triageLabel": "✅ Addressed — Suggested Code Already in HEAD",
+                "triageSummary": f"The code from @{author}'s `suggestion` block is already present in `{os.path.basename(rel_path) or rel_path}`.",
+                "whatIsDone": f"Applied @{author}'s suggested code in `{loc_short}`.",
+                "whatIsNotDone": "None — current HEAD code matches the suggestion.",
+                "whatShouldBeDone": "No further code changes needed.",
+                "recommendedForFix": False,
+            },
+            author=author,
+            rel_path=rel_path,
+            line=line,
+            code_state=cs,
+        )
 
     # 1. Check if PR author already replied or refuted the comment in the thread
     author_replies = [
@@ -705,51 +1101,110 @@ def assess_existing_github_comment(
                 "incorrect",
             )
         ):
-            return {
-                "triageStatus": "addressed_or_refuted",
-                "triageCategory": "refuted",
-                "triageBadge": "⚠️ Disputed / No Fix",
-                "triageLabel": "⚠️ Premise Disputed by Author — Do Not Apply",
-                "triageSummary": (
-                    f"@{pr_author} replied explaining why this comment's premise does not apply"
-                    + (f' ("{first_reply_line}").' if first_reply_line else ".")
-                ),
-                "recommendedForFix": False,
-            }
+            return normalize_and_format_quasar_followup(
+                {
+                    "triageStatus": "addressed_or_refuted",
+                    "triageCategory": "refuted",
+                    "triageBadge": "⚠️ Disputed / No Fix",
+                    "triageLabel": "⚠️ Premise Disputed by Author — Do Not Apply",
+                    "triageSummary": (
+                        f"@{pr_author} replied explaining why this comment's premise does not apply"
+                        + (f' ("{first_reply_line}").' if first_reply_line else ".")
+                    ),
+                    "whatIsDone": f"@{pr_author} replied in thread explaining why the current code is intentional"
+                    + (f' ("{first_reply_line}").' if first_reply_line else "."),
+                    "whatIsNotDone": "None — premise disputed / intentional behavior.",
+                    "whatShouldBeDone": "Do not apply this change unless reviewer follows up.",
+                    "recommendedForFix": False,
+                },
+                author=author,
+                rel_path=rel_path,
+                line=line,
+                code_state=cs,
+            )
         if any(
             kw in last_reply_lower
             for kw in ("done", "fixed", "updated", "removed", "renamed", "addressed", "added")
         ):
-            return {
+            return normalize_and_format_quasar_followup(
+                {
+                    "triageStatus": "addressed_or_refuted",
+                    "triageCategory": "addressed",
+                    "triageBadge": "✅ Addressed in Thread",
+                    "triageLabel": "✅ Already Addressed by Author",
+                    "triageSummary": f"@{pr_author} replied indicating this comment was already addressed.",
+                    "whatIsDone": f"@{pr_author} updated the code and confirmed in thread"
+                    + (f' ("{first_reply_line}").' if first_reply_line else "."),
+                    "whatIsNotDone": "None — marked addressed by author (deep review verifies no edge cases remain).",
+                    "whatShouldBeDone": "No further code changes needed unless deep review spots a subtle edge case.",
+                    "recommendedForFix": False,
+                },
+                author=author,
+                rel_path=rel_path,
+                line=line,
+                code_state=cs,
+            )
+        return normalize_and_format_quasar_followup(
+            {
                 "triageStatus": "addressed_or_refuted",
-                "triageCategory": "addressed",
-                "triageBadge": "✅ Addressed in Thread",
-                "triageLabel": "✅ Already Addressed by Author",
-                "triageSummary": f"@{pr_author} replied indicating this comment was already addressed.",
+                "triageCategory": "replied",
+                "triageBadge": "💬 Author Replied",
+                "triageLabel": "💬 Author Replied in Thread — Check if Resolved",
+                "triageSummary": (
+                    f"@{pr_author} already replied in this thread"
+                    + (f': "{first_reply_line}"' if first_reply_line else ".")
+                ),
+                "whatIsDone": f"@{pr_author} replied in thread"
+                + (f': "{first_reply_line}"' if first_reply_line else "."),
+                "whatIsNotDone": "Awaiting reviewer confirmation (or deep code check if follow-up edits are needed).",
+                "whatShouldBeDone": "No action needed unless reviewer replies further.",
                 "recommendedForFix": False,
-            }
-        return {
-            "triageStatus": "addressed_or_refuted",
-            "triageCategory": "replied",
-            "triageBadge": "💬 Author Replied",
-            "triageLabel": "💬 Author Replied in Thread — Check if Resolved",
-            "triageSummary": (
-                f"@{pr_author} already replied in this thread"
-                + (f': "{first_reply_line}"' if first_reply_line else ".")
-            ),
-            "recommendedForFix": False,
-        }
+            },
+            author=author,
+            rel_path=rel_path,
+            line=line,
+            code_state=cs,
+        )
 
-    # 2. Check for explicit GitHub ```suggestion block
+    # 1b. Code-level check: Did the commented code line already change in HEAD (even without an author reply)?
+    if cs.get("commented_line_changed_in_head"):
+        return normalize_and_format_quasar_followup(
+            {
+                "triageStatus": "partially_addressed",
+                "triageCategory": "code_updated",
+                "triageBadge": "🟡 Code Updated — Verifying",
+                "triageLabel": "🟡 Code Changed Since Comment — Checking Completeness",
+                "triageSummary": f"Code around `{loc_short}` was modified after @{author}'s comment; Quasar deep analysis checks whether all cases are resolved.",
+                "whatIsDone": f"Code around `{loc_short}` was updated in HEAD since @{author} left this comment.",
+                "whatIsNotDone": "Pending semantic check that every case / question in the comment is fully resolved.",
+                "whatShouldBeDone": "Wait for Quasar deep review verification (or inspect HEAD around this line).",
+                "recommendedForFix": False,
+            },
+            author=author,
+            rel_path=rel_path,
+            line=line,
+            code_state=cs,
+        )
+
+    # 2. Check for explicit GitHub ```suggestion block (not yet applied in HEAD)
     if "```suggestion" in lower:
-        return {
-            "triageStatus": "recommended_fix",
-            "triageCategory": "suggestion",
-            "triageBadge": "🛠️ Good Fix (Suggestion)",
-            "triageLabel": "🛠️ Good Comment — Suggested Fix Should Be Made",
-            "triageSummary": f"@{author} provided a concrete code suggestion block (` ```suggestion `) that is ready to apply.",
-            "recommendedForFix": True,
-        }
+        return normalize_and_format_quasar_followup(
+            {
+                "triageStatus": "recommended_fix",
+                "triageCategory": "suggestion",
+                "triageBadge": "🛠️ Not Applied (Suggestion)",
+                "triageLabel": "🛠️ Not Yet Applied — Concrete Code Suggestion Available",
+                "triageSummary": f"@{author} provided a concrete `suggestion` block on `{loc_short}` that is not yet in HEAD.",
+                "whatIsDone": f"Nothing changed at `{loc_short}` yet — current HEAD still has the pre-suggestion code.",
+                "whatIsNotDone": f"@{author}'s `suggestion` block on `{loc_short}` has not been applied.",
+                "whatShouldBeDone": "Apply the suggested code block (or reply explaining why if not applicable).",
+                "recommendedForFix": True,
+            },
+            author=author,
+            rel_path=rel_path,
+            line=line,
+            code_state=cs,
+        )
 
     # 3. Check for high-signal bug / edge-case / compiler warning / shadowing / collision catches
     bug_signals = [
@@ -771,14 +1226,23 @@ def assess_existing_github_comment(
     matched_bug_reasons = [desc for pat, desc in bug_signals if pat in lower]
     if matched_bug_reasons:
         reason_str = ", ".join(dict.fromkeys(matched_bug_reasons[:2]))
-        return {
-            "triageStatus": "recommended_fix",
-            "triageCategory": "bug_or_edge_case",
-            "triageBadge": "🛠️ Good Catch — Should Fix",
-            "triageLabel": "🛠️ Good Comment — Suggested Fix Should Be Made",
-            "triageSummary": f"High-signal catch by @{author} identifying a valid {reason_str} in `{os.path.basename(rel_path) or rel_path}:L{line}`. Quasar recommends making this fix.",
-            "recommendedForFix": True,
-        }
+        return normalize_and_format_quasar_followup(
+            {
+                "triageStatus": "recommended_fix",
+                "triageCategory": "bug_or_edge_case",
+                "triageBadge": "🛠️ Not Addressed — Should Fix",
+                "triageLabel": "🛠️ Not Yet Addressed — Suggested Fix Should Be Made",
+                "triageSummary": f"@{author} flagged a {reason_str} in `{loc_short}` and the commented line has not changed in HEAD.",
+                "whatIsDone": f"No code changes at `{loc_short}` since @{author}'s comment.",
+                "whatIsNotDone": f"The {reason_str} noted by @{author} on `{loc_short}` is still unaddressed.",
+                "whatShouldBeDone": f"Update `{loc_short}` to fix the {reason_str}.",
+                "recommendedForFix": True,
+            },
+            author=author,
+            rel_path=rel_path,
+            line=line,
+            code_state=cs,
+        )
 
     # 4. Check for open architectural / design questions or broader design discussions that require human attention
     is_design_discussion = any(
@@ -812,42 +1276,78 @@ def assess_existing_github_comment(
 
     if is_design_discussion:
         if has_question_mark:
-            return {
+            return normalize_and_format_quasar_followup(
+                {
+                    "triageStatus": "needs_attention",
+                    "triageCategory": "question",
+                    "triageBadge": "❓ Question — Needs Answer",
+                    "triageLabel": "❓ Open Question — Requires Your Answer or Decision",
+                    "triageSummary": f"@{author} asked an architectural/design question on `{loc_short}` with no code change or reply yet.",
+                    "whatIsDone": f"No reply or code change recorded on `{loc_short}` yet.",
+                    "whatIsNotDone": f"@{author}'s architectural/design question remains unanswered.",
+                    "whatShouldBeDone": "Decide on the design trade-off and either reply in the thread or refactor.",
+                    "recommendedForFix": False,
+                },
+                author=author,
+                rel_path=rel_path,
+                line=line,
+                code_state=cs,
+            )
+        return normalize_and_format_quasar_followup(
+            {
                 "triageStatus": "needs_attention",
-                "triageCategory": "question",
-                "triageBadge": "❓ Question — Needs Answer",
-                "triageLabel": "❓ Question — Requires Your Answer or Decision",
-                "triageSummary": f"@{author} asked an architectural/design question on `{os.path.basename(rel_path) or rel_path}` that needs an answer or design decision.",
+                "triageCategory": "discussion",
+                "triageBadge": "👀 Needs Look (Design)",
+                "triageLabel": "👀 Open Design Discussion — Needs Attention",
+                "triageSummary": f"@{author} raised a design/structure concern on `{loc_short}`.",
+                "whatIsDone": f"No reply or structural change recorded on `{loc_short}` yet.",
+                "whatIsNotDone": f"@{author}'s design concern has not been addressed or replied to.",
+                "whatShouldBeDone": "Review the design feedback and decide whether to refactor or explain the current structure.",
                 "recommendedForFix": False,
-            }
-        return {
-            "triageStatus": "needs_attention",
-            "triageCategory": "discussion",
-            "triageBadge": "👀 Needs Look (Design)",
-            "triageLabel": "👀 Needs Attention — Design Discussion",
-            "triageSummary": f"@{author} raised a design/structure concern on `{os.path.basename(rel_path) or rel_path}` that requires looking at to decide whether to refactor or reply.",
-            "recommendedForFix": False,
-        }
+            },
+            author=author,
+            rel_path=rel_path,
+            line=line,
+            code_state=cs,
+        )
 
     # 5. Check for questions that ask whether something is necessary or how it works
     if has_question_mark and not is_polite_doc_or_nit_request:
         if "is this " in lower and "necessary" in lower:
-            return {
-                "triageStatus": "recommended_fix",
-                "triageCategory": "cleanup_question",
-                "triageBadge": "🛠️ Good Catch / ❓ Question",
-                "triageLabel": "🛠️ Good Comment — Suggested Simplification (or Reply)",
-                "triageSummary": f"@{author} asked whether this code is redundant; inspecting the context shows it can be simplified directly as suggested.",
-                "recommendedForFix": True,
-            }
-        return {
-            "triageStatus": "needs_attention",
-            "triageCategory": "question",
-            "triageBadge": "❓ Question — Needs Answer",
-            "triageLabel": "❓ Question — Requires Your Attention / Answer",
-            "triageSummary": f"@{author} asked a question on `{os.path.basename(rel_path) or rel_path}:L{line}` that needs to be looked at and answered.",
-            "recommendedForFix": False,
-        }
+            return normalize_and_format_quasar_followup(
+                {
+                    "triageStatus": "recommended_fix",
+                    "triageCategory": "cleanup_question",
+                    "triageBadge": "🛠️ Good Catch / ❓ Question",
+                    "triageLabel": "🛠️ Not Yet Addressed — Suggested Simplification (or Reply)",
+                    "triageSummary": f"@{author} asked whether code at `{loc_short}` is redundant; line is unchanged in HEAD.",
+                    "whatIsDone": f"No code change or reply at `{loc_short}` yet.",
+                    "whatIsNotDone": f"Redundancy question from @{author} has not been resolved.",
+                    "whatShouldBeDone": "Simplify/remove the redundant code if unnecessary, or reply explaining why it is needed.",
+                    "recommendedForFix": True,
+                },
+                author=author,
+                rel_path=rel_path,
+                line=line,
+                code_state=cs,
+            )
+        return normalize_and_format_quasar_followup(
+            {
+                "triageStatus": "needs_attention",
+                "triageCategory": "question",
+                "triageBadge": "❓ Question — Needs Answer",
+                "triageLabel": "❓ Open Question — Requires Your Attention / Answer",
+                "triageSummary": f"@{author} asked a question on `{loc_short}` that has not been answered or changed yet.",
+                "whatIsDone": f"No code change or author reply at `{loc_short}` yet.",
+                "whatIsNotDone": f"@{author}'s question on `{loc_short}` is still open.",
+                "whatShouldBeDone": "Check the code at this line and either answer the question or adjust the code.",
+                "recommendedForFix": False,
+            },
+            author=author,
+            rel_path=rel_path,
+            line=line,
+            code_state=cs,
+        )
 
     # 6. Actionable nits, readability improvements, and documentation/comment requests
     if is_polite_doc_or_nit_request or any(
@@ -864,24 +1364,42 @@ def assess_existing_github_comment(
             "rename",
         )
     ):
-        return {
-            "triageStatus": "recommended_fix",
-            "triageCategory": "actionable_improvement",
-            "triageBadge": "🛠️ Good Comment — Should Fix",
-            "triageLabel": "🛠️ Good Comment — Suggested Fix Should Be Made",
-            "triageSummary": f"Clear, actionable improvement suggested by @{author} on `{os.path.basename(rel_path) or rel_path}:L{line}`; Quasar recommends applying this fix.",
-            "recommendedForFix": True,
-        }
+        return normalize_and_format_quasar_followup(
+            {
+                "triageStatus": "recommended_fix",
+                "triageCategory": "actionable_improvement",
+                "triageBadge": "🛠️ Not Addressed — Should Fix",
+                "triageLabel": "🛠️ Not Yet Addressed — Suggested Improvement",
+                "triageSummary": f"Actionable improvement suggested by @{author} on `{loc_short}` (code unchanged since comment).",
+                "whatIsDone": f"No code changes at `{loc_short}` since @{author}'s comment.",
+                "whatIsNotDone": f"@{author}'s suggested improvement on `{loc_short}` has not been applied.",
+                "whatShouldBeDone": f"Apply the requested improvement at `{loc_short}`.",
+                "recommendedForFix": True,
+            },
+            author=author,
+            rel_path=rel_path,
+            line=line,
+            code_state=cs,
+        )
 
     # Default fallback: requires looking at
-    return {
-        "triageStatus": "needs_attention",
-        "triageCategory": "review_comment",
-        "triageBadge": "👀 Needs Attention",
-        "triageLabel": "👀 Needs Attention — Review Comment",
-        "triageSummary": f"Existing review comment from @{author} that requires looking at.",
-        "recommendedForFix": False,
-    }
+    return normalize_and_format_quasar_followup(
+        {
+            "triageStatus": "needs_attention",
+            "triageCategory": "review_comment",
+            "triageBadge": "👀 Needs Attention",
+            "triageLabel": "👀 Needs Attention — Review Comment",
+            "triageSummary": f"Existing review comment from @{author} on `{loc_short}`.",
+            "whatIsDone": f"No code change or reply detected on `{loc_short}`.",
+            "whatIsNotDone": f"@{author}'s comment on `{loc_short}` still needs review.",
+            "whatShouldBeDone": "Inspect the commented code and decide whether to update or reply.",
+            "recommendedForFix": False,
+        },
+        author=author,
+        rel_path=rel_path,
+        line=line,
+        code_state=cs,
+    )
 
 
 def build_initial_cliffs_notes_session(
@@ -1039,19 +1557,14 @@ def build_initial_cliffs_notes_session(
             pr_author=pr_author_login,
             rel_path=c.get("path") or "",
             line=int(c.get("line") or 1),
+            diff_hunk=c.get("diff_hunk") or "",
+            is_outdated=bool(c.get("is_outdated")),
+            head_root=head_root,
+            base_root=base_root,
+            repo_dir=repo_dir,
+            code_state=c.get("code_check"),
         )
-        cat = triage.get("triageCategory") or ""
-        status = triage.get("triageStatus") or "needs_attention"
-        if status == "recommended_fix":
-            left_tag = "🛠️ [Suggestion]" if cat == "suggestion" else "🛠️ [Should Fix]"
-        elif status == "addressed_or_refuted":
-            left_tag = (
-                "⚠️ [Disputed]"
-                if cat == "refuted"
-                else ("✅ [Addressed]" if cat == "addressed" else "💬 [Replied]")
-            )
-        else:
-            left_tag = "❓ [Question]" if "question" in cat else "👀 [Needs Look]"
+        left_tag = triage["triageLeftTag"]
 
         msgs: List[Dict[str, Any]] = [
             {
@@ -1071,8 +1584,8 @@ def build_initial_cliffs_notes_session(
             )
         msgs.append(
             {
-                "author": f"Quasar Triage ({triage['triageBadge']})",
-                "body": f"**{triage['triageLabel']}**\n\n{triage['triageSummary']}",
+                "author": triage["followupAuthor"],
+                "body": triage["followupBody"],
                 "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "isTriageNote": True,
             }
@@ -1092,12 +1605,20 @@ def build_initial_cliffs_notes_session(
                 "triageBadge": triage["triageBadge"],
                 "triageLabel": triage["triageLabel"],
                 "triageSummary": triage["triageSummary"],
+                "whatIsDone": triage["whatIsDone"],
+                "whatIsNotDone": triage["whatIsNotDone"],
+                "whatShouldBeDone": triage["whatShouldBeDone"],
                 "recommendedForFix": triage["recommendedForFix"],
                 "path": c["path"],
                 "startLine": int(c.get("line") or 1),
                 "endLine": int(c.get("line") or 1),
                 "title": f"{left_tag} {first_line}",
-                "whyItMatters": f"{triage['triageLabel']} — {triage['triageSummary']}",
+                "whyItMatters": (
+                    f"{triage['triageLabel']} — "
+                    f"✅ Done: {triage['whatIsDone']} | "
+                    f"⚠️ Not Done: {triage['whatIsNotDone']} | "
+                    f"👉 Should Do: {triage['whatShouldBeDone']}"
+                ),
                 "draftComment": raw_body,
                 "messages": msgs,
             }
@@ -1422,8 +1943,9 @@ TOP_LEVEL_SUMMARY_THREAD_ID = "top-level-review"
 
 def build_combined_top_level_comment(session: Dict[str, Any]) -> str:
     """Builds a single ready-to-leave Top-Level PR Review Comment combining any
-    explicit `topLevelCommentIntro` / `topLevelComment` and any active top-level
-    findings (such as comments on untouched files outside the PR diff).
+    explicit `topLevelCommentIntro` / `topLevelComment` and any staged NEW top-level
+    findings (such as new review comments on untouched files outside the PR diff).
+    Never includes existing GitHub PR comments (`kind == 'github_existing'`).
     """
     intro = (session.get("topLevelCommentIntro") or "").strip()
     threads = session.get("threads") or []
@@ -1431,7 +1953,9 @@ def build_combined_top_level_comment(session: Dict[str, Any]) -> str:
     for t in threads:
         if t.get("id") == TOP_LEVEL_SUMMARY_THREAD_ID:
             continue
-        if t.get("status") in ("dismissed", "uncertain"):
+        if t.get("kind") == "github_existing":
+            continue
+        if t.get("status") != "staged":
             continue
         rel_path = (t.get("path") or "").strip()
         is_top = bool(
@@ -1481,11 +2005,13 @@ def sync_top_level_comments_file(session: Dict[str, Any]) -> None:
 
     threads = session.get("threads") or []
     summary_thread: Optional[Dict[str, Any]] = None
+    non_summary_threads: List[Dict[str, Any]] = []
     top_threads: List[Dict[str, Any]] = []
     for t in threads:
         if t.get("id") == TOP_LEVEL_SUMMARY_THREAD_ID:
             summary_thread = t
             continue
+        non_summary_threads.append(t)
         rel_path = (t.get("path") or "").strip()
         is_top = bool(
             t.get("isTopLevel")
@@ -1576,7 +2102,7 @@ def sync_top_level_comments_file(session: Dict[str, Any]) -> None:
                     }
                 ],
             }
-            session["threads"] = [summary_thread] + threads
+            session["threads"] = [summary_thread] + non_summary_threads
         else:
             summary_thread["isTopLevel"] = True
             summary_thread["isTopLevelSummary"] = True
@@ -1587,6 +2113,9 @@ def sync_top_level_comments_file(session: Dict[str, Any]) -> None:
                 summary_thread["draftComment"] = effective_summary_draft
                 if summary_thread.get("messages"):
                     summary_thread["messages"][0]["body"] = summary_msg_body
+            session["threads"] = [summary_thread] + non_summary_threads
+    else:
+        session["threads"] = non_summary_threads
 
     if not top_threads:
         head_lines.append("_No individual untouched-file comments in this session._")
@@ -1599,19 +2128,36 @@ def sync_top_level_comments_file(session: Dict[str, Any]) -> None:
             why = (t.get("whyItMatters") or "").strip()
             draft = (t.get("draftComment") or t.get("body") or "").strip()
 
-            head_lines.append(f"## 📌 #{idx} [{sev}] {title}")
-            if target_file:
-                head_lines.append(f"- **Untouched File (Not in PR Diff)**: `{target_file}`")
-            if why:
-                head_lines.append(f"- **CliffsNotes Context**: {why}")
-            head_lines.append("")
-            head_lines.append("### 💬 Top-Level GitHub Review Comment Item")
-            if target_file and target_file not in draft and os.path.basename(target_file) not in draft:
-                head_lines.append(f"> **`{target_file}`:** {draft}")
-            elif target_file and target_file not in draft:
-                head_lines.append(f"> **`{target_file}`:** {draft}")
+            if t.get("kind") == "github_existing":
+                gh_author = (t.get("author") or "reviewer").lstrip("@")
+                badge = t.get("triageBadge") or "💬 GitHub Comment"
+                head_lines.append(f"## 💬 Existing GitHub Comment #{idx} ({badge}) — {title}")
+                if target_file:
+                    head_lines.append(f"- **Commented File (No Longer in PR Diff)**: `{target_file}`")
+                head_lines.append(f"- **Original Author**: `@{gh_author}` *(existing GitHub comment — NOT staged as a new review comment)*")
+                head_lines.append("")
+                head_lines.append(f"### 💬 Original GitHub Comment (`@{gh_author}`)")
+                for d_ln in (draft.splitlines() or [""]):
+                    head_lines.append(f"> {d_ln}")
+                head_lines.append("")
+                head_lines.append("### 🤖 Quasar Follow-Up")
+                head_lines.append(f"- **✅ What's Done:** {t.get('whatIsDone') or t.get('triageSummary') or 'Checked against current PR diff.'}")
+                head_lines.append(f"- **⚠️ What Isn't Done:** {t.get('whatIsNotDone') or 'None.'}")
+                head_lines.append(f"- **👉 What Should Be Done:** {t.get('whatShouldBeDone') or 'No code changes needed.'}")
             else:
-                head_lines.append(f"> {draft}")
+                head_lines.append(f"## 📌 #{idx} [{sev}] {title}")
+                if target_file:
+                    head_lines.append(f"- **Untouched File (Not in PR Diff)**: `{target_file}`")
+                if why:
+                    head_lines.append(f"- **CliffsNotes Context**: {why}")
+                head_lines.append("")
+                head_lines.append("### 💬 Top-Level GitHub Review Comment Item")
+                if target_file and target_file not in draft and os.path.basename(target_file) not in draft:
+                    head_lines.append(f"> **`{target_file}`:** {draft}")
+                elif target_file and target_file not in draft:
+                    head_lines.append(f"> **`{target_file}`:** {draft}")
+                else:
+                    head_lines.append(f"> {draft}")
 
             end_line = len(head_lines)
             t["startLine"] = start_line
@@ -1961,9 +2507,7 @@ def render_cliffs_notes_markdown(session: Dict[str, Any]) -> str:
         if t.get("kind") == "github_existing" and t.get("status") != "dismissed"
     ]
     if existing_gh_threads:
-        lines.append("## 💬 Existing GitHub PR Comments (Triage & Recommendations)")
-        lines.append("| Assessment | Location | Comment & Quasar Triage |")
-        lines.append("| :--- | :--- | :--- |")
+        lines.append("## 💬 Existing GitHub PR Comments & Quasar Follow-Ups")
         for t in existing_gh_threads:
             head_path = os.path.join(session.get("headSnapshotRoot", ""), t.get("path", ""))
             start_l = t.get("startLine", 1)
@@ -1973,22 +2517,29 @@ def render_cliffs_notes_markdown(session: Dict[str, Any]) -> str:
                 if t.get("status") == "fixed"
                 else (t.get("triageBadge") or "👀 Needs Attention")
             )
-            summary_note = (
-                t.get("fixedSummary")
-                if t.get("status") == "fixed"
-                else (t.get("triageSummary") or t.get("whyItMatters") or "")
-            )
-            if is_owned and len(t.get("solutionOptions") or []) >= 2:
-                opts_str = "; ".join(str(o.get("label") or "") for o in (t.get("solutionOptions") or []))
-                if t.get("selectedSolution"):
-                    summary_note += f" (✅ Chosen: {t['selectedSolution']})"
-                else:
-                    summary_note += f" (🧭 Options: {opts_str})"
-            title_clean = (t.get("title") or "GitHub Comment").replace("|", "\\|")
-            summary_clean = summary_note.replace("|", "\\|").replace("\n", " ")
-            lines.append(
-                f"| **{badge}** | [{os.path.basename(t.get('path', ''))}:L{start_l}](file://{head_path}#L{start_l}-L{end_l}) | **{title_clean}** — {summary_clean} |"
-            )
+            disp_file = t.get("targetFile") or t.get("path") or ""
+            loc_md = f"[{os.path.basename(disp_file)}:L{start_l}](file://{head_path}#L{start_l}-L{end_l})"
+            gh_author = (t.get("author") or "reviewer").lstrip("@")
+            lines.append(f"- **[{badge}] {loc_md} (`@{gh_author}`) — {t.get('title', 'GitHub Comment')}**")
+            if t.get("status") == "fixed":
+                lines.append(f"  - **✅ Fixed in Working Tree:** {t.get('fixedSummary') or 'Applied fix in workspace.'}")
+            else:
+                what_done = t.get("whatIsDone") or t.get("triageSummary") or "Checked against current code."
+                what_not_done = t.get("whatIsNotDone") or (
+                    "None — comment has been addressed."
+                    if t.get("triageStatus") == "addressed_or_refuted"
+                    else "See comment details."
+                )
+                what_should = t.get("whatShouldBeDone") or (
+                    "No code changes needed."
+                    if t.get("triageStatus") == "addressed_or_refuted"
+                    else "Inspect and update or reply."
+                )
+                lines.append(f"  - **✅ What's Done:** {what_done}")
+                lines.append(f"  - **⚠️ What Isn't Done:** {what_not_done}")
+                lines.append(f"  - **👉 What Should Be Done:** {what_should}")
+            if is_owned and t.get("status") != "fixed":
+                lines.extend(_render_thread_solutions_markdown_lines(t, "  "))
         lines.append("")
 
     prefs = session.get("reviewerPreferences") or {}
@@ -3114,6 +3665,14 @@ def main() -> None:
         lens_ctx = build_lens_context(_load_full_prefs(), effort_level, repo_dir, ws_root)
     except Exception:
         lens_ctx = {"available_review_agents": [], "effort_lenses": {}, "review_lenses": []}
+
+    enrich_comments_with_code_state(
+        comments,
+        base_root=base_root,
+        head_root=head_root,
+        repo_dir=repo_dir,
+        files_list=files_list,
+    )
 
     summary: Dict[str, Any] = {
         "mode": "pr" if pr_arg else "local_branch",

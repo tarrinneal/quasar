@@ -19,10 +19,13 @@ from typing import Any, Dict, List, Optional
 
 from collect_pr_context import (
     REVIEW_STATE_DIR,
+    TOP_LEVEL_COMMENTS_FILENAME,
     archive_review_session,
     assess_existing_github_comment,
     format_solution_option_text,
     get_session_paths,
+    inspect_comment_code_state,
+    normalize_and_format_quasar_followup,
     normalize_solution_options,
     render_cliffs_notes_markdown,
     resolve_target_window,
@@ -36,6 +39,9 @@ def _apply_triage_to_existing_thread(
     pr_author: str,
     now_iso: str,
     is_owned: bool = True,
+    head_root: str = "",
+    base_root: str = "",
+    repo_dir: str = "",
 ) -> Dict[str, Any]:
     thread = dict(t)
     raw_body = (thread.get("draftComment") or "").strip()
@@ -56,76 +62,112 @@ def _apply_triage_to_existing_thread(
         if "(GitHub" in str(m.get("author") or "")
     ]
 
-    if override:
-        status = override.get("triageStatus") or override.get("verdict") or thread.get("triageStatus") or "needs_attention"
-        if status in ("good", "should_fix", "needs_fix", "fix", "recommended_fix"):
-            status = "recommended_fix"
-        elif status in ("question", "needs_look", "needs_attention", "discussion"):
-            status = "needs_attention"
-        elif status in ("addressed", "refuted", "disputed", "replied", "skip", "addressed_or_refuted"):
-            status = "addressed_or_refuted"
+    raw_path = (thread.get("path") or "").strip()
+    rel_path_for_check = (
+        (thread.get("targetFile") or "").strip()
+        if raw_path == TOP_LEVEL_COMMENTS_FILENAME
+        else raw_path
+    )
+    line_num = int(thread.get("startLine") or 1)
+    code_state = inspect_comment_code_state(
+        rel_path=rel_path_for_check,
+        line=line_num,
+        body=raw_body,
+        head_root=head_root,
+        base_root=base_root,
+        repo_dir=repo_dir,
+    )
 
-        default_badge = (
-            "🛠️ Good Catch — Should Fix"
-            if status == "recommended_fix"
-            else ("❓ Question / Needs Look" if status == "needs_attention" else "💬 Replied / No Fix")
-        )
-        default_label = (
-            "🛠️ Good Comment — Suggested Fix Should Be Made"
-            if status == "recommended_fix"
-            else (
-                "❓ Needs Attention — Question or Design Decision"
-                if status == "needs_attention"
-                else "💬 Already Replied / No Fix Needed"
-            )
-        )
-        badge = override.get("triageBadge") or default_badge
-        label = override.get("triageLabel") or default_label
-        summary = override.get("triageSummary") or override.get("reason") or override.get("rationale") or thread.get("triageSummary") or ""
-        rec_fix = bool(override.get("recommendedForFix", status == "recommended_fix"))
-        triage = {
-            "triageStatus": status,
-            "triageCategory": override.get("triageCategory") or status,
-            "triageBadge": badge,
-            "triageLabel": label,
-            "triageSummary": summary,
-            "recommendedForFix": rec_fix,
+    if override:
+        raw_triage = {
+            "triageStatus": override.get("triageStatus") or override.get("verdict") or thread.get("triageStatus") or "needs_attention",
+            "triageCategory": override.get("triageCategory") or thread.get("triageCategory") or "",
+            "triageBadge": override.get("triageBadge") or "",
+            "triageLabel": override.get("triageLabel") or "",
+            "triageSummary": (
+                override.get("triageSummary")
+                or override.get("reason")
+                or override.get("rationale")
+                or thread.get("triageSummary")
+                or ""
+            ),
+            "whatIsDone": (
+                override.get("whatIsDone")
+                or override.get("what_is_done")
+                or ""
+            ),
+            "whatIsNotDone": (
+                override.get("whatIsNotDone")
+                or override.get("what_is_not_done")
+                or override.get("what_isnt_done")
+                or ""
+            ),
+            "whatShouldBeDone": (
+                override.get("whatShouldBeDone")
+                or override.get("what_should_be_done")
+                or ""
+            ),
         }
+        if "recommendedForFix" in override:
+            raw_triage["recommendedForFix"] = bool(override["recommendedForFix"])
+        triage = normalize_and_format_quasar_followup(
+            raw_triage,
+            author=author,
+            rel_path=rel_path_for_check,
+            line=line_num,
+            code_state=code_state,
+        )
     elif thread.get("triageStatus") and thread.get("triageBadge") and thread.get("triageSummary"):
-        triage = {
-            "triageStatus": thread["triageStatus"],
-            "triageCategory": thread.get("triageCategory") or thread["triageStatus"],
-            "triageBadge": thread["triageBadge"],
-            "triageLabel": thread.get("triageLabel") or thread["triageBadge"],
-            "triageSummary": thread["triageSummary"],
-            "recommendedForFix": bool(thread.get("recommendedForFix", thread["triageStatus"] == "recommended_fix")),
-        }
+        triage = normalize_and_format_quasar_followup(
+            {
+                "triageStatus": thread["triageStatus"],
+                "triageCategory": thread.get("triageCategory") or thread["triageStatus"],
+                "triageBadge": thread["triageBadge"],
+                "triageLabel": thread.get("triageLabel") or thread["triageBadge"],
+                "triageSummary": thread["triageSummary"],
+                "whatIsDone": thread.get("whatIsDone") or "",
+                "whatIsNotDone": thread.get("whatIsNotDone") or "",
+                "whatShouldBeDone": thread.get("whatShouldBeDone") or "",
+                "recommendedForFix": bool(
+                    thread.get(
+                        "recommendedForFix",
+                        thread["triageStatus"] in ("recommended_fix", "partially_addressed"),
+                    )
+                ),
+            },
+            author=author,
+            rel_path=rel_path_for_check,
+            line=line_num,
+            code_state=code_state,
+        )
     else:
         triage = assess_existing_github_comment(
             author=author,
             body=raw_body,
             replies=replies,
             pr_author=pr_author,
-            rel_path=thread.get("path") or "",
-            line=int(thread.get("startLine") or 1),
+            rel_path=rel_path_for_check,
+            line=line_num,
+            head_root=head_root,
+            base_root=base_root,
+            repo_dir=repo_dir,
+            code_state=code_state,
         )
 
-    import re
-
-    cat = triage.get("triageCategory") or ""
-    status = triage.get("triageStatus") or "needs_attention"
-    if status == "recommended_fix":
-        left_tag = "🛠️ [Suggestion]" if cat == "suggestion" else "🛠️ [Should Fix]"
-    elif status == "addressed_or_refuted":
-        left_tag = (
-            "⚠️ [Disputed]"
-            if cat == "refuted"
-            else ("✅ [Addressed]" if cat == "addressed" else "💬 [Replied]")
-        )
-    else:
-        left_tag = "❓ [Question]" if "question" in cat else "👀 [Needs Look]"
-
-    thread.update(triage)
+    left_tag = triage["triageLeftTag"]
+    thread.update(
+        {
+            "triageStatus": triage["triageStatus"],
+            "triageCategory": triage["triageCategory"],
+            "triageBadge": triage["triageBadge"],
+            "triageLabel": triage["triageLabel"],
+            "triageSummary": triage["triageSummary"],
+            "whatIsDone": triage["whatIsDone"],
+            "whatIsNotDone": triage["whatIsNotDone"],
+            "whatShouldBeDone": triage["whatShouldBeDone"],
+            "recommendedForFix": triage["recommendedForFix"],
+        }
+    )
     if is_owned:
         raw_sol = (
             (override.get("solutionOptions") or override.get("fixOptions"))
@@ -156,16 +198,28 @@ def _apply_triage_to_existing_thread(
         non_empty = [ln for ln in clean_lines if ln]
         if non_empty:
             thread["title"] = f"{left_tag} {non_empty[0][:72]}"
-    thread["whyItMatters"] = f"{triage['triageLabel']} — {triage['triageSummary']}"
-    msgs.append(
-        {
-            "author": f"Quasar Triage ({triage['triageBadge']})",
-            "body": f"**{triage['triageLabel']}**\n\n{triage['triageSummary']}",
-            "timestamp": now_iso,
-            "isTriageNote": True,
-        }
+    thread["whyItMatters"] = (
+        f"{triage['triageLabel']} — "
+        f"✅ Done: {triage['whatIsDone']} | "
+        f"⚠️ Not Done: {triage['whatIsNotDone']} | "
+        f"👉 Should Do: {triage['whatShouldBeDone']}"
     )
-    thread["messages"] = msgs
+    # Keep GitHub messages first, followed by Quasar's structured follow-up, then any later user Q&A
+    gh_msgs: List[Dict[str, Any]] = []
+    qa_msgs: List[Dict[str, Any]] = []
+    for idx_m, m in enumerate(msgs):
+        m_auth = str(m.get("author") or "")
+        if idx_m == 0 or "(GitHub" in m_auth:
+            gh_msgs.append(m)
+        else:
+            qa_msgs.append(m)
+    followup_msg = {
+        "author": triage["followupAuthor"],
+        "body": triage["followupBody"],
+        "timestamp": now_iso,
+        "isTriageNote": True,
+    }
+    thread["messages"] = gh_msgs + [followup_msg] + qa_msgs
     return thread
 
 
@@ -327,6 +381,9 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
                     pr_author,
                     session["updatedAt"],
                     is_owned=is_owned,
+                    head_root=head_root,
+                    base_root=base_root,
+                    repo_dir=repo_dir,
                 )
             )
         else:

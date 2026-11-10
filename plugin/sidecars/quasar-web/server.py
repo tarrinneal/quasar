@@ -70,29 +70,50 @@ def discover_ls_env(workspace_dir: Optional[str] = None) -> Dict[str, str]:
     try:
         ps_out = subprocess.check_output(["/bin/ps", "-axww", "-o", "pid=,command="], text=True, timeout=3)
         norm_ws = re.sub(r"[^a-zA-Z0-9]", "_", workspace_dir or "")
-        procs: List[Tuple[int, int, str]] = []
+        procs: List[Tuple[int, int, str, Optional[int]]] = []
+        my_pid = os.getpid()
         for raw in ps_out.splitlines():
             line = raw.strip()
-            if "language_server" not in line or "--csrf_token" not in line:
+            if not line:
                 continue
             m_pid = re.match(r"^(\d+)\s+(.*)$", line)
             if not m_pid:
                 continue
             pid = int(m_pid.group(1))
+            if pid == my_pid:
+                continue
             cmd = m_pid.group(2)
-            m_csrf = re.search(r"--csrf_token\s+(\S+)", cmd)
+            is_ls = "language_server" in cmd
+            is_agy = "/bin/agy" in cmd or " agy " in cmd or cmd.startswith("agy ")
+            if not is_ls and not is_agy:
+                continue
+            if "--csrf_token" not in cmd:
+                continue
+            m_csrf = re.search(r"--csrf_token[=\s]+(\S+)", cmd)
             if not m_csrf:
                 continue
             csrf = m_csrf.group(1)
             is_lsp = "--enable_lsp" in cmd
-            m_ws = re.search(r"--workspace_id\s+(\S+)", cmd)
+            m_ws = re.search(r"--(?:workspace_id|add-dir)[=\s]+(\S+)", cmd)
             ws_id = m_ws.group(1) if m_ws else ""
-            matches_ws = bool(norm_ws and ws_id and norm_ws in ws_id)
-            score = (10 if is_lsp else 0) + (0 if matches_ws else 5)
-            procs.append((score, pid, csrf))
+            matches_ws = bool(
+                workspace_dir
+                and (
+                    (norm_ws and norm_ws in ws_id)
+                    or (ws_id and (workspace_dir in ws_id or ws_id in workspace_dir))
+                )
+            )
+            m_hub = re.search(r"--hub-port[=\s]+(\d+)", cmd)
+            hub_port = int(m_hub.group(1)) if m_hub else None
+            score = (0 if matches_ws else 20) + (10 if is_lsp else 0)
+            procs.append((score, pid, csrf, hub_port))
         procs.sort(key=lambda x: x[0])
         lsof_bin = "/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else "lsof"
-        for _, pid, csrf in procs:
+        for _, pid, csrf, hub_port in procs:
+            if hub_port:
+                env["ANTIGRAVITY_LS_ADDRESS"] = f"localhost:{hub_port}"
+                env["ANTIGRAVITY_CSRF_TOKEN"] = csrf
+                return env
             try:
                 lsof_out = subprocess.check_output(
                     [lsof_bin, "-Pan", "-p", str(pid), "-a", "-iTCP", "-sTCP:LISTEN"],
@@ -1455,24 +1476,38 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
 
     function renderThreadCardHtml(t) {
       const sev = String(t.severity || '').toLowerCase();
+      const isExistingGh = t.kind === 'github_existing';
       const isStaged = Boolean(t.stagedForGithub || t.status === 'staged');
+      const ghColorCls = t.triageStatus === 'addressed_or_refuted'
+        ? 'text-emerald-300 border-emerald-500/40'
+        : t.triageStatus === 'partially_addressed'
+        ? 'text-amber-300 border-amber-500/40'
+        : t.triageStatus === 'recommended_fix'
+        ? 'text-orange-300 border-orange-500/40'
+        : 'text-purple-300 border-purple-500/40';
       const sevBadge = t.status === 'uncertain'
         ? '<span class="q-badge text-amber-300 border-amber-500/40">🤔 Uncertain — Calibrate</span>'
+        : isExistingGh
+        ? `<span class="q-badge ${ghColorCls}">${esc(t.triageBadge || '👀 GitHub Comment')}</span>`
         : sev === 'blocking'
         ? '<span class="q-badge text-red-300 border-red-500/40">🔴 Blocking</span>'
         : sev === 'design'
         ? '<span class="q-badge text-yellow-300 border-yellow-500/40">🟡 Design</span>'
-        : t.kind === 'github_existing'
-        ? `<span class="q-badge text-purple-300 border-purple-500/40">${esc(t.triageBadge || '👀 GitHub Comment')}</span>`
         : '<span class="q-badge text-green-300 border-green-500/40">🟢 Nit</span>';
 
       const statusBadge = t.status === 'fixed'
         ? '<span class="q-badge text-emerald-300 border-emerald-500/50">✅ Fixed</span>'
+        : isExistingGh
+        ? `<span class="q-badge text-[var(--q-muted)]">💬 GitHub${t.author ? ' (@' + esc(String(t.author).replace(/^@/, '')) + ')' : ''}</span>`
         : isStaged
         ? '<span class="q-badge text-blue-300 border-blue-500/50">☁️ Staged for GitHub</span>'
         : '<span class="q-badge text-[var(--q-muted)]">Draft</span>';
 
-      const replies = (t.messages || []).slice(1);
+      const showFixBtn = t.status !== 'fixed' && (!isExistingGh || t.selectedForFix || t.triageStatus !== 'addressed_or_refuted');
+      const whatDone = t.whatIsDone || (t.triageStatus === 'addressed_or_refuted' ? (t.triageSummary || 'Already addressed in code or thread.') : 'Checked against current HEAD code.');
+      const whatNotDone = t.whatIsNotDone || (t.triageStatus === 'addressed_or_refuted' ? 'None — comment has been addressed.' : (t.triageSummary || 'See comment details.'));
+      const whatShould = t.whatShouldBeDone || (t.triageStatus === 'addressed_or_refuted' ? 'No code changes needed.' : 'Inspect and update or reply.');
+      const replies = (t.messages || []).slice(1).filter((m) => !(isExistingGh && m && m.isTriageNote));
       return `
         <div class="p-3.5 rounded-lg border border-[var(--q-border)] bg-black/25 space-y-2">
           <div class="flex flex-wrap items-center justify-between gap-2">
@@ -1481,25 +1516,34 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
               ${statusBadge}
               <span class="text-xs font-bold">${esc(t.title || 'Comment')}</span>
               <button class="text-[11px] text-blue-400 hover:underline font-mono" onclick="openFileInDiff('${esc(t.path)}', ${t.startLine || 1})">
-                ${esc(t.path)}:${t.startLine || 1}
+                ${esc(t.targetFile || t.path)}:${t.startLine || 1}
               </button>
             </div>
             <div class="flex items-center gap-1.5 flex-wrap">
+              ${showFixBtn ? `
               <button class="q-btn ${t.selectedForFix ? 'q-btn-primary' : ''}" onclick="threadAction('${esc(t.id)}', 'toggleFix')">
                 ${t.selectedForFix ? '☑️ Queued for Fix' : '🔧 Queue for Fix'}
-              </button>
-              <button class="q-btn" onclick="openReviseCommentModal('${esc(t.id)}')">💬 Change Comment...</button>
+              </button>` : ''}
+              <button class="q-btn" onclick="openReviseCommentModal('${esc(t.id)}')">💬 Ask / Follow Up...</button>
+              ${!isExistingGh ? `
               <button class="q-btn" onclick="openEditDraftModal('${esc(t.id)}')">✏️ Edit</button>
               <button class="q-btn" onclick="threadAction('${esc(t.id)}', 'toggleStage')">
                 ${isStaged ? 'Unstage' : '☁️ Stage'}
-              </button>
+              </button>` : ''}
               <button class="q-btn" onclick="threadAction('${esc(t.id)}', 'rate', { rating: 'up' })" title="Helpful — flag more like this">👍</button>
               <button class="q-btn" onclick="threadAction('${esc(t.id)}', 'dismiss')" title="Dismiss comment">✕</button>
             </div>
           </div>
-          ${t.whyItMatters ? `<div class="text-xs text-[var(--q-muted)]"><b>Why it matters:</b> ${esc(t.whyItMatters)}</div>` : ''}
+          ${(!isExistingGh && t.whyItMatters) ? `<div class="text-xs text-[var(--q-muted)]"><b>Why it matters:</b> ${esc(t.whyItMatters)}</div>` : ''}
           <div class="text-xs whitespace-pre-wrap leading-relaxed">${esc(t.draftComment || '')}</div>
           ${t.suggestion ? `<pre class="text-[11px] bg-black/40 border border-[var(--q-border)] rounded p-2.5 overflow-x-auto"><code>${esc(t.suggestion)}</code></pre>` : ''}
+          ${(isExistingGh && t.status !== 'fixed') ? `
+            <div class="p-2.5 rounded border ${t.triageStatus === 'addressed_or_refuted' ? 'border-emerald-500/35 bg-emerald-500/10' : t.triageStatus === 'partially_addressed' ? 'border-amber-500/35 bg-amber-500/10' : 'border-blue-500/35 bg-blue-500/10'} text-xs space-y-1">
+              <div class="font-semibold">🤖 Quasar Follow-Up — ${esc(t.triageLabel || t.triageBadge || 'Code Assessment')}</div>
+              <div><b>✅ What's Done:</b> ${esc(whatDone)}</div>
+              <div><b>⚠️ What Isn't Done:</b> ${esc(whatNotDone)}</div>
+              <div><b>👉 What Should Be Done:</b> ${esc(whatShould)}</div>
+            </div>` : ''}
           ${((!STATE.activeSession?.pr || STATE.activeSession.pr.isOwnedByUser !== false) && t.status !== 'fixed' && ((Array.isArray(t.solutionOptions) && t.solutionOptions.length >= 2) || t.selectedSolution)) ? `
             <div class="space-y-1.5 pt-2 border-t border-cyan-500/30 text-xs">
               <div class="flex items-center justify-between gap-2">

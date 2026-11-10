@@ -449,32 +449,49 @@ function discoverAntigravityLsEnv(targetWorkspaceRoot = null) {
 
     for (const rawLine of psOut.split('\n')) {
       const line = rawLine.trim();
-      if (!line || !line.includes('language_server') || !line.includes('--csrf_token')) {
-        continue;
-      }
+      if (!line) continue;
       const pidMatch = line.match(/^(\d+)\s+(.*)$/);
       if (!pidMatch) continue;
       const pid = Number(pidMatch[1]);
+      if (pid === process.pid) continue;
       const cmd = pidMatch[2];
-      const csrfMatch = cmd.match(/--csrf_token\s+([^\s]+)/);
+
+      const isLs = cmd.includes('language_server');
+      const isAgy = cmd.includes('/bin/agy') || cmd.includes(' agy ') || cmd.startsWith('agy ');
+      if (!isLs && !isAgy) continue;
+      if (!cmd.includes('--csrf_token')) continue;
+
+      const csrfMatch = cmd.match(/--csrf_token[=\s]+([^\s]+)/);
       if (!csrfMatch) continue;
       const csrfToken = csrfMatch[1];
       const isLspOnly = cmd.includes('--enable_lsp');
-      const wsMatch = cmd.match(/--workspace_id\s+([^\s]+)/);
+      const wsMatch = cmd.match(/--(?:workspace_id|add-dir)[=\s]+([^\s]+)/);
       const workspaceId = wsMatch ? wsMatch[1] : '';
-      const matchesTargetWs = Boolean(normWs && workspaceId && workspaceId.includes(normWs));
-      procs.push({ pid, csrfToken, isLspOnly, workspaceId, matchesTargetWs });
+      const matchesTargetWs = Boolean(
+        targetWorkspaceRoot &&
+        ((normWs && workspaceId.includes(normWs)) ||
+          (workspaceId && (targetWorkspaceRoot.includes(workspaceId) || workspaceId.includes(targetWorkspaceRoot))))
+      );
+      const hubPortMatch = cmd.match(/--hub-port[=\s]+(\d+)/);
+      const hubPort = hubPortMatch ? Number(hubPortMatch[1]) : null;
+      procs.push({ pid, csrfToken, isLspOnly, workspaceId, matchesTargetWs, hubPort });
     }
 
-    // Prioritize the main agent server (no --enable_lsp), then workspace-matching server
+    // Prioritize workspace-matching server, then main agent server (no --enable_lsp)
     procs.sort((a, b) => {
-      const scoreA = (!a.isLspOnly ? 0 : 10) + (a.matchesTargetWs ? 0 : 5);
-      const scoreB = (!b.isLspOnly ? 0 : 10) + (b.matchesTargetWs ? 0 : 5);
+      const scoreA = (a.matchesTargetWs ? 0 : 20) + (!a.isLspOnly ? 0 : 5);
+      const scoreB = (b.matchesTargetWs ? 0 : 20) + (!b.isLspOnly ? 0 : 5);
       return scoreA - scoreB;
     });
 
     const lsofBin = fs.existsSync('/usr/sbin/lsof') ? '/usr/sbin/lsof' : 'lsof';
     for (const proc of procs) {
+      if (proc.hubPort) {
+        return {
+          ANTIGRAVITY_LS_ADDRESS: `localhost:${proc.hubPort}`,
+          ANTIGRAVITY_CSRF_TOKEN: proc.csrfToken,
+        };
+      }
       try {
         const lsofOut = execFileSync(
           lsofBin,
@@ -1917,20 +1934,130 @@ class CliffsNotesTreeProvider {
  * - `needs_attention`: Requires looking at — a question that needs answering or a design discussion (`❓ Question` / `👀 Needs Look`)
  * - `addressed_or_refuted`: Author already replied or refuted the premise (`⚠️ Disputed` / `💬 Replied`)
  */
+function finalizeExistingCommentTriage(rawTriage, t) {
+  const status = rawTriage.triageStatus || 'needs_attention';
+  const cat = rawTriage.triageCategory || status;
+  const badge = rawTriage.triageBadge || '👀 Needs Attention';
+  const label = rawTriage.triageLabel || badge;
+  const summary = (rawTriage.triageSummary || (t && t.whyItMatters) || '').trim();
+  const recommendedForFix =
+    typeof rawTriage.recommendedForFix === 'boolean'
+      ? rawTriage.recommendedForFix
+      : status === 'recommended_fix' || status === 'partially_addressed';
+
+  const loc =
+    t && (t.targetFile || t.path)
+      ? `${path.basename(t.targetFile || t.path)}:L${t.startLine || 1}`
+      : `line ${(t && t.startLine) || 1}`;
+
+  let whatIsDone = String((t && t.whatIsDone) || rawTriage.whatIsDone || '').trim();
+  let whatIsNotDone = String((t && t.whatIsNotDone) || rawTriage.whatIsNotDone || '').trim();
+  let whatShouldBeDone = String(
+    (t && t.whatShouldBeDone) || rawTriage.whatShouldBeDone || ''
+  ).trim();
+
+  if (status === 'addressed_or_refuted') {
+    if (!whatIsDone) {
+      whatIsDone =
+        summary ||
+        (cat === 'refuted'
+          ? `Author explained why the premise does not apply on \`${loc}\`.`
+          : `Already addressed in current code / thread on \`${loc}\`.`);
+    }
+    if (!whatIsNotDone) {
+      whatIsNotDone =
+        cat === 'refuted'
+          ? 'None — premise disputed / intentional behavior.'
+          : 'None — comment has been addressed.';
+    }
+    if (!whatShouldBeDone) {
+      whatShouldBeDone = 'No code changes needed.';
+    }
+  } else if (status === 'partially_addressed') {
+    if (!whatIsDone) {
+      whatIsDone = `Code around \`${loc}\` was updated toward this comment.`;
+    }
+    if (!whatIsNotDone) {
+      whatIsNotDone =
+        summary || 'An edge case or secondary part of the comment remains open.';
+    }
+    if (!whatShouldBeDone) {
+      whatShouldBeDone =
+        'Refine the implementation to cover the remaining case (or reply if intentional).';
+    }
+  } else if (status === 'recommended_fix') {
+    if (!whatIsDone) {
+      whatIsDone = `No code changes applied at \`${loc}\` for this comment yet.`;
+    }
+    if (!whatIsNotDone) {
+      whatIsNotDone = summary || `Suggested fix on \`${loc}\` has not been applied yet.`;
+    }
+    if (!whatShouldBeDone) {
+      whatShouldBeDone =
+        cat === 'suggestion'
+          ? 'Apply the suggested code block.'
+          : 'Update the code to address this comment.';
+    }
+  } else {
+    if (!whatIsDone) {
+      whatIsDone = `No code change or author reply recorded on \`${loc}\` yet.`;
+    }
+    if (!whatIsNotDone) {
+      whatIsNotDone = summary || `Question / design point on \`${loc}\` is still open.`;
+    }
+    if (!whatShouldBeDone) {
+      whatShouldBeDone =
+        'Inspect the code context and either reply in the PR thread or update the implementation.';
+    }
+  }
+
+  const bodyLines = [`**🤖 Quasar Follow-Up — ${label}**`, ''];
+  if (
+    summary &&
+    summary !== whatIsDone &&
+    summary !== whatIsNotDone &&
+    summary !== whatShouldBeDone
+  ) {
+    bodyLines.push(summary, '');
+  }
+  bodyLines.push(
+    `- **✅ What's Done:** ${whatIsDone}`,
+    `- **⚠️ What Isn't Done:** ${whatIsNotDone}`,
+    `- **👉 What Should Be Done:** ${whatShouldBeDone}`
+  );
+
+  return {
+    triageStatus: status,
+    triageCategory: cat,
+    triageBadge: badge,
+    triageLabel: label,
+    triageSummary: summary || whatIsNotDone,
+    whatIsDone,
+    whatIsNotDone,
+    whatShouldBeDone,
+    recommendedForFix,
+    followupAuthor: `Quasar Follow-Up (${badge})`,
+    followupBody: bodyLines.join('\n'),
+  };
+}
+
 function inferExistingCommentTriage(t, session) {
   if (!t || t.kind !== 'github_existing') return null;
   if (t.triageStatus && t.triageBadge && t.triageLabel) {
-    return {
-      triageStatus: t.triageStatus,
-      triageCategory: t.triageCategory || t.triageStatus,
-      triageBadge: t.triageBadge,
-      triageLabel: t.triageLabel,
-      triageSummary: t.triageSummary || t.whyItMatters || '',
-      recommendedForFix:
-        typeof t.recommendedForFix === 'boolean'
-          ? t.recommendedForFix
-          : t.triageStatus === 'recommended_fix',
-    };
+    return finalizeExistingCommentTriage(
+      {
+        triageStatus: t.triageStatus,
+        triageCategory: t.triageCategory || t.triageStatus,
+        triageBadge: t.triageBadge,
+        triageLabel: t.triageLabel,
+        triageSummary: t.triageSummary || '',
+        whatIsDone: t.whatIsDone,
+        whatIsNotDone: t.whatIsNotDone,
+        whatShouldBeDone: t.whatShouldBeDone,
+        recommendedForFix: t.recommendedForFix,
+      },
+      t
+    );
   }
 
   const prAuthor = (((session && session.pr && session.pr.author) || '') + '').trim().toLowerCase();
@@ -1950,34 +2077,43 @@ function inferExistingCommentTriage(t, session) {
         (kw) => replyLower.includes(kw)
       )
     ) {
-      return {
-        triageStatus: 'addressed_or_refuted',
-        triageCategory: 'refuted',
-        triageBadge: '⚠️ Disputed / No Fix',
-        triageLabel: '⚠️ Premise Disputed by Author — Do Not Apply',
-        triageSummary: `PR author replied explaining why this comment's premise does not apply.`,
-        recommendedForFix: false,
-      };
+      return finalizeExistingCommentTriage(
+        {
+          triageStatus: 'addressed_or_refuted',
+          triageCategory: 'refuted',
+          triageBadge: '⚠️ Disputed / No Fix',
+          triageLabel: '⚠️ Premise Disputed by Author — Do Not Apply',
+          triageSummary: `PR author replied explaining why this comment's premise does not apply.`,
+          recommendedForFix: false,
+        },
+        t
+      );
     }
-    return {
-      triageStatus: 'addressed_or_refuted',
-      triageCategory: 'replied',
-      triageBadge: '💬 Author Replied',
-      triageLabel: '💬 Author Replied in Thread',
-      triageSummary: 'PR author has already replied to this comment thread.',
-      recommendedForFix: false,
-    };
+    return finalizeExistingCommentTriage(
+      {
+        triageStatus: 'addressed_or_refuted',
+        triageCategory: 'replied',
+        triageBadge: '💬 Author Replied',
+        triageLabel: '💬 Author Replied in Thread',
+        triageSummary: 'PR author has already replied to this comment thread.',
+        recommendedForFix: false,
+      },
+      t
+    );
   }
 
   if (lower.includes('```suggestion')) {
-    return {
-      triageStatus: 'recommended_fix',
-      triageCategory: 'suggestion',
-      triageBadge: '🛠️ Good Fix (Suggestion)',
-      triageLabel: '🛠️ Good Comment — Suggested Fix Should Be Made',
-      triageSummary: 'Contains a concrete code suggestion block ready to apply.',
-      recommendedForFix: true,
-    };
+    return finalizeExistingCommentTriage(
+      {
+        triageStatus: 'recommended_fix',
+        triageCategory: 'suggestion',
+        triageBadge: '🛠️ Not Applied (Suggestion)',
+        triageLabel: '🛠️ Not Yet Applied — Concrete Code Suggestion Available',
+        triageSummary: 'Contains a concrete code suggestion block ready to apply.',
+        recommendedForFix: true,
+      },
+      t
+    );
   }
 
   const bugKeywords = [
@@ -1996,14 +2132,17 @@ function inferExistingCommentTriage(t, session) {
     'completionhandler',
   ];
   if (bugKeywords.some((kw) => lower.includes(kw))) {
-    return {
-      triageStatus: 'recommended_fix',
-      triageCategory: 'bug_or_edge_case',
-      triageBadge: '🛠️ Good Catch — Should Fix',
-      triageLabel: '🛠️ Good Comment — Suggested Fix Should Be Made',
-      triageSummary: 'Identifies a valid bug, edge case, or compiler warning; Quasar recommends making this fix.',
-      recommendedForFix: true,
-    };
+    return finalizeExistingCommentTriage(
+      {
+        triageStatus: 'recommended_fix',
+        triageCategory: 'bug_or_edge_case',
+        triageBadge: '🛠️ Not Addressed — Should Fix',
+        triageLabel: '🛠️ Not Yet Addressed — Suggested Fix Should Be Made',
+        triageSummary: 'Identifies a valid bug, edge case, or compiler warning; Quasar recommends making this fix.',
+        recommendedForFix: true,
+      },
+      t
+    );
   }
 
   const isDesignDiscussion = [
@@ -2030,39 +2169,48 @@ function inferExistingCommentTriage(t, session) {
     lower.startsWith('nit ');
 
   if (isDesignDiscussion) {
-    return {
-      triageStatus: 'needs_attention',
-      triageCategory: hasQuestion ? 'question' : 'discussion',
-      triageBadge: hasQuestion ? '❓ Question — Needs Answer' : '👀 Needs Look (Design)',
-      triageLabel: hasQuestion
-        ? '❓ Question — Requires Your Answer or Decision'
-        : '👀 Needs Attention — Design Discussion',
-      triageSummary: hasQuestion
-        ? 'Asks an architectural/design question that needs an answer or decision.'
-        : 'Raises a design/structure discussion that requires looking at.',
-      recommendedForFix: false,
-    };
+    return finalizeExistingCommentTriage(
+      {
+        triageStatus: 'needs_attention',
+        triageCategory: hasQuestion ? 'question' : 'discussion',
+        triageBadge: hasQuestion ? '❓ Question — Needs Answer' : '👀 Needs Look (Design)',
+        triageLabel: hasQuestion
+          ? '❓ Question — Requires Your Answer or Decision'
+          : '👀 Needs Attention — Design Discussion',
+        triageSummary: hasQuestion
+          ? 'Asks an architectural/design question that needs an answer or decision.'
+          : 'Raises a design/structure discussion that requires looking at.',
+        recommendedForFix: false,
+      },
+      t
+    );
   }
 
   if (hasQuestion && !isPoliteNitOrDoc) {
     if (lower.includes('is this ') && lower.includes('necessary')) {
-      return {
-        triageStatus: 'recommended_fix',
-        triageCategory: 'cleanup_question',
-        triageBadge: '🛠️ Good Catch / ❓ Question',
-        triageLabel: '🛠️ Good Comment — Suggested Simplification (or Reply)',
-        triageSummary: 'Asks whether this code is redundant; can be simplified directly as suggested.',
-        recommendedForFix: true,
-      };
+      return finalizeExistingCommentTriage(
+        {
+          triageStatus: 'recommended_fix',
+          triageCategory: 'cleanup_question',
+          triageBadge: '🛠️ Good Catch / ❓ Question',
+          triageLabel: '🛠️ Not Yet Addressed — Suggested Simplification (or Reply)',
+          triageSummary: 'Asks whether this code is redundant; can be simplified directly as suggested.',
+          recommendedForFix: true,
+        },
+        t
+      );
     }
-    return {
-      triageStatus: 'needs_attention',
-      triageCategory: 'question',
-      triageBadge: '❓ Question — Needs Answer',
-      triageLabel: '❓ Question — Requires Your Attention / Answer',
-      triageSummary: 'Asks a question on this line that requires looking at and answering.',
-      recommendedForFix: false,
-    };
+    return finalizeExistingCommentTriage(
+      {
+        triageStatus: 'needs_attention',
+        triageCategory: 'question',
+        triageBadge: '❓ Question — Needs Answer',
+        triageLabel: '❓ Question — Requires Your Attention / Answer',
+        triageSummary: 'Asks a question on this line that requires looking at and answering.',
+        recommendedForFix: false,
+      },
+      t
+    );
   }
 
   if (
@@ -2071,24 +2219,30 @@ function inferExistingCommentTriage(t, session) {
       lower.includes(kw)
     )
   ) {
-    return {
-      triageStatus: 'recommended_fix',
-      triageCategory: 'actionable_improvement',
-      triageBadge: '🛠️ Good Comment — Should Fix',
-      triageLabel: '🛠️ Good Comment — Suggested Fix Should Be Made',
-      triageSummary: 'Clear, actionable improvement suggested by reviewer; Quasar recommends making this fix.',
-      recommendedForFix: true,
-    };
+    return finalizeExistingCommentTriage(
+      {
+        triageStatus: 'recommended_fix',
+        triageCategory: 'actionable_improvement',
+        triageBadge: '🛠️ Not Addressed — Should Fix',
+        triageLabel: '🛠️ Not Yet Addressed — Suggested Fix Should Be Made',
+        triageSummary: 'Clear, actionable improvement suggested by reviewer; Quasar recommends making this fix.',
+        recommendedForFix: true,
+      },
+      t
+    );
   }
 
-  return {
-    triageStatus: 'needs_attention',
-    triageCategory: 'review_comment',
-    triageBadge: '👀 Needs Attention',
-    triageLabel: '👀 Needs Attention — Review Comment',
-    triageSummary: 'Existing GitHub review comment that requires looking at.',
-    recommendedForFix: false,
-  };
+  return finalizeExistingCommentTriage(
+    {
+      triageStatus: 'needs_attention',
+      triageCategory: 'review_comment',
+      triageBadge: '👀 Needs Attention',
+      triageLabel: '👀 Needs Attention — Review Comment',
+      triageSummary: 'Existing GitHub review comment that requires looking at.',
+      recommendedForFix: false,
+    },
+    t
+  );
 }
 
 // ============================================================================
@@ -2173,29 +2327,33 @@ class CommentsTreeProvider {
       );
       const statusPriority = {
         recommended_fix: 0,
-        needs_attention: 1,
-        addressed_or_refuted: 2,
+        partially_addressed: 1,
+        needs_attention: 2,
+        addressed_or_refuted: 3,
       };
       const existingGh = [...existingGhRaw].sort((a, b) => {
         const ta = inferExistingCommentTriage(a, session);
         const tb = inferExistingCommentTriage(b, session);
-        const pa = statusPriority[(ta && ta.triageStatus) || 'needs_attention'] ?? 1;
-        const pb = statusPriority[(tb && tb.triageStatus) || 'needs_attention'] ?? 1;
+        const pa = statusPriority[(ta && ta.triageStatus) || 'needs_attention'] ?? 2;
+        const pb = statusPriority[(tb && tb.triageStatus) || 'needs_attention'] ?? 2;
         return pa - pb;
       });
       let ghShouldFixCount = 0;
+      let ghPartialCount = 0;
       let ghNeedsLookCount = 0;
       let ghRepliedCount = 0;
       for (const t of existingGh) {
         const tr = inferExistingCommentTriage(t, session);
         if (tr && tr.triageStatus === 'recommended_fix') ghShouldFixCount++;
+        else if (tr && tr.triageStatus === 'partially_addressed') ghPartialCount++;
         else if (tr && tr.triageStatus === 'addressed_or_refuted') ghRepliedCount++;
         else ghNeedsLookCount++;
       }
       const existingSummaryParts = [];
       if (ghShouldFixCount > 0) existingSummaryParts.push(`🛠️ ${ghShouldFixCount} Should Fix`);
+      if (ghPartialCount > 0) existingSummaryParts.push(`🟡 ${ghPartialCount} Partial`);
       if (ghNeedsLookCount > 0) existingSummaryParts.push(`❓ ${ghNeedsLookCount} Need Look`);
-      if (ghRepliedCount > 0) existingSummaryParts.push(`💬 ${ghRepliedCount} Replied`);
+      if (ghRepliedCount > 0) existingSummaryParts.push(`✅ ${ghRepliedCount} Addressed`);
 
       const groups = [
         ...(queuedForFix.length > 0
@@ -2306,6 +2464,8 @@ class CommentsTreeProvider {
             ? cat === 'suggestion'
               ? '🛠️ [Suggestion]'
               : '🛠️ [Should Fix]'
+            : ghTriage.triageStatus === 'partially_addressed'
+            ? '🟡 [Partially Addressed]'
             : ghTriage.triageStatus === 'addressed_or_refuted'
             ? cat === 'refuted'
               ? '⚠️ [Disputed]'
@@ -2412,7 +2572,10 @@ class CommentsTreeProvider {
               ? `**✅ Applied Fix**: ${t.fixedSummary}\n\n`
               : '') +
             (isExistingGh && ghTriage
-              ? `**Quasar Assessment**: **${ghTriage.triageLabel}**\n\n> ${ghTriage.triageSummary}\n\n`
+              ? `**🤖 Quasar Follow-Up (${ghTriage.triageLabel})**:\n` +
+                `- **✅ What's Done:** ${ghTriage.whatIsDone}\n` +
+                `- **⚠️ What Isn't Done:** ${ghTriage.whatIsNotDone}\n` +
+                `- **👉 What Should Be Done:** ${ghTriage.whatShouldBeDone}\n\n`
               : '') +
             (isUncertain && t.uncertaintyQuestion
               ? `**🤔 Preference Question**: *${t.uncertaintyQuestion}*\n\n`
@@ -3126,17 +3289,26 @@ function activate(context) {
       const range = new vscode.Range(startLine, 0, endLine, 0);
 
       const ghTriage = t.kind === 'github_existing' ? inferExistingCommentTriage(t, session) : null;
-      const rawMessages = [...(t.messages || [])];
-      if (
-        ghTriage &&
-        t.status !== 'fixed' &&
-        !rawMessages.some((m) => m && m.isTriageNote)
-      ) {
-        rawMessages.push({
-          author: `Quasar Triage (${ghTriage.triageBadge})`,
-          body: `**${ghTriage.triageLabel}**\n\n${ghTriage.triageSummary}`,
-          isTriageNote: true,
-        });
+      const rawMessages = (t.messages || []).map((m) => ({ ...m }));
+      if (ghTriage) {
+        const existingTriageIdx = rawMessages.findIndex((m) => m && m.isTriageNote);
+        if (existingTriageIdx >= 0) {
+          const curBody = String(rawMessages[existingTriageIdx].body || '');
+          if (!curBody.includes("What's Done:")) {
+            rawMessages[existingTriageIdx] = {
+              ...rawMessages[existingTriageIdx],
+              author: ghTriage.followupAuthor,
+              body: ghTriage.followupBody,
+              isTriageNote: true,
+            };
+          }
+        } else {
+          rawMessages.push({
+            author: ghTriage.followupAuthor,
+            body: ghTriage.followupBody,
+            isTriageNote: true,
+          });
+        }
       }
 
       const isFixInProgress = t.status !== 'fixed' && t.fixStatus === 'in_progress';
@@ -3186,6 +3358,10 @@ function activate(context) {
         solutionOptionsMd = optLines.join('\n');
       }
 
+      const isAlreadyAddressedGh =
+        t.kind === 'github_existing' &&
+        ghTriage &&
+        ghTriage.triageStatus === 'addressed_or_refuted';
       const fixActionBarMd =
         t.status === 'fixed'
           ? `\n\n---\n✅ **Fixed in Working Tree**${t.fixedSummary ? ` — ${t.fixedSummary}` : ''}`
@@ -3193,11 +3369,22 @@ function activate(context) {
           ? `\n\n---\n⏳ **🔧 Agent Fix in Progress...**  •  [$(debug-restart) Retry Fix Now](command:quasar.fixSingleComment?${cmdArg})  •  [$(close) Remove from Fix Queue](command:quasar.unqueueForFix?${cmdArg})`
           : isQueuedForFix
           ? `\n\n---\n✅ **🔧 Queued for Agent Fix**  •  [$(close) Remove from Fix Queue](command:quasar.unqueueForFix?${cmdArg})  •  [$(wrench) Fix Now](command:quasar.fixSingleComment?${cmdArg})`
+          : isAlreadyAddressedGh
+          ? `\n\n---\n✅ **No Code Changes Needed**  •  [$(tools) Queue Fix Anyway](command:quasar.queueForFix?${cmdArg})`
           : `\n\n---\n[$(tools) Queue for Agent Fix](command:quasar.queueForFix?${cmdArg})  •  [$(wrench) Fix Now](command:quasar.fixSingleComment?${cmdArg})`;
 
+      const actionTargetIdx =
+        t.kind === 'github_existing'
+          ? Math.max(
+              0,
+              rawMessages.findIndex((m) => m && m.isTriageNote) >= 0
+                ? rawMessages.findIndex((m) => m && m.isTriageNote)
+                : rawMessages.length - 1
+            )
+          : 0;
       const comments = rawMessages.map((m, idx) => {
         const bodyText =
-          (m.body || '') + (idx === 0 ? solutionOptionsMd + fixActionBarMd : '');
+          (m.body || '') + (idx === actionTargetIdx ? solutionOptionsMd + fixActionBarMd : '');
         const md = new vscode.MarkdownString(bodyText, true);
         md.isTrusted = true;
         return {
@@ -3730,7 +3917,11 @@ function activate(context) {
                     : ''
                 }
                 ${
-                  t.status !== 'fixed'
+                  t.status !== 'fixed' &&
+                  (!isExisting ||
+                    Boolean(t.selectedForFix) ||
+                    !ghTriage ||
+                    ghTriage.triageStatus !== 'addressed_or_refuted')
                     ? `<button type="button" class="q-btn q-btn-sm ${
                         t.selectedForFix ? 'q-btn-primary' : ''
                       }" data-act="toggleFixThread" data-thread-id="${escapeHtmlText(t.id)}">${
@@ -3743,6 +3934,30 @@ function activate(context) {
                 )}" title="Remove Comment">🗑️</button>
               </div>
             </div>
+            ${
+              isExisting && ghTriage && t.status !== 'fixed'
+                ? `<div class="q-stop-meta" style="margin-top:8px;padding:8px 10px;border-radius:6px;background:rgba(128,128,128,0.08);border-left:3px solid ${
+                    ghTriage.triageStatus === 'addressed_or_refuted'
+                      ? 'var(--q-success)'
+                      : ghTriage.triageStatus === 'partially_addressed'
+                      ? 'var(--q-warn)'
+                      : 'var(--q-accent)'
+                  };">
+                    <div style="font-weight:600;margin-bottom:4px;">🤖 Quasar Follow-Up — ${escapeHtmlText(
+                      ghTriage.triageLabel
+                    )}</div>
+                    <div style="margin:2px 0;"><strong>✅ What's Done:</strong> ${formatInlineMd(
+                      ghTriage.whatIsDone
+                    )}</div>
+                    <div style="margin:2px 0;"><strong>⚠️ What Isn't Done:</strong> ${formatInlineMd(
+                      ghTriage.whatIsNotDone
+                    )}</div>
+                    <div style="margin:2px 0;"><strong>👉 What Should Be Done:</strong> ${formatInlineMd(
+                      ghTriage.whatShouldBeDone
+                    )}</div>
+                  </div>`
+                : ''
+            }
             ${
               t.status === 'uncertain' && t.uncertaintyQuestion
                 ? `<div class="q-stop-meta" style="margin-top:6px;color:var(--q-warn);"><strong>🤔 Flagged Question:</strong> ${formatInlineMd(
@@ -3803,10 +4018,16 @@ function activate(context) {
             ${
               t.whyItMatters || t.draftComment
                 ? `<details class="q-stop-details" ${t.status === 'uncertain' ? 'open' : ''}>
-                    <summary>Comment &amp; rationale</summary>
+                    <summary>${
+                      isExisting
+                        ? `Original GitHub comment${
+                            t.author ? ` (@${escapeHtmlText(String(t.author).replace(/^@/, ''))})` : ''
+                          }`
+                        : 'Comment &amp; rationale'
+                    }</summary>
                     <div class="q-stop-details-body">
                       ${
-                        t.whyItMatters
+                        !isExisting && t.whyItMatters
                           ? `<div class="q-stop-meta">${formatInlineMd(t.whyItMatters)}</div>`
                           : ''
                       }

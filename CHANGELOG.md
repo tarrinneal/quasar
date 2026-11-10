@@ -2,7 +2,22 @@
 
 All notable changes to **Quasar** are documented in this file.
 
-## [Unreleased]
+## [1.2.5] - 2026-11-09
+
+### Added
+- **Structured Quasar Follow-Ups & Code-Level Verification on Existing GitHub PR Comments**:
+  - Every pulled GitHub PR comment (`github_existing`) is now followed immediately by a structured **🤖 Quasar Follow-Up** message detailing **✅ What's Done**, **⚠️ What Isn't Done**, and **👉 What Should Be Done** across native VS Code inline comment threads, Study Guide cards, sidebar hover tooltips, CliffsNotes Markdown, and `quasar-web`.
+  - Added a first-class `"partially_addressed"` (`🟡 [Partially Addressed]`) triage status so comments where code was updated in HEAD—but an edge case or cleaner refinement remains—explicitly credit what is already done instead of appearing unfixed.
+  - Added direct HEAD snapshot & diff-hunk code checks (`inspect_comment_code_state` and `enrich_comments_with_code_state` in `collect_pr_context.py`) to verify reverted/untouched files, already-applied ````suggestion``` blocks, and post-comment line edits automatically.
+
+### Fixed
+- **VS Code `agy --hub` Agent Auto-Dispatch Discovery**:
+  - Updated `discoverAntigravityLsEnv` (`extension/extension.js`) and `discover_ls_env` (`plugin/sidecars/quasar-web/server.py`) to discover VS Code's `agy --hub` processes (`--csrf_token=...`, `--hub-port=...`, and `--add-dir=...` per-workspace routing) in addition to standalone `language_server` processes.
+- **Top-Level Review Comment Scoop-Up & Inline Action Bar Placement**:
+  - `build_combined_top_level_comment` and `sync_top_level_comments_file` now exclude `github_existing` and non-`staged` threads so existing GitHub comments on files outside the current diff are never merged into new top-level review drafts.
+  - Inline solution options and fix controls on `github_existing` threads now attach to Quasar's follow-up message rather than the reviewer's original GitHub comment, showing `✅ No Code Changes Needed` on already-addressed comments.
+
+## [1.2.4] - 2026-11-09
 
 ### Added
 - **New general-purpose review lenses**: `review-security`, `review-performance`, `review-concurrency`, `review-compat`, `review-error-handling`, `review-docs`, `review-readability`, `review-dependencies`, `review-accessibility`, and opt-in `review-newcomer`. Each declares default effort levels (`quasarEfforts`) and an applicability gate (`quasarAppliesWhen`) so irrelevant lenses skip diffs they don't apply to.
