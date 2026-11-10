@@ -46,7 +46,7 @@ python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/collect_pr_context
 Inspect `effort_level` (`"low"`, `"medium"`, or `"high"`), `comments_only` (`true` or `false`), `available_review_agents`, and `reviewer_preferences` inside `pr_context.json` (or view `~/.gemini/quasar/PREFERENCES.md` if it exists) so you know:
 - Which **Effort Level** to run (`"low"`, `"medium"`, or `"high"` — if the user explicitly asked for `"low effort"` / `"quick"`, `"medium effort"`, or `"high effort"` / `"deep"` in their prompt, pass `--effort <level>` to `collect_pr_context.py` or honor their requested level).
 - Whether **Comments-Only Mode (`comments_only: true` / `--comments-only`)** is active (either via `--comments-only` flag, `comments_only: true` in `pr_context.json`, or because the user asked for comments only / no study guide).
-- Which **Built-In & Custom Review Subagents (`available_review_agents`)** are installed and applicable to this repository or diff (including any user-added custom `review-*` subagents with `isCustom: true` in `~/.gemini/config/plugins/quasar/agents/`, `~/.gemini/config/agents/`, or `.gemini/agents/`).
+- Which **Review Lenses run at this effort level (`review_lenses`)**. `review_lenses` is the user-configured list of `review-*` subagents enabled for the current `effort_level` (resolved from each lens's `quasarEfforts` frontmatter plus the user's `lensEfforts` overrides in `~/.gemini/quasar/preferences.json`; see `effort_lenses` for all levels and `available_review_agents` for every installed lens/helper). Each entry includes an `appliesWhen` gate describing which diffs it is relevant to.
 - What patterns the reviewer **prefers to flag** (`preferRules`)
 - What patterns the reviewer **wants suppressed/skipped** (`avoidRules`)
 - Their preferred **comment tone, verbosity, and phrasing examples** (`styleProfile` & `recentEditedDrafts`).
@@ -64,29 +64,37 @@ When the user provides a GitHub PR link or number, inspect `pr_metadata` in `pr_
 > When `comments_only` is `true` (or the user requested a comments-only review):
 > - **Do NOT build the CliffsNotes Study Guide** (`cliffsNotes.tldr`, `whatAndWhy`, `architectureDiagram`, `keySymbols`, `designTradeoffs`) and **do NOT generate reading tour `chapters` or `stops`**.
 > - Focus 100% on finding verified, high-signal review comments (`findings`) and triaging `existing_comments` (`existingCommentAssessments`) so the user can immediately publish them to GitHub or queue them for Agent fixes.
-> - In `medium` effort Comments-Only mode, you only need to spawn `review-bug-hunter` (plus any applicable domain/custom `review-*` subagents) with `Model: "flash"`, asking subagents strictly for candidate review findings (skipping reading-tour & architecture-diagram synthesis).
+> - In `medium` effort Comments-Only mode, spawn only the lenses in `review_lenses` (with `Model: "flash"`), asking them strictly for candidate review findings (skipping reading-tour & architecture-diagram synthesis).
+
+### 🧩 Choosing Which Lenses to Spawn (`review_lenses`)
+Users configure which lenses run at each effort level (Quasar sidebar → **Configure Review Lenses per Effort**, or `python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/review_lenses.py --set-effort-lenses <level> --lenses a,b,c`). **Always honor `review_lenses` from `pr_context.json`** instead of a hard-coded list:
+- Spawn **every lens in `review_lenses` whose `appliesWhen` gate matches this diff** (e.g. skip `review-accessibility` for a diff with no UI code, skip `review-dependencies` when no manifest/lockfile changed). Lenses with `appliesWhen: "Always applicable."` always run. When unsure whether a lens applies, spawn it — each lens self-gates and returns quickly when irrelevant.
+- **Never spawn lenses that are not in `review_lenses`** unless the user explicitly asks for them by name in their prompt (e.g. "also run the security lens"); in that case add them for this review only.
+- `review-advocate` is a false-positive filter helper (`role: "filter"`), not a lens — it is never listed in `review_lenses`.
+- If `review_lenses` is empty for the current effort, do not spawn any subagents (single-pass review).
+- Pass each lens the PR title/description, changed `core_source` files, `<SCRATCH_DIR>/pr.diff`, and `reviewer_preferences`, and use `Role` = the lens's description title (e.g. `"Security Auditor"`).
 
 Choose the analysis pipeline below that matches `effort_level` (`"low"`, `"medium"`, or `"high"`):
 
-### ⚡ Option A: `low` Effort (Fast / Quick Scan — Single-Pass, 0 Subagents)
-- **Do NOT spawn any subagents (`invoke_subagent`)**.
+### ⚡ Option A: `low` Effort (Fast / Quick Scan — Single-Pass)
+- By default `review_lenses` is empty at `low` effort: **do NOT spawn any subagents**. (If the user enabled lenses for `low`, spawn only those, with `Model: "flash"`, in one parallel `invoke_subagent` call.)
 - Read `<SCRATCH_DIR>/pr_context.json` and `<SCRATCH_DIR>/pr.diff` directly in a single fast pass (only view individual files if a diff hunk is ambiguous).
 - Build a concise CliffsNotes Study Guide (`tldr`, `architectureDiagram`, logical `chapters` & `stops` — **skip this step if `comments_only` is `true`**), triage any `existing_comments`, and include only **obvious, high-confidence bugs or blockers** (skipping deep cross-file hunting and minor nits).
 - Proceed immediately to **Phase 3** (`publish_review_session.py`).
 
 ### ⚖️ Option B: `medium` Effort (Balanced — Default — Fast `flash` Subagents in 1 Wave)
-- Spawn **subagents in parallel** in a single `invoke_subagent` call with **`Model: "flash"`**:
-  1. **`review-architect`** (`Model: "flash"`, `Role: "Architecture & API Reviewer"`): Pass the PR title/description, changed `core_source` files, `<SCRATCH_DIR>/pr.diff`, and `reviewer_preferences`. *(If `comments_only` is `true`, instruct `review-architect` to only return API/design `findings` and skip building a reading tour or mental model.)*
-  2. **`review-bug-hunter`** (`Model: "flash"`, `Role: "Bug & Edge-Case Hunter"`): Pass the changed `core_source` files, `<SCRATCH_DIR>/pr.diff`, and `reviewer_preferences`.
-  3. **Any Custom Review Subagents (`isCustom: true` in `available_review_agents`)**: Automatically include any user-defined review subagents whose description matches the repository/diff (or all custom `review-*` subagents if general-purpose) with `Model: "flash"`.
+- Spawn the applicable lenses from `review_lenses` **in parallel** in a single `invoke_subagent` call with **`Model: "flash"`** (defaults: `review-architect`, `review-bug-hunter`, `review-security`, plus any custom lenses enabled for `medium`).
+  - If `review-architect` is spawned, pass it the PR title/description too. *(If `comments_only` is `true`, instruct `review-architect` to only return API/design `findings` and skip building a reading tour or mental model.)*
 - **Do NOT spawn a second sequential `review-advocate` wave** in `medium` effort — once the `flash` subagents report back, verify and filter their findings directly in the main agent and proceed immediately to **Phase 3**.
 
 ### 🔬 Option C: `high` Effort (Deep / Thorough — Full Multi-Lens Pipeline)
-- Spawn all **specialist review subagents in parallel** using a single `invoke_subagent` call (`Model: "inherit"`). Pass each subagent the active `reviewer_preferences` summary (or instruct them to read `~/.gemini/quasar/PREFERENCES.md`):
-  1. **`review-architect`** (`Model: "inherit"`, `Role: "Architecture & API Reviewer"`): Build the architectural mental model, identify key symbols ("Character List"), evaluate API boundaries & backwards compatibility, and suggest the logical top-down reading order *(if `comments_only` is `true`, skip the reading tour & mental model and focus strictly on architectural/API findings)*.
-  2. **`review-bug-hunter`** (`Model: "inherit"`, `Role: "Bug & Edge-Case Hunter"`): Trace execution paths, nullability, state mutations, resource lifecycle, and language-boundary/generator edge cases.
-  3. **`review-test-critic`** (`Model: "inherit"`, `Role: "Test & Verification Critic"`): Build a coverage matrix, evaluate test falsifiability, verify generated file sync, and check repo hygiene (`CHANGELOG.md`, `pubspec.yaml`).
-  4. **Any Custom Review Subagents (`isCustom: true` in `available_review_agents`)**: Automatically include any user-defined review subagents whose description matches the repository/diff (or all custom `review-*` subagents if general-purpose) with `Model: "inherit"`.
+- Spawn the applicable lenses from `review_lenses` **in parallel** using a single `invoke_subagent` call (`Model: "inherit"`). Pass each subagent the active `reviewer_preferences` summary (or instruct them to read `~/.gemini/quasar/PREFERENCES.md`). Defaults include:
+  1. **`review-architect`**: Build the architectural mental model, identify key symbols ("Character List"), evaluate API boundaries & backwards compatibility, and suggest the logical top-down reading order *(if `comments_only` is `true`, skip the reading tour & mental model and focus strictly on architectural/API findings)*.
+  2. **`review-bug-hunter`**: Trace execution paths, nullability, state mutations, resource lifecycle, and language-boundary/generator edge cases.
+  3. **`review-test-critic`**: Build a coverage matrix, evaluate test falsifiability, verify generated file sync, and check repo hygiene (changelog, version metadata).
+  4. **Gated specialist lenses** (spawned only when their `appliesWhen` matches): `review-security`, `review-performance`, `review-concurrency`, `review-compat`, `review-error-handling`, `review-docs`, `review-readability`, `review-dependencies`, `review-accessibility`.
+  5. **Custom lenses** (`isCustom: true`) enabled for `high`.
+- When several lenses report the same issue, merge them into a single finding (keep the most specific location and the clearest draft comment).
 
 ### Filtering False Positives, Flagging Uncertain Preferences, & Triaging Existing GitHub Comments
 Verify every candidate finding against the actual codebase callers/callees, `existing_comments`, and `reviewer_preferences` (in `high` effort you may invoke `review-advocate` or verify directly; in `low`/`medium` effort always filter directly):
@@ -96,6 +104,10 @@ Verify every candidate finding against the actual codebase callers/callees, `exi
   - `"triageStatus": "recommended_fix"` (`"triageBadge": "🛠️ Good Catch — Should Fix"`): The comment points out a valid bug, warning, edge case, or clean improvement (`suggestion` block, naming/readability/doc fix) that should be applied.
   - `"triageStatus": "needs_attention"` (`"triageBadge": "❓ Question — Needs Answer"` or `"👀 Needs Look (Design)"`): The comment asks an open question that needs answering or raises an architectural/design trade-off that requires human decision.
   - `"triageStatus": "addressed_or_refuted"` (`"triageBadge": "⚠️ Disputed / No Fix"` or `"💬 Author Replied"`): The comment was already addressed, replied to by the PR author, or relies on a mistaken premise.
+- **Present Selectable Solution Options on User-Owned Reviews (`"solutionOptions"` when `pr_metadata.isOwnedByUser` is `true`)**:
+  - Whenever `pr_metadata.isOwnedByUser` is `true` (a local branch review or a GitHub PR authored by the user), check each candidate/uncertain finding (`findings`) and each triaged existing GitHub comment (`existingCommentAssessments`) to see whether there are **multiple genuinely distinct, valid ways to solve it** (2–4 reasonable implementation approaches, API shapes, or error-handling strategies — do **not** invent artificial options for single-way trivial fixes like typos or obvious 1-line suggestions).
+  - When 2+ distinct valid solutions exist on a user-owned review, include `"solutionOptions"` on that finding or `existingCommentAssessment` so the user can select their preferred approach directly in the Quasar UI instead of hoping the agent guesses how they want it solved:
+    - Each option should have `"id"` (`"opt-1"`, `"opt-2"`, ...), `"label"` (concise action summary), `"description"` (1-sentence trade-off/impact), and `"recommended": true` on the recommended option when one is preferable.
 - **Flag as Uncertain (`"status": "uncertain"`) for Post-Review Inspection in the UI** 1–3 borderline, questionable, or preference-sensitive findings where the technical observation is valid, but whether to post it depends on the reviewer's taste/convention or closer code inspection (e.g., private-helper unit test strictness, API surface trade-offs, defensive guards on internal callers, or borderline nits) and is **not yet covered** by `reviewer_preferences`. **Never interrupt the review with `ask_question` in chat** — instead, flag these findings in `review_synthesis.json` so the user can view the code and comments together in the Quasar UI after the review completes. Each uncertain finding MUST include:
   - `"status": "uncertain"`
   - `"preferenceCategory"`: e.g. `"test_strictness"`, `"api_design"`, `"nit_threshold"`, `"null_defensiveness"`, `"comment_tone"`, `"repo_hygiene"`
@@ -157,7 +169,20 @@ Write `<SCRATCH_DIR>/review_synthesis.json` and publish it using `publish_review
       "endLine": 148,
       "title": "Null-safety crash when kotlinOptions.package is omitted",
       "whyItMatters": "`options.package` is nullable in `KotlinOptions`, and callers do not default it.",
-      "draftComment": "If `KotlinOptions.package` isn't specified by the caller, `options.package!` here will throw at generation time. Should we guard this with `if (options.package != null)`?"
+      "draftComment": "If `KotlinOptions.package` isn't specified by the caller, `options.package!` here will throw at generation time. Should we guard this with `if (options.package != null)`?",
+      "solutionOptions": [
+        {
+          "id": "opt-1",
+          "label": "Omit the `package` declaration when `options.package` is null",
+          "description": "Preserves backwards compatibility for existing callers that do not pass `package`.",
+          "recommended": true
+        },
+        {
+          "id": "opt-2",
+          "label": "Default `KotlinOptions.package` to a fallback namespace in the constructor",
+          "description": "Guarantees every generated Kotlin file has an explicit package header."
+        }
+      ]
     },
     {
       "id": "finding-2",
@@ -223,9 +248,9 @@ python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/publish_review_ses
 > - Direct browser URL: `http://127.0.0.1:49341` (or the exported `quasar_review.html` artifact)
 
 ### Flagging Uncertain Comments for Post-Review Inspection (Do NOT Call `ask_question` During Review)
-- **Never call `ask_question` while conducting or finishing a review.** Always let the review complete and publish to the Quasar UI first so the user can view the code diff and comments in the UI while considering any flagged items.
+- **Never call `ask_question` while conducting or finishing a review.** Always let the review complete and publish to the Quasar UI first so the user can view the code diff and comments in the UI while considering any flagged items (and selecting among `solutionOptions` on user-owned reviews).
 - Any findings with `"status": "uncertain"` are automatically flagged in the Quasar UI under **🤔 Flagged to Review / Calibrate**, inside the Study Guide, and inline on the diff lines with **🤔 Calibrate**, **Stage**, and **🗑️ Dismiss** buttons.
-- In your final response after `publish_review_session.py` completes, briefly list any flagged `"status": "uncertain"` comments (with clickable file/line links and their `uncertaintyQuestion`) and let the user know they can inspect and calibrate them directly in the Quasar UI (or reply in chat).
+- In your final response after `publish_review_session.py` completes, briefly list any flagged `"status": "uncertain"` comments (with clickable file/line links and their `uncertaintyQuestion`) and—when `isOwnedByUser` is `true`—mention any comments that include selectable `solutionOptions` so the user knows they can pick how they want them solved in the Quasar UI (or reply in chat).
 - Whenever the user later tells you their decision on a flagged/uncertain comment in chat, persist their preference and update the live session by running `manage_preferences.py`:
 
 ```bash
@@ -295,6 +320,8 @@ python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/answer_comment_que
   [--updated-title "<OPTIONAL_NEW_TITLE>"] \
   [--updated-why "<OPTIONAL_NEW_RATIONALE>"] \
   [--updated-severity "<BLOCKING|DESIGN|NIT>"] \
+  [--solution-options '<OPTIONAL_JSON_ARRAY_OF_SOLUTION_OPTIONS>'] \
+  [--select-solution "<OPTIONAL_CHOSEN_SOLUTION_ID_OR_TEXT>"] \
   [--start-line <N> --end-line <M>] \
   [--stage | --unstage | --dismiss] \
   [--learned-rule "<OPTIONAL_REUSABLE_PREFERENCE_RULE>" --sentiment <prefer|avoid|custom>]
@@ -316,18 +343,24 @@ The reviewer can provide their GitHub Personal Access Token (API Key) via **`�
     [--summary-body "<OVERALL_REVIEW_SUMMARY>"]
   ```
 
-### 5. When the PR/Branch Owner Selects Comments to Fix (`manage_fixes.py`)
-When reviewing a local branch or user-owned PR, the user can check boxes next to any Quasar findings or existing GitHub PR comments in the **Review Comments & Cart** sidebar (or click **`$(wrench) Fix Selected Comments with Agent...`** / **`$(wrench) Fix This Issue with Quasar Now...`** on an inline thread).
-When you receive a fix request prompt (referencing `~/.gemini/quasar/fix_request.json`):
-1. Read `~/.gemini/quasar/fix_request.json` if needed and apply the requested fixes directly to the **real working-tree files** under `repoDir` (never edit only the snapshot copies, and do **not** create a git commit unless explicitly asked).
-2. Run relevant static analysis or unit tests in `repoDir` to verify the fix.
-3. Run `manage_fixes.py --complete-fix` so Quasar automatically copies your updated working-tree files into `headSnapshotRoot` (updating the native side-by-side `vscode.diff` editor) and marks the fixed threads as `✅ Fixed` in `active_session.json`:
+### 5. When the PR/Branch Owner Selects Comments to Fix (`manage_fixes.py` or Chat Fix Requests)
+When reviewing a local branch or user-owned PR (`isOwnedByUser: true`), the user can pick among `solutionOptions` on any multi-solution comment and check boxes next to any Quasar findings or existing GitHub PR comments in the **Review Comments & Cart** sidebar (or click **`$(wrench) Fix Selected Comments with Agent...`** / **`$(wrench) Fix This Issue with Quasar Now...`** on an inline thread), or ask you directly in chat to address review comments.
+When you receive a fix request on a user-owned review:
+1. **Honor Selected Solutions & Present Options When Multiple Valid Fixes Exist**:
+   - Inspect `fix_request.json` (or `active_session.json`) and the relevant working-tree code.
+   - If the user already chose a `selectedSolution` (or gave explicit instructions choosing the approach), implement that **exact** chosen solution.
+   - If a comment does **not** have a `selectedSolution` chosen yet AND there are **multiple meaningfully different ways to solve it** (either listed in `solutionOptions` or discovered when inspecting the code—e.g., returning a fallback vs. throwing, changing a signature vs. handling internally, or resolving an open design question from a reviewer), **do NOT guess or silently pick one**. Use the `ask_question` tool to present the concrete solution options (marking `(Recommended)` first when appropriate) so the user can select how they want each ambiguous comment solved before you edit the files.
+2. Apply the fixes directly to the **real working-tree files** under `repoDir` (never edit only the snapshot copies, and do **not** create a git commit unless explicitly asked).
+3. Run relevant static analysis or unit tests in `repoDir` to verify the fix.
+4. Run `manage_fixes.py --complete-fix` so Quasar automatically copies your updated working-tree files into `headSnapshotRoot` (updating the native side-by-side `vscode.diff` editor) and marks the fixed threads as `✅ Fixed` in `active_session.json`:
 
 ```bash
 python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/manage_fixes.py \
   --complete-fix \
   --thread-ids "<COMMA_SEPARATED_THREAD_IDS>" \
+  --workspace-dir "<ACTIVE_WORKSPACE_PATH>" \
   --summary "<CONCISE_SUMMARY_OF_WHAT_YOU_FIXED>"
 ```
+
 
 

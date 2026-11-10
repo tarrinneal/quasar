@@ -5,7 +5,7 @@ A **comprehension-first, 100% native** GitHub PR & local branch code review tool
 Point **Quasar** at any **GitHub PR URL** or **local branch / working-tree diff** and it automatically:
 1. Fetches the PR metadata or local branch commit history, unified diff, and existing comments.
 2. Materializes clean local `base/` and `head/` file snapshots so native side-by-side diffs (`vscode.diff`) work immediately without dirtying your active branch.
-3. Runs 4 parallel specialist review subagents (`review-architect`, `review-bug-hunter`, `review-test-critic`, `review-advocate`, plus any custom `review-*` subagents you add).
+3. Runs parallel specialist review lenses (architecture, bugs, security, tests, performance, concurrency, compatibility, docs, and more, plus any custom `review-*` subagents you add), with configurable lenses per effort level.
 4. Populates a **CliffsNotes Study Guide**, a **Guided Reading Tour** ordered by logical chapters (instead of alphabetically), **CliffsNotes Hover Cards & CodeLenses** (keeping your code completely free of inline comprehension clutter), and **Native Inline Comment Threads** where you can ask Quasar questions directly on any line of code, calibrate your review preferences, or stage comments for a **GitHub Pending Review**.
 
 ---
@@ -150,14 +150,40 @@ When an agent is asked to set up Quasar, it should execute these exact steps:
   - Learned rules, seed skills, style profiles, and phrasing examples are automatically persisted and injected into `pr_context.json` and all review subagents on every future review.
 
 ### 4. Multi-Lens Review Subagents & Adding Custom Review Agents (`review-*`)
-Quasar ships with 4 built-in specialist review subagents under `plugin/agents/`:
-- **`review-architect`**: Architecture, API surface, backwards compatibility, and logical reading order.
-- **`review-bug-hunter`**: Execution paths, nullability, concurrency/async hazards, resource leaks, and platform edge cases.
-- **`review-test-critic`**: Test falsifiability, edge-case coverage matrix, generated file sync, and repo hygiene (`CHANGELOG.md`, `pubspec.yaml`).
-- **`review-advocate`**: False-positive filter that verifies candidate findings against callers, types, and existing PR comments.
+Quasar ships with general-purpose review lenses under `plugin/agents/`. Each lens declares the effort levels it runs at by default (`quasarEfforts`) and an applicability gate (`quasarAppliesWhen`) so irrelevant lenses are skipped for a given diff:
+
+| Lens | Focus | Default efforts |
+|---|---|---|
+| `review-architect` | Architecture, API surface, backwards compatibility, reading order | medium, high |
+| `review-bug-hunter` | Execution paths, nullability, async hazards, leaks, platform edge cases | medium, high |
+| `review-security` | Injection, authn/authz, secrets, unsafe parsing, path traversal, transport/crypto | medium, high |
+| `review-test-critic` | Test falsifiability, coverage matrix, generated file sync, repo hygiene | high |
+| `review-performance` | Complexity regressions, N+1 IO, allocation churn, main-thread blocking | high |
+| `review-concurrency` | Races, deadlocks, thread/isolate affinity, cancellation & disposal ordering | high |
+| `review-compat` | Public API diffs, semver bumps, deprecation paths, wire/storage formats | high |
+| `review-error-handling` | Swallowed errors, lost context, error contracts, observability gaps | high |
+| `review-docs` | API doc comments, README/guide accuracy, changelog & migration notes | high |
+| `review-readability` | Naming, structure, duplication, dead code, convention drift | high |
+| `review-dependencies` | New/changed deps, constraints, lockfiles, licenses, footprint | high |
+| `review-accessibility` | Semantics/labels, keyboard & focus, contrast, touch targets, motion | high |
+| `review-newcomer` | Fresh-eyes read for confusing code and missing context | opt-in |
+
+Plus **`review-advocate`**, a false-positive filter helper (not a lens) that verifies candidate findings against callers, types, and existing PR comments.
+
+#### Configure Which Lenses Run at Each Effort Level
+- **From the UI**: Command Palette → **`Quasar: Configure Review Lenses per Effort Level...`** (also in the **Review Subagents** sidebar section and the Preferences menu). Pick `low` / `medium` / `high`, then check the lenses to run. `low` defaults to no lenses (single pass).
+- **From the CLI**:
+  ```bash
+  SCRIPTS=~/.gemini/config/plugins/quasar/skills/quasar/scripts
+  python3 $SCRIPTS/review_lenses.py --list
+  python3 $SCRIPTS/review_lenses.py --set-effort-lenses medium --lenses review-architect,review-bug-hunter,review-security
+  python3 $SCRIPTS/review_lenses.py --set-lens review-newcomer --efforts high
+  python3 $SCRIPTS/review_lenses.py --reset            # back to AGENT.md defaults
+  ```
+- Overrides are stored as `lensEfforts` in `~/.gemini/quasar/preferences.json`. Each review writes the resolved selection to `pr_context.json` (`review_lenses` for the current effort, `effort_lenses` for all levels), and Quasar spawns only those lenses.
 
 #### How to Add Your Own Review Subagents
-You can add custom domain-, language-, or team-specific review subagents (e.g., `review-security`, `review-accessibility`, `review-sql-migrations`) and Quasar will automatically discover them (`available_review_agents` in `pr_context.json`) and spawn them in parallel during `medium` and `high` effort reviews:
+You can add custom domain-, language-, or team-specific review subagents (e.g., `review-security`, `review-accessibility`, `review-sql-migrations`) and Quasar will automatically discover them (`available_review_agents` in `pr_context.json`). Custom lenses run at `medium` and `high` effort by default; set `quasarEfforts` in the frontmatter or use **Configure Review Lenses per Effort Level** to change that:
 
 - **Option A: Directly from the Extension UI (No GitHub Repo Needed)**
   1. Open the Command Palette (`Cmd+Shift+P` $\rightarrow$ **`Quasar: Add / Manage Review Subagents (review-*)...`**), click **`$(git-pull-request) Quasar`** in the Status Bar $\rightarrow$ **`Add / Manage Review Subagents (review-*)...`**, or expand **`Review Subagents`** in the **Checks & Learned Preferences** sidebar.
@@ -175,8 +201,10 @@ You can add custom domain-, language-, or team-specific review subagents (e.g., 
   2. **Use the standard read-only review subagent template**:
      ```markdown
      ---
-     name: review-security
-     description: "Security & Auth Reviewer. Evaluates authentication boundaries, secret handling, injection risks, and permission checks."
+     name: review-sql-migrations
+     description: "SQL Migration Reviewer. Checks schema migrations for locking, backfills, reversibility, and index usage."
+     quasarEfforts: [medium, high]          # effort levels this lens runs at by default ([] = opt-in)
+     quasarAppliesWhen: "Diff touches migrations/ or *.sql files."
      tools:
        - view_file
        - grep_search
@@ -187,14 +215,14 @@ You can add custom domain-, language-, or team-specific review subagents (e.g., 
      commandExecutionPolicy: off
      ---
 
-     # Security & Auth Reviewer (`review-security`)
+     # SQL Migration Reviewer (`review-sql-migrations`)
 
-     You are a specialist code review subagent focused on security boundaries and safe data handling. You operate in read-only mode.
+     You are a specialist code review subagent focused on database schema migrations. You operate in read-only mode.
 
      ## What You Hunt For
-     - Unvalidated external inputs, path traversal, or command/SQL injection risks.
-     - Token/secret leakage in logs, error messages, or serialized state.
-     - Missing authorization or permission checks on newly exposed endpoints or platform channels.
+     - Migrations that take long table locks or rewrite large tables online.
+     - Backfills without batching, and migrations that cannot be rolled back.
+     - New queries or constraints without supporting indexes.
 
      ## Honor Learned Reviewer Preferences
      Check `~/.gemini/quasar/PREFERENCES.md` or the `reviewer_preferences` passed in your prompt. Skip patterns marked `Avoid` and match the reviewer's preferred comment tone.
@@ -208,7 +236,7 @@ You can add custom domain-, language-, or team-specific review subagents (e.g., 
      - **Draft GitHub Comment**: Concise, collaborative 1–2 sentence review comment
      ```
   3. **Automatic Discovery & Execution**:
-     - On the next review, `collect_pr_context.py` automatically detects all installed `review-*` subagents and lists them under `available_review_agents` in `pr_context.json` so Quasar spawns them alongside the built-in reviewers (or you can explicitly ask in chat: *"Review this PR using `review-security`"*).
+     - On the next review, `collect_pr_context.py` automatically detects all installed `review-*` subagents and lists them under `available_review_agents` in `pr_context.json` so Quasar spawns them alongside the built-in reviewers (or you can explicitly ask in chat: *"Review this PR using `review-sql-migrations`"*).
 
 ### 5. Author Self-Review: Check Comments & Fix with Agent (`manage_fixes.py`)
 - When reviewing a **local branch** or a **GitHub PR you own** (auto-detected from your git/GitHub identity or checked-out branch), Quasar enables **Author Self-Review / Fix Mode**:

@@ -1,6 +1,8 @@
 ---
 name: review-test-critic
 description: "Test & Verification Critic for code reviews. Evaluates test falsifiability, missing edge-case coverage, generated file synchronization, and repo hygiene (CHANGELOG/pubspec)."
+quasarEfforts: [high]
+quasarAppliesWhen: "Always applicable."
 tools:
   - view_file
   - grep_search
@@ -44,3 +46,4 @@ For each testing gap or repo hygiene issue:
 - **Location**: Exact file path and 1-indexed line range (`path/to/file:L10-L25`)
 - **Why It Matters (For the Reviewer)**: What regression could slip through without this test or check.
 - **Draft Comment (For the Author)**: Concise PR comment noting the missing coverage or check without losing key context (simply pointing out the gap is often enough; include a specific test suggestion when helpful).
+- **Possible Solutions (when 2+ distinct valid ways to test or address the gap exist)**: List 2–4 concise options (marking `(Recommended)` when one is preferable) with a 1-sentence trade-off description for each so a PR/branch owner can choose how to solve it.

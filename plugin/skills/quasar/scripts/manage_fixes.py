@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional
 from collect_pr_context import (
     REVIEW_STATE_DIR,
     archive_review_session,
+    format_solution_option_text,
     get_session_paths,
     render_cliffs_notes_markdown,
 )
@@ -173,6 +174,38 @@ def record_positive_preference_for_fixed_threads(
     return recorded
 
 
+def apply_solution_selection_to_thread(
+    t: Dict[str, Any],
+    solution_id: str,
+    solution_text: str = "",
+    queue_mode: str = "true",
+) -> None:
+    sol_id = (solution_id or "").strip()
+    sol_txt = (solution_text or "").strip()
+    if sol_id.lower() in ("clear", "none", "") and not sol_txt:
+        t.pop("selectedSolutionId", None)
+        t.pop("selectedSolution", None)
+        if queue_mode == "false":
+            t["selectedForFix"] = False
+            t.pop("fixStatus", None)
+        return
+
+    opts = t.get("solutionOptions") or []
+    matched_opt = next((o for o in opts if str(o.get("id") or "") == sol_id), None)
+    if matched_opt:
+        t["selectedSolutionId"] = str(matched_opt.get("id"))
+        t["selectedSolution"] = sol_txt or format_solution_option_text(matched_opt)
+    else:
+        t["selectedSolutionId"] = sol_id or "custom"
+        t["selectedSolution"] = sol_txt or sol_id
+
+    if queue_mode == "true" and t.get("status") != "fixed":
+        t["selectedForFix"] = True
+    elif queue_mode == "false":
+        t["selectedForFix"] = False
+        t.pop("fixStatus", None)
+
+
 def parse_thread_ids(raw_ids: Optional[str], session: Dict[str, Any]) -> List[str]:
     if raw_ids:
         return [x.strip() for x in raw_ids.split(",") if x.strip()]
@@ -186,10 +219,15 @@ def parse_thread_ids(raw_ids: Optional[str], session: Dict[str, Any]) -> List[st
 def main() -> None:
     parser = argparse.ArgumentParser(description="Manage Quasar Self-Review Comment Selection & Agent Fixes.")
     parser.add_argument("--toggle-select", action="store_true", help="Toggle or set selectedForFix on one or more threads")
+    parser.add_argument("--select-solution", action="store_true", help="Select or clear a preferred solution option for a thread")
+    parser.add_argument("--solution-id", default="", help="Option ID to select (e.g. opt-1, custom, or clear)")
+    parser.add_argument("--solution-text", default="", help="Custom or explicit solution approach text")
+    parser.add_argument("--queue", choices=["true", "false", "keep"], default="true", help="Whether selecting a solution also queues the comment for fix")
     parser.add_argument("--thread-id", help="Single thread ID")
     parser.add_argument("--thread-ids", help="Comma-separated thread IDs")
     parser.add_argument("--selected", choices=["true", "false", "toggle"], default="toggle", help="Desired selection state")
     parser.add_argument("--prepare-fix", action="store_true", help="Prepare fix_request.json, record preference signal, and output agent prompt")
+    parser.add_argument("--solution-choices-json", default="", help="JSON map of threadId -> {id, text} selected solutions for --prepare-fix")
     parser.add_argument("--instructions", default="", help="Optional custom instructions from the user for how to fix the selected comments")
     parser.add_argument("--complete-fix", action="store_true", help="Mark threads as fixed in active_session.json and sync head snapshots from working tree")
     parser.add_argument("--summary", default="Applied fix in local working tree.", help="Summary of the fix applied by the agent")
@@ -216,6 +254,38 @@ def main() -> None:
         return
 
     threads: List[Dict[str, Any]] = session.get("threads") or []
+
+    if args.select_solution:
+        updated = []
+        for t in threads:
+            if str(t.get("id")) in target_ids:
+                apply_solution_selection_to_thread(
+                    t,
+                    solution_id=args.solution_id,
+                    solution_text=args.solution_text,
+                    queue_mode=args.queue,
+                )
+                updated.append(
+                    {
+                        "id": t.get("id"),
+                        "selectedSolutionId": t.get("selectedSolutionId"),
+                        "selectedSolution": t.get("selectedSolution"),
+                        "selectedForFix": bool(t.get("selectedForFix", False)),
+                    }
+                )
+        save_session(session, active_session_path, cliffs_notes_md_path)
+        selected_count = sum(1 for t in threads if t.get("selectedForFix") and t.get("status") != "fixed")
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "updated": updated,
+                    "selectedCount": selected_count,
+                },
+                indent=2,
+            )
+        )
+        return
 
     if args.toggle_select:
         updated = []
@@ -253,11 +323,38 @@ def main() -> None:
             print(json.dumps({"ok": False, "error": "No comments selected to fix."}))
             return
 
+        choices_map: Dict[str, Any] = {}
+        if args.solution_choices_json.strip():
+            try:
+                parsed_choices = json.loads(args.solution_choices_json)
+                if isinstance(parsed_choices, dict):
+                    choices_map = parsed_choices
+            except Exception:
+                choices_map = {}
+
         repo_dir = session.get("repoDir") or os.getcwd()
         head_root = session.get("headSnapshotRoot") or ""
         pr = session.get("pr") or {}
+        is_owned = pr.get("isOwnedByUser", True) is not False
 
         for t in selected_threads:
+            tid_str = str(t.get("id"))
+            if tid_str in choices_map:
+                choice_val = choices_map[tid_str]
+                if isinstance(choice_val, dict):
+                    apply_solution_selection_to_thread(
+                        t,
+                        solution_id=str(choice_val.get("id") or ""),
+                        solution_text=str(choice_val.get("text") or ""),
+                        queue_mode="keep",
+                    )
+                elif isinstance(choice_val, str) and choice_val.strip():
+                    apply_solution_selection_to_thread(
+                        t,
+                        solution_id="custom",
+                        solution_text=choice_val.strip(),
+                        queue_mode="keep",
+                    )
             t["selectedForFix"] = True
             t["fixStatus"] = "in_progress"
             if args.instructions.strip():
@@ -293,6 +390,9 @@ def main() -> None:
                     "endLine": end_l,
                     "whyItMatters": t.get("whyItMatters") or "",
                     "commentToAddress": t.get("draftComment") or ("\n\n".join(all_messages)),
+                    "solutionOptions": t.get("solutionOptions") or [],
+                    "selectedSolutionId": t.get("selectedSolutionId") or "",
+                    "selectedSolution": t.get("selectedSolution") or "",
                     "threadDiscussion": all_messages,
                     "codeSnippet": read_code_snippet(
                         abs_repo_path if os.path.isfile(abs_repo_path) else snap_path,
@@ -313,7 +413,7 @@ def main() -> None:
                 "title": pr.get("title"),
                 "headRefName": pr.get("headRefName"),
                 "baseRefName": pr.get("baseRefName"),
-                "isOwnedByUser": pr.get("isOwnedByUser", True),
+                "isOwnedByUser": is_owned,
             },
             "userInstructions": args.instructions.strip(),
             "threadIds": [item["threadId"] for item in fix_items],
@@ -326,11 +426,25 @@ def main() -> None:
         ids_csv = ",".join(manifest["threadIds"])
         item_lines = []
         for item in fix_items:
+            sol_block = ""
+            if item["selectedSolution"]:
+                sol_block = (
+                    f"\n   - **✅ User-Selected Solution Approach (MUST FOLLOW)**: {item['selectedSolution']}"
+                )
+            elif is_owned and len(item["solutionOptions"]) >= 2:
+                opts_bullets = "\n".join(
+                    f"     - {format_solution_option_text(o)}" for o in item["solutionOptions"]
+                )
+                sol_block = (
+                    f"\n   - **🧭 Possible Solution Options (No option selected yet — ask user via `ask_question` before editing)**:\n"
+                    f"{opts_bullets}"
+                )
             item_lines.append(
                 f"{item['index']}. **[{item['severity']}] {item['title']}** (Thread ID: `{item['threadId']}`)\n"
                 f"   - **Editable File**: `{item['editableFilePath']}` (Lines {item['startLine']}–{item['endLine']})\n"
                 + (f"   - **Context / Why It Matters**: {item['whyItMatters']}\n" if item["whyItMatters"] else "")
                 + f"   - **Comment / Issue to Fix**: {item['commentToAddress']}"
+                + sol_block
             )
 
         custom_instr_block = (
@@ -340,6 +454,14 @@ def main() -> None:
         )
 
         ws_arg = f' --workspace-dir "{session.get("workspaceDir") or repo_dir}"' if (session.get("workspaceDir") or repo_dir) else ""
+        solution_policy_step = (
+            "1. **Honor Selected Solutions & Present Options When Multiple Valid Fixes Exist**: "
+            "If a comment above includes **✅ User-Selected Solution Approach**, implement that exact chosen approach. "
+            "Because this review is owned by the user, if a comment does **not** have a selected approach yet and has multiple meaningfully different ways to solve it (listed under **Possible Solution Options** or discovered when inspecting the code), **do NOT guess**—call `ask_question` first to present the solution options so the user can select how they want it solved before you edit the code.\n"
+            if is_owned
+            else ""
+        )
+        step_offset = 1 if is_owned else 0
         agent_prompt = (
             f"Please fix the following {len(fix_items)} selected review comment(s) in `{repo_dir}` "
             f"(full structured context saved at `{fix_request_path}`):\n\n"
@@ -347,9 +469,10 @@ def main() -> None:
             + "\n"
             + custom_instr_block
             + "\n### Instructions for Applying Fixes:\n"
-            f"1. Edit the real working-tree files under `{repo_dir}` (do **not** edit the snapshot copies directly, and do **not** create a git commit unless asked).\n"
-            f"2. Run any relevant analyzer or unit tests to verify your fix compiles and passes.\n"
-            f"3. Once fixed, sync the Quasar review session and mark the comment thread(s) as `✅ Fixed` by running:\n"
+            + solution_policy_step
+            + f"{1 + step_offset}. Edit the real working-tree files under `{repo_dir}` (do **not** edit the snapshot copies directly, and do **not** create a git commit unless asked).\n"
+            f"{2 + step_offset}. Run any relevant analyzer or unit tests to verify your fix compiles and passes.\n"
+            f"{3 + step_offset}. Once fixed, sync the Quasar review session and mark the comment thread(s) as `✅ Fixed` by running:\n"
             f"   ```bash\n"
             f'   python3 "{script_path}" --complete-fix --thread-ids "{ids_csv}"{ws_arg} --summary "<CONCISE_SUMMARY_OF_FIXES>"\n'
             f"   ```"

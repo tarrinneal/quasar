@@ -21,7 +21,9 @@ from collect_pr_context import (
     REVIEW_STATE_DIR,
     archive_review_session,
     assess_existing_github_comment,
+    format_solution_option_text,
     get_session_paths,
+    normalize_solution_options,
     render_cliffs_notes_markdown,
     resolve_target_window,
     sanitize_mermaid_diagram,
@@ -33,6 +35,7 @@ def _apply_triage_to_existing_thread(
     override: Optional[Dict[str, Any]],
     pr_author: str,
     now_iso: str,
+    is_owned: bool = True,
 ) -> Dict[str, Any]:
     thread = dict(t)
     raw_body = (thread.get("draftComment") or "").strip()
@@ -55,7 +58,7 @@ def _apply_triage_to_existing_thread(
 
     if override:
         status = override.get("triageStatus") or override.get("verdict") or thread.get("triageStatus") or "needs_attention"
-        if status in ("good", "should_fix", "fix", "recommended_fix"):
+        if status in ("good", "should_fix", "needs_fix", "fix", "recommended_fix"):
             status = "recommended_fix"
         elif status in ("question", "needs_look", "needs_attention", "discussion"):
             status = "needs_attention"
@@ -123,6 +126,26 @@ def _apply_triage_to_existing_thread(
         left_tag = "❓ [Question]" if "question" in cat else "👀 [Needs Look]"
 
     thread.update(triage)
+    if is_owned:
+        raw_sol = (
+            (override.get("solutionOptions") or override.get("fixOptions"))
+            if override
+            else None
+        ) or thread.get("solutionOptions")
+        sol_opts = normalize_solution_options(raw_sol)
+        if sol_opts:
+            thread["solutionOptions"] = sol_opts
+            if override and override.get("selectedSolution"):
+                thread["selectedSolution"] = str(override["selectedSolution"]).strip()
+            if override and override.get("selectedSolutionId"):
+                thread["selectedSolutionId"] = str(override["selectedSolutionId"]).strip()
+        else:
+            thread.pop("solutionOptions", None)
+    else:
+        thread.pop("solutionOptions", None)
+        thread.pop("selectedSolutionId", None)
+        thread.pop("selectedSolution", None)
+
     thread["author"] = author
     thread["triageLeftTag"] = left_tag
     if raw_body:
@@ -242,14 +265,23 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
                 assessments_by_id[str(k)] = v
     elif isinstance(raw_assessments, list):
         for item in raw_assessments:
-            if isinstance(item, dict) and item.get("id"):
-                assessments_by_id[str(item["id"])] = item
+            if isinstance(item, dict):
+                aid = item.get("id") or item.get("threadId") or item.get("thread_id")
+                if aid:
+                    assessments_by_id[str(aid)] = item
 
     for finding in payload.get("findings") or payload.get("threads") or []:
-        if finding.get("kind") == "github_existing" and finding.get("id"):
-            assessments_by_id[str(finding["id"])] = finding
+        if finding.get("kind") == "github_existing":
+            fid = finding.get("id") or finding.get("threadId") or finding.get("thread_id")
+            if fid:
+                assessments_by_id[str(fid)] = finding
 
-    pr_author = ((session.get("pr") or {}).get("author") or "").strip()
+    pr_info = session.get("pr") or {}
+    pr_author = (pr_info.get("author") or "").strip()
+    is_owned = pr_info.get("isOwnedByUser", True) is not False
+    prior_threads_by_id: Dict[str, Dict[str, Any]] = {
+        str(t.get("id")): t for t in (session.get("threads") or []) if t.get("id")
+    }
     raw_existing_threads = [
         t
         for t in (session.get("threads") or [])
@@ -290,7 +322,11 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
             tid = str(t.get("id") or "")
             existing_threads.append(
                 _apply_triage_to_existing_thread(
-                    t, assessments_by_id.get(tid), pr_author, session["updatedAt"]
+                    t,
+                    assessments_by_id.get(tid),
+                    pr_author,
+                    session["updatedAt"],
+                    is_owned=is_owned,
                 )
             )
         else:
@@ -302,6 +338,7 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
         if finding.get("kind") in ("github_existing", "user_qa"):
             continue
         t_id = finding.get("id") or f"finding-{idx}"
+        prior_t = prior_threads_by_id.get(str(t_id)) or {}
         sev = finding.get("severity") or "DESIGN"
         draft = finding.get("draftComment") or finding.get("body") or ""
         why = finding.get("whyItMatters") or finding.get("rationale") or ""
@@ -352,6 +389,32 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
         )
         pref_category = finding.get("preferenceCategory") or finding.get("category") or "general"
         pref_options = finding.get("preferenceOptions") or []
+        solution_options = (
+            normalize_solution_options(
+                finding.get("solutionOptions")
+                or finding.get("fixOptions")
+                or prior_t.get("solutionOptions")
+            )
+            if is_owned
+            else []
+        )
+        selected_sol_id = (
+            str(finding.get("selectedSolutionId") or prior_t.get("selectedSolutionId") or "").strip()
+            if is_owned
+            else ""
+        )
+        selected_sol_text = (
+            str(finding.get("selectedSolution") or prior_t.get("selectedSolution") or "").strip()
+            if is_owned
+            else ""
+        )
+        if selected_sol_id and not selected_sol_text and solution_options:
+            matched_opt = next(
+                (o for o in solution_options if o.get("id") == selected_sol_id),
+                None,
+            )
+            if matched_opt:
+                selected_sol_text = format_solution_option_text(matched_opt)
 
         top_level_note = (
             f"\n\n📌 *Top-Level PR Comment"
@@ -377,35 +440,40 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
                 f"**Draft GitHub Comment**:\n> {draft}"
             )
 
-        new_threads.append(
-            {
-                "id": t_id,
-                "kind": kind,
-                "severity": sev,
-                "status": status,
-                "isTopLevel": is_top_level,
-                "targetFile": target_file,
-                "selectedForFix": bool(finding.get("selectedForFix", False)),
-                "uncertain": is_uncertain,
-                "uncertaintyQuestion": uncertainty_q,
-                "preferenceCategory": pref_category,
-                "preferenceOptions": pref_options,
-                "path": effective_path,
-                "startLine": start_l,
-                "endLine": end_l,
-                "title": title,
-                "whyItMatters": why,
-                "draftComment": draft,
-                "messages": finding.get("messages")
-                or [
-                    {
-                        "author": "Quasar",
-                        "body": default_body,
-                        "timestamp": session["updatedAt"],
-                    }
-                ],
-            }
-        )
+        thread_entry: Dict[str, Any] = {
+            "id": t_id,
+            "kind": kind,
+            "severity": sev,
+            "status": status,
+            "isTopLevel": is_top_level,
+            "targetFile": target_file,
+            "selectedForFix": bool(finding.get("selectedForFix", prior_t.get("selectedForFix", False))),
+            "uncertain": is_uncertain,
+            "uncertaintyQuestion": uncertainty_q,
+            "preferenceCategory": pref_category,
+            "preferenceOptions": pref_options,
+            "path": effective_path,
+            "startLine": start_l,
+            "endLine": end_l,
+            "title": title,
+            "whyItMatters": why,
+            "draftComment": draft,
+            "messages": finding.get("messages")
+            or [
+                {
+                    "author": "Quasar",
+                    "body": default_body,
+                    "timestamp": session["updatedAt"],
+                }
+            ],
+        }
+        if solution_options:
+            thread_entry["solutionOptions"] = solution_options
+        if selected_sol_id:
+            thread_entry["selectedSolutionId"] = selected_sol_id
+        if selected_sol_text:
+            thread_entry["selectedSolution"] = selected_sol_text
+        new_threads.append(thread_entry)
 
     session["threads"] = existing_threads + new_threads
 

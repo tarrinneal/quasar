@@ -1500,6 +1500,27 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
           ${t.whyItMatters ? `<div class="text-xs text-[var(--q-muted)]"><b>Why it matters:</b> ${esc(t.whyItMatters)}</div>` : ''}
           <div class="text-xs whitespace-pre-wrap leading-relaxed">${esc(t.draftComment || '')}</div>
           ${t.suggestion ? `<pre class="text-[11px] bg-black/40 border border-[var(--q-border)] rounded p-2.5 overflow-x-auto"><code>${esc(t.suggestion)}</code></pre>` : ''}
+          ${((!STATE.activeSession?.pr || STATE.activeSession.pr.isOwnedByUser !== false) && t.status !== 'fixed' && ((Array.isArray(t.solutionOptions) && t.solutionOptions.length >= 2) || t.selectedSolution)) ? `
+            <div class="space-y-1.5 pt-2 border-t border-cyan-500/30 text-xs">
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-cyan-300 font-semibold">🧭 Choose How to Solve This:</span>
+                ${t.selectedSolution ? `<button type="button" class="text-[11px] text-[var(--q-muted)] hover:underline" onclick="threadAction('${esc(t.id)}', 'selectSolution', { optionId: 'clear' })">Clear selection</button>` : ''}
+              </div>
+              <div class="space-y-1">
+                ${(t.solutionOptions || []).map((opt, idx) => {
+                  const oid = opt.id || ('opt-' + (idx + 1));
+                  const isSel = t.selectedSolutionId === oid;
+                  return `<button type="button" class="w-full text-left p-2 rounded border transition ${isSel ? 'border-cyan-400 bg-cyan-500/15 text-cyan-100' : 'border-[var(--q-border)] bg-black/30 hover:border-cyan-500/50'}" onclick="threadAction('${esc(t.id)}', 'selectSolution', { optionId: '${esc(oid)}' })">
+                    <div class="font-semibold">${isSel ? '✅ ' : '○ '}${esc(opt.label || ('Option ' + (idx + 1)))}${opt.recommended ? ' <span class="text-[10px] text-amber-300 font-normal">(Recommended)</span>' : ''}</div>
+                    ${opt.description ? `<div class="text-[11px] text-[var(--q-muted)] mt-0.5">${esc(opt.description)}</div>` : ''}
+                  </button>`;
+                }).join('')}
+              </div>
+              ${(t.selectedSolution && t.selectedSolutionId === 'custom') ? `<div class="p-2 rounded border border-cyan-400 bg-cyan-500/15 text-cyan-100"><span class="font-semibold">✅ Custom approach:</span> ${esc(t.selectedSolution)}</div>` : ''}
+              <div class="flex items-center gap-2 pt-0.5">
+                <button type="button" class="q-btn" onclick="openCustomSolutionModal('${esc(t.id)}')">✏️ Custom Approach...</button>
+              </div>
+            </div>` : ''}
           ${t.status === 'uncertain' ? `
             <div class="space-y-1.5 pt-1.5 border-t border-amber-500/30 text-xs">
               ${(t.uncertaintyQuestion || t.calibrationQuestion) ? `<div class="text-amber-200">${esc(t.uncertaintyQuestion || t.calibrationQuestion)}</div>` : ''}
@@ -1788,16 +1809,121 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       }
     }
 
-    async function fixSelectedComments() {
+    function openCustomSolutionModal(threadId) {
+      const t = (STATE.activeSession?.threads || []).find((th) => th.id === threadId);
+      if (!t) return;
+      const existing = t.selectedSolutionId === 'custom' ? (t.selectedSolution || '') : '';
+      showModal(`
+        <div class="text-sm font-bold">🧭 Custom Solution Approach</div>
+        <div class="text-xs text-[var(--q-muted)]">${esc(t.title || t.path || '')}</div>
+        <textarea id="customSolInput" rows="3" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2 text-xs"
+                  placeholder="Describe how you want this comment solved...">${esc(existing)}</textarea>
+        <div class="flex justify-end gap-2 pt-2">
+          <button class="q-btn" onclick="closeModal()">Cancel</button>
+          <button class="q-btn q-btn-primary" onclick="submitCustomSolution('${esc(threadId)}')">Save Approach</button>
+        </div>
+      `);
+    }
+
+    async function submitCustomSolution(threadId) {
+      const text = (document.getElementById('customSolInput')?.value || '').trim();
+      if (!text) return;
+      closeModal();
+      await threadAction(threadId, 'selectSolution', { optionId: 'custom', customText: text, queueForFix: true });
+    }
+
+    let PENDING_SOLUTION_THREADS = [];
+
+    function openResolveSolutionsModal(unresolvedThreads) {
+      PENDING_SOLUTION_THREADS = unresolvedThreads;
+      const cardsHtml = unresolvedThreads.map((t, tIdx) => {
+        const opts = Array.isArray(t.solutionOptions) ? t.solutionOptions : [];
+        const recIdx = Math.max(0, opts.findIndex((o) => o.recommended));
+        return `
+          <div class="p-3 rounded border border-[var(--q-border)] bg-black/30 space-y-2">
+            <div class="font-semibold text-xs text-cyan-200">${esc(t.title || 'Comment')} <span class="text-[var(--q-muted)] font-mono font-normal">(${esc(t.path || '')}:${t.startLine || 1})</span></div>
+            <div class="space-y-1">
+              ${opts.map((opt, idx) => {
+                const oid = opt.id || ('opt-' + (idx + 1));
+                const checked = idx === recIdx ? 'checked' : '';
+                return `<label class="flex items-start gap-2 p-1.5 rounded hover:bg-white/5 cursor-pointer text-xs">
+                  <input type="radio" name="sol_choice_${tIdx}" value="${esc(oid)}" ${checked} class="mt-0.5" onchange="document.getElementById('sol_custom_${tIdx}').classList.add('hidden')" />
+                  <div>
+                    <div class="font-medium">${esc(opt.label || ('Option ' + (idx + 1)))}${opt.recommended ? ' <span class="text-[10px] text-amber-300">(Recommended)</span>' : ''}</div>
+                    ${opt.description ? `<div class="text-[11px] text-[var(--q-muted)]">${esc(opt.description)}</div>` : ''}
+                  </div>
+                </label>`;
+              }).join('')}
+              <label class="flex items-start gap-2 p-1.5 rounded hover:bg-white/5 cursor-pointer text-xs">
+                <input type="radio" name="sol_choice_${tIdx}" value="custom" class="mt-0.5" onchange="document.getElementById('sol_custom_${tIdx}').classList.remove('hidden')" />
+                <div class="w-full space-y-1">
+                  <div class="font-medium">✏️ Custom approach...</div>
+                  <input id="sol_custom_${tIdx}" type="text" class="hidden w-full bg-black/40 border border-[var(--q-border)] rounded px-2 py-1 text-xs" placeholder="Describe how you want this solved..." />
+                </div>
+              </label>
+            </div>
+          </div>`;
+      }).join('');
+
+      showModal(`
+        <div class="text-sm font-bold">🧭 Choose How to Solve Comments (${unresolvedThreads.length})</div>
+        <div class="text-xs text-[var(--q-muted)]">These queued comments have multiple valid solutions. Select your preferred approach before dispatching to Quasar:</div>
+        <div class="space-y-2.5 max-h-[55vh] overflow-y-auto pr-1">${cardsHtml}</div>
+        <div class="flex justify-end gap-2 pt-2">
+          <button class="q-btn" onclick="closeModal()">Cancel</button>
+          <button class="q-btn q-btn-primary" onclick="confirmSolutionsAndFix()">🔧 Confirm &amp; Fix Selected</button>
+        </div>
+      `);
+    }
+
+    async function confirmSolutionsAndFix() {
+      const choices = {};
+      for (let i = 0; i < PENDING_SOLUTION_THREADS.length; i++) {
+        const t = PENDING_SOLUTION_THREADS[i];
+        const checked = document.querySelector(`input[name="sol_choice_${i}"]:checked`);
+        const val = checked ? checked.value : '';
+        if (val === 'custom') {
+          const customText = (document.getElementById(`sol_custom_${i}`)?.value || '').trim();
+          if (!customText) {
+            showToast(`Please enter a custom approach for "${t.title || t.id}"`, true);
+            return;
+          }
+          choices[t.id] = { id: 'custom', text: customText };
+        } else if (val) {
+          choices[t.id] = val;
+        }
+      }
+      closeModal();
+      await fixSelectedComments(choices);
+    }
+
+    async function fixSelectedComments(solutionChoices = null) {
+      const isOwned = !STATE.activeSession?.pr || STATE.activeSession.pr.isOwnedByUser !== false;
+      if (isOwned && !solutionChoices) {
+        const queuedThreads = (STATE.activeSession?.threads || []).filter(
+          (t) => t.status !== 'dismissed' && t.status !== 'fixed' && Boolean(t.selectedForFix)
+        );
+        const unresolved = queuedThreads.filter(
+          (t) => Array.isArray(t.solutionOptions) && t.solutionOptions.length >= 2 && !t.selectedSolution
+        );
+        if (unresolved.length > 0) {
+          openResolveSolutionsModal(unresolved);
+          return;
+        }
+      }
       startOptimisticAgentBanner(
         'Quasar Fix Selected Comments',
         'Applying queued review fixes to codebase',
         'Preparing fix manifest and dispatching to Quasar agent...'
       );
       showToast('🔧 Preparing fix manifest and dispatching to Quasar agent...');
-      const res = await apiCall('/api/fix-selected', 'POST', {
+      const payload = {
         sessionId: STATE.activeSession?.sessionId,
-      });
+      };
+      if (solutionChoices && Object.keys(solutionChoices).length > 0) {
+        payload.solutionChoices = solutionChoices;
+      }
+      const res = await apiCall('/api/fix-selected', 'POST', payload);
       if (res && res.ok) {
         showToast(`🔧 Dispatched ${res.count || ''} comment(s) to agent for fixing!`);
         await refreshState(STATE.activeSession?.sessionId);
@@ -1973,7 +2099,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
               <select id="newReviewEffort" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2">
                 <option value="low">⚡ Low Effort (Fast)</option>
                 <option value="medium" selected>⚖️ Medium Effort (Balanced)</option>
-                <option value="high">🔬 High Effort (Deep 4-Lens)</option>
+                <option value="high">🔬 High Effort (Deep Multi-Lens)</option>
               </select>
             </div>
             <div>
@@ -2244,6 +2370,40 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                     "upvote" if rating == "up" else "downvote",
                 ]
                 msg = "Recorded positive feedback 👍" if rating == "up" else "Recorded feedback 👎"
+            elif act == "selectSolution":
+                opt_id = str(data.get("optionId") or "").strip()
+                custom_text = str(data.get("customText") or "").strip()
+                if opt_id in ("clear", "none"):
+                    target.pop("selectedSolutionId", None)
+                    target.pop("selectedSolution", None)
+                    msg = "Cleared selected solution"
+                elif opt_id == "custom" and custom_text:
+                    target["selectedSolutionId"] = "custom"
+                    target["selectedSolution"] = custom_text
+                    if data.get("queueForFix"):
+                        target["selectedForFix"] = True
+                    msg = "Saved custom solution approach"
+                else:
+                    matched = next(
+                        (
+                            o
+                            for o in (target.get("solutionOptions") or [])
+                            if isinstance(o, dict) and str(o.get("id") or "") == opt_id
+                        ),
+                        None,
+                    )
+                    if matched:
+                        target["selectedSolutionId"] = str(matched.get("id") or opt_id)
+                        label = str(matched.get("label") or "").strip()
+                        desc = str(matched.get("description") or "").strip()
+                        target["selectedSolution"] = (
+                            f"{label} — {desc}" if (label and desc) else (label or desc)
+                        )
+                        msg = f"Selected solution: {label or opt_id}"
+                    elif custom_text:
+                        target["selectedSolutionId"] = opt_id or "custom"
+                        target["selectedSolution"] = custom_text
+                        msg = "Saved selected solution"
 
             save_session_everywhere(session, session_path)
             if pref_cmd:
@@ -2336,6 +2496,9 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
             cmd = [sys.executable, script, "--prepare-fix"]
             if ws_dir:
                 cmd.extend(["--workspace-dir", ws_dir])
+            sol_choices = data.get("solutionChoices")
+            if isinstance(sol_choices, dict) and sol_choices:
+                cmd.extend(["--solution-choices-json", json.dumps(sol_choices)])
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
             prep = {}
             try:
@@ -2347,8 +2510,8 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"ok": False, "error": "No comments are currently queued for fix. Click 'Queue for Fix' on one or more comments first."})
                 return
             prompt_path = prep.get("promptPath") or prep.get("fixRequestPath") or ""
-            prompt = ""
-            if prompt_path and os.path.isfile(prompt_path):
+            prompt = (prep.get("agentPrompt") or "").strip()
+            if not prompt and prompt_path and os.path.isfile(prompt_path):
                 try:
                     with open(prompt_path, "r", encoding="utf-8") as f:
                         prompt = f.read().strip()

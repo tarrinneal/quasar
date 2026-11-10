@@ -31,7 +31,9 @@ from typing import Any, Dict
 
 from collect_pr_context import (
     archive_review_session,
+    format_solution_option_text,
     get_session_paths,
+    normalize_solution_options,
     render_cliffs_notes_markdown,
 )
 
@@ -97,6 +99,16 @@ def main() -> None:
         "--updated-severity",
         help="Optional updated severity (e.g. BLOCKING, DESIGN, NIT)",
     )
+    parser.add_argument(
+        "--solution-options",
+        default=None,
+        help="Optional JSON array of solution options ([{\"label\": \"...\", \"description\": \"...\", \"recommended\": true}, ...])",
+    )
+    parser.add_argument(
+        "--select-solution",
+        default=None,
+        help="Optional selected solution option ID (e.g. opt-1) or custom approach text",
+    )
     parser.add_argument("--start-line", type=int, help="Optional updated start line (1-based)")
     parser.add_argument("--end-line", type=int, help="Optional updated end line (1-based)")
     parser.add_argument(
@@ -126,7 +138,18 @@ def main() -> None:
     parser.add_argument("--workspace-dir", default=None, help="Window workspace directory")
     args = parser.parse_args()
 
-    if not args.answer.strip() and args.updated_draft is None and not args.updated_title and not args.updated_why and not args.updated_severity and not args.dismiss and not args.stage and not args.unstage:
+    if (
+        not args.answer.strip()
+        and args.updated_draft is None
+        and not args.updated_title
+        and not args.updated_why
+        and not args.updated_severity
+        and args.solution_options is None
+        and args.select_solution is None
+        and not args.dismiss
+        and not args.stage
+        and not args.unstage
+    ):
         sys.stderr.write("Provide at least --answer or --updated-draft (or another update flag).\n")
         sys.exit(1)
 
@@ -169,6 +192,32 @@ def main() -> None:
                 t["whyItMatters"] = args.updated_why.strip()
             if args.updated_severity and args.updated_severity.strip():
                 t["severity"] = args.updated_severity.strip().upper()
+            if args.solution_options is not None:
+                try:
+                    parsed_opts = json.loads(args.solution_options)
+                    norm_opts = normalize_solution_options(parsed_opts)
+                    if norm_opts:
+                        t["solutionOptions"] = norm_opts
+                    else:
+                        t.pop("solutionOptions", None)
+                except Exception:
+                    pass
+            if args.select_solution is not None:
+                sel_raw = args.select_solution.strip()
+                if not sel_raw or sel_raw.lower() in ("clear", "none"):
+                    t.pop("selectedSolutionId", None)
+                    t.pop("selectedSolution", None)
+                else:
+                    opts = t.get("solutionOptions") or []
+                    matched_opt = next((o for o in opts if str(o.get("id") or "") == sel_raw), None)
+                    if matched_opt:
+                        t["selectedSolutionId"] = str(matched_opt.get("id"))
+                        t["selectedSolution"] = format_solution_option_text(matched_opt)
+                    else:
+                        t["selectedSolutionId"] = "custom"
+                        t["selectedSolution"] = sel_raw
+                    if t.get("status") != "fixed":
+                        t["selectedForFix"] = True
             if args.start_line is not None and args.start_line >= 1:
                 t["startLine"] = int(args.start_line)
                 if args.end_line is None and int(t.get("endLine") or 1) < int(args.start_line):

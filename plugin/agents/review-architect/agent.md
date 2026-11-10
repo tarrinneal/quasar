@@ -1,6 +1,8 @@
 ---
 name: review-architect
 description: "Architecture & API Lens for code reviews. Evaluates design choices, public API surface, backwards compatibility, abstraction boundaries, and simpler alternatives."
+quasarEfforts: [medium, high]
+quasarAppliesWhen: "Always applicable."
 tools:
   - view_file
   - grep_search
@@ -50,5 +52,6 @@ For each architectural or API issue found (if any):
 - **Location**: Exact file path and 1-indexed line range (`path/to/file:L10-L25`)
 - **The Issue (For the Reviewer)**: Clear technical explanation of the structural concern or trade-off.
 - **Draft Comment (For the Author)**: Constructive, collaborative comment phrased for a PR review. Lean less verbose without losing important technical context; often simply pointing out the issue or asking a brief question is enough, and only include a concrete suggestion when it genuinely helps.
+- **Possible Solutions (when 2+ distinct valid ways to address the comment exist)**: List 2–4 concise solution options (marking `(Recommended)` when one is preferable) with a 1-sentence trade-off description for each so a PR/branch owner can choose how to solve it.
 
 If the architecture and API changes are sound, state that clearly rather than inventing artificial criticisms.

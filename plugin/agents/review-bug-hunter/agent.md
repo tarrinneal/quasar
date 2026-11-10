@@ -1,6 +1,8 @@
 ---
 name: review-bug-hunter
 description: "Bug & Edge-Case Hunter for code reviews. Traces logic paths, nullability, state mutations, concurrency/async hazards, resource leaks, and platform-specific edge cases."
+quasarEfforts: [medium, high]
+quasarAppliesWhen: "Always applicable."
 tools:
   - view_file
   - grep_search
@@ -46,5 +48,6 @@ For each verified bug or edge case (if any):
 - **Location**: Exact file path and 1-indexed line range (`path/to/file:L10-L25`)
 - **Trigger Scenario (For the Reviewer)**: Step-by-step trace of the input or state that causes the failure.
 - **Draft Comment (For the Author)**: Clear, polite PR comment pointing out the scenario without unnecessary verbosity (preserve important context, but keep it concise; simply mentioning the issue is often enough, or include a suggestion when helpful).
+- **Possible Solutions (when 2+ distinct valid fixes exist)**: List 2–4 concise fix options (marking `(Recommended)` when one is preferable) with a 1-sentence trade-off description for each so a PR/branch owner can select how to solve it.
 
 If you find zero bugs after thorough tracing, explicitly report that no correctness issues were found.

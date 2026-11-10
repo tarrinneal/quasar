@@ -209,6 +209,12 @@
         "icon": "$(organization)"
       },
       {
+        "command": "quasar.configureEffortLenses",
+        "title": "Configure Review Lenses per Effort Level...",
+        "category": "Quasar",
+        "icon": "$(settings-gear)"
+      },
+      {
         "command": "quasar.managePreferences",
         "title": "Manage & Calibrate Reviewer Preferences...",
         "category": "Quasar",
@@ -243,6 +249,12 @@
         "title": "✓ Queued for Agent Fix (Click to Remove from Queue)",
         "category": "Quasar",
         "icon": "$(pass-filled)"
+      },
+      {
+        "command": "quasar.selectSolutionOption",
+        "title": "Choose Solution Option...",
+        "category": "Quasar",
+        "icon": "$(list-selection)"
       },
       {
         "command": "quasar.fixSingleComment",
@@ -457,6 +469,11 @@
           "group": "inline@5"
         },
         {
+          "command": "quasar.selectSolutionOption",
+          "when": "view == quasar.commentsTree && quasar.isOwnedReview && (viewItem == thread-candidate || viewItem == thread-uncertain || viewItem == thread-staged || viewItem == thread-existing)",
+          "group": "1_modify@0_0solution"
+        },
+        {
           "command": "quasar.commentOnComment",
           "when": "view == quasar.commentsTree && (viewItem == thread-candidate || viewItem == thread-uncertain || viewItem == thread-staged || viewItem == thread-existing)",
           "group": "1_modify@0_change"
@@ -483,6 +500,11 @@
         }
       ],
       "comments/commentThread/title": [
+        {
+          "command": "quasar.selectSolutionOption",
+          "when": "commentController == quasar && commentThread =~ /has_solutions/",
+          "group": "inline@0_0solution"
+        },
         {
           "command": "quasar.calibrateFindingPreference",
           "when": "commentController == quasar && commentThread =~ /uncertain/",

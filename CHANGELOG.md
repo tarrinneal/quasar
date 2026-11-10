@@ -2,6 +2,17 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [Unreleased]
+
+### Added
+- **New general-purpose review lenses**: `review-security`, `review-performance`, `review-concurrency`, `review-compat`, `review-error-handling`, `review-docs`, `review-readability`, `review-dependencies`, `review-accessibility`, and opt-in `review-newcomer`. Each declares default effort levels (`quasarEfforts`) and an applicability gate (`quasarAppliesWhen`) so irrelevant lenses skip diffs they don't apply to.
+- **Configurable lenses per effort level**: `Quasar: Configure Review Lenses per Effort Level...` (sidebar, Preferences menu, Command Palette) and `review_lenses.py` CLI. Overrides persist as `lensEfforts` in `preferences.json`; `pr_context.json` now includes `review_lenses` (current effort) and `effort_lenses` (all levels), and the review pipeline spawns only the configured lenses.
+- **Solution options on user-owned reviews**: findings and existing comments with multiple valid fixes carry selectable `solutionOptions` in all Quasar UIs, and fixes follow the chosen approach.
+
+### Changed
+- `medium` effort now includes `review-security` by default (gated to security-relevant diffs).
+- Removed the domain-specific `review-flutter-packages` lens from the shipped plugin; Quasar's built-in lenses are now general-purpose. Domain lenses belong in `~/.gemini/config/agents/` or `<repo>/.gemini/agents/`.
+
 ## [1.2.3] - 2026-10-30
 
 ### Added

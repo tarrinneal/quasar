@@ -251,34 +251,26 @@ function normalizeEffortLevel(val) {
 function getEffortSpec(level) {
   const norm = normalizeEffortLevel(level);
   const base = { ...(EFFORT_LEVEL_SPECS[norm] || EFFORT_LEVEL_SPECS.medium) };
-  if (norm === 'low') {
-    return base;
-  }
-  let customAgents = [];
+  let lensNames = null;
   try {
     if (typeof discoverInstalledReviewAgents === 'function') {
-      customAgents = discoverInstalledReviewAgents().filter((a) => a && a.isCustom);
+      lensNames = getLensNamesForEffort(norm);
     }
   } catch (_) {}
-  const customCount = customAgents.length;
-  if (customCount === 0) {
+  if (!lensNames) return base;
+  const shortNames = lensNames.map((n) => String(n).replace(/^review-/, '')).join(', ');
+  const n = lensNames.length;
+  if (n === 0) {
+    base.description = '0 subagents • Fast direct scan for CliffsNotes tour + obvious blockers only';
     return base;
   }
-  const customShortNames = customAgents
-    .map((a) => String(a.name || '').replace(/^review-/, ''))
-    .filter(Boolean)
-    .join(', ');
-  const customFullNames = customAgents.map((a) => a.name).join(', ');
-
-  if (norm === 'medium') {
-    const totalMed = 2 + customCount;
-    base.description = `${totalMed} fast Flash subagents (Architect + Bug Hunter + ${customCount} custom: ${customShortNames}) in 1 wave`;
-    base.detail = `Runs ${totalMed} parallel Flash subagents (Architect, Bug Hunter, plus ${customFullNames}) and filters directly in a single wave.`;
-  } else if (norm === 'high') {
-    const totalHigh = 4 + customCount;
-    base.title = `$(beaker) High Effort — Deep ${totalHigh}-Lens Pipeline (~2–4m)`;
-    base.description = `All ${totalHigh} specialist subagents (4 built-in + ${customCount} custom: ${customShortNames})`;
-    base.detail = `Full deep codebase verification across all ${totalHigh} specialist lenses (Architect, Bug Hunter, Test Critic, Advocate, plus ${customFullNames}) for maximum thoroughness on complex PRs.`;
+  if (norm === 'high') {
+    base.title = `$(beaker) High Effort — Deep ${n}-Lens Pipeline (~2–4m)`;
+    base.description = `${n} specialist lenses (${shortNames}) — gated lenses skip irrelevant diffs`;
+    base.detail = `Runs the ${n} lenses configured for high effort in parallel, then filters false positives. Configure via "Configure Review Lenses per Effort Level".`;
+  } else {
+    base.description = `${n} fast Flash lens${n === 1 ? '' : 'es'} (${shortNames}) in 1 wave`;
+    base.detail = `Runs the ${n} lenses configured for ${norm} effort in parallel with Flash and filters directly in a single wave.`;
   }
   return base;
 }
@@ -309,68 +301,55 @@ function getDefaultCommentsOnly() {
 
 function buildEffortPromptInstruction(effortLevel, commentsOnly = false) {
   const level = normalizeEffortLevel(effortLevel);
-  let customAgents = [];
+  let lensNames = [];
   try {
     if (typeof discoverInstalledReviewAgents === 'function') {
-      customAgents = discoverInstalledReviewAgents().filter((a) => a && a.isCustom);
+      lensNames = getLensNamesForEffort(level);
     }
   } catch (_) {}
-  const customListText =
-    customAgents.length > 0
-      ? `, plus any applicable custom review subagents (${customAgents.map((a) => `\`${a.name}\``).join(', ')})`
-      : '';
-  const totalMed = 2 + customAgents.length;
-  const totalHighLenses = 4 + customAgents.length;
-  const totalHighWave = 3 + customAgents.length;
+  const lensList = lensNames.map((n) => `\`${n}\``).join(', ');
+  const architectNote = lensNames.includes('review-architect') && commentsOnly
+    ? ' (instruct `review-architect` to skip the reading tour/mental model and only return API/design findings)'
+    : '';
+  const lensRule =
+    ` Spawn only the configured lenses for this effort level (\`review_lenses\` in \`pr_context.json\`), skipping any whose \`appliesWhen\` gate clearly does not match this diff.`;
 
   const noChatQuestionsRule =
     ` Do NOT call \`ask_question\` during the review — complete and publish the review uninterrupted, and flag any borderline or preference-dependent comments with \`"status": "uncertain"\` so the user can review them in the UI alongside the code.`;
 
-  if (commentsOnly) {
-    const modePrefix =
-      `REVIEW MODE: COMMENTS ONLY (NO STUDY GUIDE OR READING TOUR). ` +
+  const modePrefix = commentsOnly
+    ? `REVIEW MODE: COMMENTS ONLY (NO STUDY GUIDE OR READING TOUR). ` +
       `Do NOT generate \`cliffsNotes\` (\`tldr\`, \`whatAndWhy\`, \`architectureDiagram\`, \`keySymbols\`, \`designTradeoffs\`) and do NOT generate reading tour \`chapters\` or \`stops\`. ` +
-      `Focus 100% on producing verified review comments (\`findings\`) and triaging \`existingCommentAssessments\` to send to GitHub or fix with the agent. `;
-    if (level === 'low') {
-      return (
-        modePrefix +
-        `EFFORT LEVEL: LOW (FAST SINGLE-PASS — NO SUBAGENTS). ` +
-        `Do NOT call \`invoke_subagent\`. Read \`pr_context.json\` and \`pr.diff\` directly in a single fast pass, produce only high-confidence review comments (\`findings\`) and \`existingCommentAssessments\`, and immediately run \`publish_review_session.py --comments-only\`.` +
-        noChatQuestionsRule
-      );
-    }
-    if (level === 'high') {
-      return (
-        modePrefix +
-        `EFFORT LEVEL: HIGH (DEEP ${totalHighLenses}-LENS COMMENTS-ONLY PIPELINE). ` +
-        `Spawn \`review-bug-hunter\`, \`review-test-critic\`, and \`review-architect\` (instructing \`review-architect\` to skip the reading tour/mental model and only return API/design findings)${customListText} in parallel with \`Model: "inherit"\`, filter false positives, and run \`publish_review_session.py --comments-only\`.` +
-        noChatQuestionsRule
-      );
-    }
+      `Focus 100% on producing verified review comments (\`findings\`) and triaging \`existingCommentAssessments\` to send to GitHub or fix with the agent. `
+    : '';
+  const publishCmd = commentsOnly ? '`publish_review_session.py --comments-only`' : '`publish_review_session.py`';
+
+  if (lensNames.length === 0) {
     return (
       modePrefix +
-      `EFFORT LEVEL: MEDIUM (BALANCED COMMENTS-ONLY — ${totalMed} FAST FLASH SUBAGENTS). ` +
-      `Spawn \`review-bug-hunter\` and \`review-architect\` (instructing \`review-architect\` to skip the reading tour/mental model and only return API/design findings)${customListText} in a single parallel \`invoke_subagent\` call using \`Model: "flash"\`, filter their findings directly, and immediately run \`publish_review_session.py --comments-only\`.` +
-      noChatQuestionsRule
-    );
-  }
-  if (level === 'low') {
-    return (
-      `EFFORT LEVEL: LOW (FAST SINGLE-PASS — NO SUBAGENTS). ` +
-      `Do NOT call \`invoke_subagent\`. Read \`pr_context.json\` and \`pr.diff\` directly in a single fast pass, synthesize the concise CliffsNotes Study Guide and Guided Tour plus only obvious high-confidence bugs/blockers, and immediately run \`publish_review_session.py\`.` +
+      `EFFORT LEVEL: ${level.toUpperCase()} (FAST SINGLE-PASS — NO SUBAGENTS). ` +
+      `Do NOT call \`invoke_subagent\`. Read \`pr_context.json\` and \`pr.diff\` directly in a single fast pass, ` +
+      (commentsOnly
+        ? `produce only high-confidence review comments (\`findings\`) and \`existingCommentAssessments\``
+        : `synthesize the concise CliffsNotes Study Guide and Guided Tour plus only obvious high-confidence bugs/blockers`) +
+      `, and immediately run ${publishCmd}.` +
       noChatQuestionsRule
     );
   }
   if (level === 'high') {
     return (
-      `EFFORT LEVEL: HIGH (DEEP ${totalHighLenses}-LENS PIPELINE). ` +
-      `Run the full parallel ${totalHighWave}-subagent wave (\`review-architect\`, \`review-bug-hunter\`, \`review-test-critic\`${customListText} with \`Model: "inherit"\`) followed by thorough false-positive filtering before running \`publish_review_session.py\`.` +
+      modePrefix +
+      `EFFORT LEVEL: HIGH (DEEP MULTI-LENS PIPELINE — ${lensNames.length} CONFIGURED LENSES). ` +
+      `Spawn ${lensList}${architectNote} in a single parallel \`invoke_subagent\` call with \`Model: "inherit"\`, then do thorough false-positive filtering (merging duplicate findings across lenses) before running ${publishCmd}.` +
+      lensRule +
       noChatQuestionsRule
     );
   }
   return (
-    `EFFORT LEVEL: MEDIUM (BALANCED — ${totalMed} FAST FLASH SUBAGENTS). ` +
-    `Spawn \`review-architect\` and \`review-bug-hunter\`${customListText} in a single parallel \`invoke_subagent\` call using \`Model: "flash"\` (do NOT spawn \`review-test-critic\` or a second sequential \`review-advocate\` wave), filter their findings directly, and immediately run \`publish_review_session.py\`.` +
+    modePrefix +
+    `EFFORT LEVEL: ${level.toUpperCase()} (BALANCED — ${lensNames.length} CONFIGURED FAST FLASH LENSES). ` +
+    `Spawn ${lensList}${architectNote} in a single parallel \`invoke_subagent\` call using \`Model: "flash"\` (do NOT spawn a second sequential \`review-advocate\` wave), filter their findings directly, and immediately run ${publishCmd}.` +
+    lensRule +
     noChatQuestionsRule
   );
 }
@@ -2374,10 +2353,19 @@ class CommentsTreeProvider {
             ? `📌 Top-Level • ${path.basename(t.targetFile)}`
             : '📌 Top-Level PR Comment'
           : `${path.basename(t.path || '')}:L${t.startLine || 1}`;
+        const hasSolOpts =
+          isOwned && !isFixed && Array.isArray(t.solutionOptions) && t.solutionOptions.length >= 2;
+        const solDescSuffix = hasSolOpts
+          ? t.selectedSolution
+            ? ' • 🧭 Solution ✓'
+            : ` • 🧭 ${t.solutionOptions.length} options`
+          : isOwned && !isFixed && t.selectedSolution
+          ? ' • 🧭 Solution ✓'
+          : '';
         item.description =
-          isExistingGh && inferredAuthor
+          (isExistingGh && inferredAuthor
             ? `@${inferredAuthor.replace(/^@/, '')} • ${locStr}`
-            : locStr;
+            : locStr) + solDescSuffix;
         item.contextValue = isFixed
           ? 'thread-fixed'
           : t.status === 'uncertain'
@@ -2401,6 +2389,22 @@ class CommentsTreeProvider {
               t.targetFile ? ` (Untouched file: \`${t.targetFile}\`)` : ''
             }\n\n`
           : `**File**: \`${t.path}:L${t.startLine}-${t.endLine || t.startLine}\`\n\n`;
+        const solTooltipMd = hasSolOpts
+          ? `**🧭 Possible Solutions (Select How to Solve)**:\n` +
+            t.solutionOptions
+              .map((opt) => {
+                const isSel = Boolean(t.selectedSolutionId && t.selectedSolutionId === opt.id);
+                const descPart = opt.description ? ` — ${opt.description}` : '';
+                return `- ${isSel ? '✅' : '🔘'} **${opt.label || ''}**${descPart}`;
+              })
+              .join('\n') +
+            (t.selectedSolution && t.selectedSolutionId === 'custom'
+              ? `\n- ✅ **Custom approach**: ${t.selectedSolution}`
+              : '') +
+            '\n\n'
+          : isOwned && !isFixed && t.selectedSolution
+          ? `**✅ Selected Solution**: ${t.selectedSolution}\n\n`
+          : '';
         const tip = new vscode.MarkdownString(
           `### ${prefix} ${t.title || 'Comment'}\n` +
             fileHeaderMd +
@@ -2414,6 +2418,7 @@ class CommentsTreeProvider {
               ? `**🤔 Preference Question**: *${t.uncertaintyQuestion}*\n\n`
               : '') +
             (!isExistingGh && t.whyItMatters ? `*CliffsNotes Context*: ${t.whyItMatters}\n\n` : '') +
+            solTooltipMd +
             `**Comment**:\n> ${t.draftComment || ''}\n\n` +
             (!isFixed ? `*Check the box to queue this comment for Quasar to fix in your branch.*` : '')
         );
@@ -2473,13 +2478,47 @@ class ChecksTreeProvider {
       };
       children.push(addAgentItem);
 
-      const agents = discoverInstalledReviewAgents();
+      const configureLensesItem = new vscode.TreeItem(
+        'Configure Review Lenses per Effort Level...',
+        vscode.TreeItemCollapsibleState.None
+      );
+      configureLensesItem.iconPath = new vscode.ThemeIcon('settings-gear');
+      const lensSummary = resolveReviewLenses();
+      configureLensesItem.description = EFFORT_LEVELS.map(
+        (lv) => `${lv}: ${getLensNamesForEffort(lv, lensSummary).length}`
+      ).join(' • ');
+      configureLensesItem.tooltip = new vscode.MarkdownString(
+        'Choose which `review-*` lenses run at **low**, **medium**, and **high** effort.\n\n' +
+          EFFORT_LEVELS.map(
+            (lv) =>
+              `- **${lv}**: ${
+                getLensNamesForEffort(lv, lensSummary)
+                  .map((n) => `\`${n}\``)
+                  .join(', ') || '_single pass, no subagents_'
+              }`
+          ).join('\n')
+      );
+      configureLensesItem.command = {
+        command: 'quasar.configureEffortLenses',
+        title: 'Configure Review Lenses per Effort Level',
+      };
+      children.push(configureLensesItem);
+
+      const agents = resolveReviewLenses();
       for (const ag of agents) {
         const agItem = new vscode.TreeItem(
           `${ag.isCustom ? '🧩' : '🤖'} ${ag.name}`,
           vscode.TreeItemCollapsibleState.None
         );
-        agItem.description = `${ag.isCustom ? 'Custom' : 'Built-in'} • ${ag.description || ag.scopeLabel}`;
+        const effortBadge =
+          ag.role !== 'lens'
+            ? 'helper'
+            : ag.efforts.length > 0
+            ? ag.efforts.join('/')
+            : 'opt-in (off)';
+        agItem.description = `${ag.isCustom ? 'Custom' : 'Built-in'} • ${effortBadge}${
+          ag.isOverridden ? ' ✎' : ''
+        } • ${ag.description || ag.scopeLabel}`;
         agItem.tooltip = new vscode.MarkdownString(
           `### ${ag.isCustom ? '🧩 Custom' : '🤖 Built-in'} Review Subagent: \`${ag.name}\`\n\n` +
             `${ag.description ? `${ag.description}\n\n` : ''}` +
@@ -2697,7 +2736,68 @@ const BUILTIN_REVIEW_AGENT_NAMES = new Set([
   'review-bug-hunter',
   'review-test-critic',
   'review-advocate',
+  'review-security',
+  'review-performance',
+  'review-readability',
+  'review-docs',
+  'review-concurrency',
+  'review-compat',
+  'review-accessibility',
+  'review-error-handling',
+  'review-dependencies',
+  'review-newcomer',
 ]);
+
+const EFFORT_LEVELS = ['low', 'medium', 'high'];
+const CUSTOM_LENS_DEFAULT_EFFORTS = ['medium', 'high'];
+// Fallbacks when a built-in AGENT.md predates the quasarEfforts frontmatter (kept in sync with review_lenses.py).
+const BUILTIN_LENS_FALLBACKS = {
+  'review-advocate': { role: 'filter', efforts: [] },
+  'review-architect': { efforts: ['medium', 'high'] },
+  'review-bug-hunter': { efforts: ['medium', 'high'] },
+  'review-test-critic': { efforts: ['high'] },
+  'review-security': { efforts: ['medium', 'high'] },
+  'review-newcomer': { efforts: [] },
+};
+
+function parseInlineYamlList(raw) {
+  let s = String(raw || '').trim();
+  if (s.startsWith('[') && s.endsWith(']')) s = s.slice(1, -1);
+  return s
+    .split(',')
+    .map((p) => p.trim().replace(/^['"]|['"]$/g, ''))
+    .filter(Boolean);
+}
+
+/**
+ * Annotates discovered agents with their effective effort levels:
+ * user override (preferences.json `lensEfforts`) > AGENT.md `quasarEfforts` > built-in fallback > custom default.
+ */
+function resolveReviewLenses(agents = null, prefs = null) {
+  const list = agents || discoverInstalledReviewAgents();
+  const overrides = ((prefs || loadReviewerPreferences()) || {}).lensEfforts || {};
+  return list.map((ag) => {
+    const a = { ...ag };
+    if (a.role !== 'lens') {
+      a.efforts = [];
+      a.isOverridden = false;
+    } else if (Array.isArray(overrides[a.name])) {
+      a.efforts = overrides[a.name].filter((lv) => EFFORT_LEVELS.includes(lv));
+      a.isOverridden = true;
+    } else {
+      a.efforts = [...(a.defaultEfforts || [])];
+      a.isOverridden = false;
+    }
+    return a;
+  });
+}
+
+function getLensNamesForEffort(level, resolved = null) {
+  const lv = normalizeEffortLevel(level);
+  return (resolved || resolveReviewLenses())
+    .filter((a) => a.role === 'lens' && (a.efforts || []).includes(lv))
+    .map((a) => a.name);
+}
 
 function copyDirRecursiveSync(srcDir, destDir, overwrite = false) {
   if (!fs.existsSync(srcDir)) return;
@@ -2796,8 +2896,11 @@ function discoverInstalledReviewAgents() {
 
       let name = entry;
       let description = '';
+      let fmRole = '';
+      let fmAppliesWhen = '';
+      let fmEfforts = null;
       try {
-        const head = fs.readFileSync(mdPath, 'utf8').slice(0, 4096);
+        const head = fs.readFileSync(mdPath, 'utf8').slice(0, 8192);
         const fmMatch = head.match(/^---\s*\n([\s\S]*?)\n---/);
         if (fmMatch) {
           const fm = fmMatch[1];
@@ -2809,11 +2912,41 @@ function discoverInstalledReviewAgents() {
           if (mDesc) {
             description = mDesc[1].trim().replace(/^['"]|['"]$/g, '');
           }
+          const mRole = fm.match(/^quasarRole:\s*([^\n]+)/m);
+          if (mRole) fmRole = mRole[1].trim().replace(/^['"]|['"]$/g, '').toLowerCase();
+          const mApplies = fm.match(/^quasarAppliesWhen:\s*([^\n]+)/m);
+          if (mApplies) fmAppliesWhen = mApplies[1].trim().replace(/^['"]|['"]$/g, '');
+          const mEff = fm.match(/^quasarEfforts:[ \t]*([^\n]*)/m);
+          if (mEff) {
+            let levels = parseInlineYamlList(mEff[1]);
+            if (!mEff[1].trim()) {
+              const block = fm.match(/^quasarEfforts:\s*\n((?:\s+-\s*[^\n]+\n?)+)/m);
+              levels = block
+                ? block[1]
+                    .split('\n')
+                    .map((l) => l.trim().replace(/^-\s*/, '').replace(/^['"]|['"]$/g, ''))
+                    .filter(Boolean)
+                : [];
+            }
+            fmEfforts = levels.map((l) => l.toLowerCase()).filter((l) => EFFORT_LEVELS.includes(l));
+          }
         }
       } catch (_) {}
 
       if (!name.startsWith('review-') && r.scope !== 'plugin') continue;
       if (!seen.has(name)) {
+        const isCustom = !BUILTIN_REVIEW_AGENT_NAMES.has(name);
+        const fb = !isCustom ? BUILTIN_LENS_FALLBACKS[name] || {} : {};
+        const role = fmRole || fb.role || 'lens';
+        const defaultEfforts = fmEfforts
+          ? fmEfforts
+          : Array.isArray(fb.efforts)
+          ? [...fb.efforts]
+          : !isCustom
+          ? ['high']
+          : role === 'lens'
+          ? [...CUSTOM_LENS_DEFAULT_EFFORTS]
+          : [];
         seen.set(name, {
           name,
           description,
@@ -2821,7 +2954,10 @@ function discoverInstalledReviewAgents() {
           dirPath: agentDir,
           scope: r.scope,
           scopeLabel: r.scopeLabel,
-          isCustom: !BUILTIN_REVIEW_AGENT_NAMES.has(name),
+          isCustom,
+          role,
+          appliesWhen: fmAppliesWhen,
+          defaultEfforts,
         });
       }
     }
@@ -2974,6 +3110,7 @@ function activate(context) {
     activeCommentThreads.clear();
 
     if (!session || !Array.isArray(session.threads)) return;
+    const isOwned = !session.pr || session.pr.isOwnedByUser !== false;
 
     for (const t of session.threads) {
       if (t.status === 'dismissed' || !t.path) continue;
@@ -3007,6 +3144,48 @@ function activate(context) {
       const fixStateTag =
         t.status === 'fixed' ? 'fix_done' : isQueuedForFix ? 'fix_queued' : 'fix_unqueued';
       const cmdArg = encodeURIComponent(JSON.stringify({ threadId: t.id }));
+
+      const solOpts =
+        isOwned && t.status !== 'fixed' && Array.isArray(t.solutionOptions)
+          ? t.solutionOptions
+          : [];
+      const hasSolutionsTag = solOpts.length >= 2 ? ':has_solutions' : '';
+      let solutionOptionsMd = '';
+      if (solOpts.length >= 2 || (isOwned && t.status !== 'fixed' && t.selectedSolution)) {
+        const optLines = ['\n\n---\n🧭 **Choose How to Solve This:**'];
+        for (let i = 0; i < solOpts.length; i++) {
+          const opt = solOpts[i] || {};
+          const oid = String(opt.id || `opt-${i + 1}`);
+          const isSel = t.selectedSolutionId === oid;
+          const optArg = encodeURIComponent(JSON.stringify({ threadId: t.id, optionId: oid }));
+          const recBadge = opt.recommended ? ' *(Recommended)*' : '';
+          const descSuffix = opt.description ? ` — ${opt.description}` : '';
+          const labelText = String(opt.label || `Option ${i + 1}`).replace(/[\[\]]/g, '');
+          optLines.push(
+            isSel
+              ? `- [$(pass-filled) **${labelText}** ✓](command:quasar.selectSolutionOption?${optArg})${recBadge}${descSuffix}`
+              : `- [$(circle-large-outline) ${labelText}](command:quasar.selectSolutionOption?${optArg})${recBadge}${descSuffix}`
+          );
+        }
+        if (t.selectedSolution && t.selectedSolutionId === 'custom') {
+          optLines.push(`- ✅ **Custom approach:** ${t.selectedSolution}`);
+        }
+        const customArg = encodeURIComponent(
+          JSON.stringify({ threadId: t.id, optionId: 'custom' })
+        );
+        const clearArg = encodeURIComponent(JSON.stringify({ threadId: t.id, optionId: 'clear' }));
+        const extraLinks = [
+          `[$(edit) Custom approach...](command:quasar.selectSolutionOption?${customArg})`,
+        ];
+        if (t.selectedSolution) {
+          extraLinks.push(
+            `[$(close) Clear selection](command:quasar.selectSolutionOption?${clearArg})`
+          );
+        }
+        optLines.push(`\n${extraLinks.join('  •  ')}`);
+        solutionOptionsMd = optLines.join('\n');
+      }
+
       const fixActionBarMd =
         t.status === 'fixed'
           ? `\n\n---\n✅ **Fixed in Working Tree**${t.fixedSummary ? ` — ${t.fixedSummary}` : ''}`
@@ -3017,7 +3196,8 @@ function activate(context) {
           : `\n\n---\n[$(tools) Queue for Agent Fix](command:quasar.queueForFix?${cmdArg})  •  [$(wrench) Fix Now](command:quasar.fixSingleComment?${cmdArg})`;
 
       const comments = rawMessages.map((m, idx) => {
-        const bodyText = (m.body || '') + (idx === 0 ? fixActionBarMd : '');
+        const bodyText =
+          (m.body || '') + (idx === 0 ? solutionOptionsMd + fixActionBarMd : '');
         const md = new vscode.MarkdownString(bodyText, true);
         md.isTrusted = true;
         return {
@@ -3043,17 +3223,25 @@ function activate(context) {
         : isQueuedForFix
         ? ' [🔧 QUEUED FOR FIX ✓]'
         : '';
+      const solutionSuffix =
+        isOwned && t.status !== 'fixed'
+          ? t.selectedSolution
+            ? ' [🧭 SOLUTION ✓]'
+            : solOpts.length >= 2
+            ? ` [🧭 ${solOpts.length} OPTIONS]`
+            : ''
+          : '';
 
       if (t.status === 'fixed') {
         thread.contextValue = `fixed:${fixStateTag}`;
         thread.label = `✅ Fixed in Working Tree — ${t.title || ''}`;
         thread.collapsibleState = vscode.CommentThreadCollapsibleState.Collapsed;
       } else if (t.status === 'uncertain') {
-        thread.contextValue = `uncertain:${fixStateTag}`;
-        thread.label = `🤔 Flagged to Review (Calibrate Preference)${queuedSuffix} — ${t.title || ''}`;
+        thread.contextValue = `uncertain:${fixStateTag}${hasSolutionsTag}`;
+        thread.label = `🤔 Flagged to Review (Calibrate Preference)${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
         thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
       } else if (t.status === 'staged') {
-        thread.contextValue = `staged:${fixStateTag}`;
+        thread.contextValue = `staged:${fixStateTag}${hasSolutionsTag}`;
         const sev = (t.severity || '').toUpperCase();
         const badge = sev.includes('BLOCK')
           ? '🔴 Blocking'
@@ -3062,30 +3250,30 @@ function activate(context) {
           : sev.includes('NIT')
           ? '🟢 Nit'
           : '💬 Review';
-        thread.label = `✅ Staged for GitHub Review (${badge})${queuedSuffix} — ${t.title || ''}`;
+        thread.label = `✅ Staged for GitHub Review (${badge})${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
         thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
       } else if (t.kind === 'ai_candidate') {
-        thread.contextValue = `candidate:${fixStateTag}`;
+        thread.contextValue = `candidate:${fixStateTag}${hasSolutionsTag}`;
         const sev = (t.severity || '').toUpperCase();
         const badge = sev.includes('BLOCK')
           ? '🔴 Blocking'
           : sev.includes('DESIGN')
           ? '🟡 Design'
           : '🟢 Nit';
-        thread.label = `${badge} Draft (Unstaged)${queuedSuffix} — ${t.title || ''}`;
+        thread.label = `${badge} Draft (Unstaged)${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
         thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
       } else if (t.kind === 'user_qa') {
-        thread.contextValue = `qa:${fixStateTag}`;
-        thread.label = `💬 Quasar Q&A${queuedSuffix} — ${t.title || ''}`;
+        thread.contextValue = `qa:${fixStateTag}${hasSolutionsTag}`;
+        thread.label = `💬 Quasar Q&A${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
         thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
       } else {
-        thread.contextValue = `existing:${fixStateTag}`;
+        thread.contextValue = `existing:${fixStateTag}${hasSolutionsTag}`;
         const triageHeader = ghTriage ? ghTriage.triageBadge : '👀 Existing GitHub Comment';
         const cleanThreadTitle = String(t.title || '').replace(
           /^(?:🛠️|⚠️|✅|💬|❓|👀|🤔|🔴|🟡|🟢)\s*\[[^\]]+\]\s*/,
           ''
         );
-        thread.label = `${triageHeader}${queuedSuffix} — ${cleanThreadTitle}`;
+        thread.label = `${triageHeader}${queuedSuffix}${solutionSuffix} — ${cleanThreadTitle}`;
         thread.collapsibleState =
           ghTriage && ghTriage.triageStatus === 'addressed_or_refuted'
             ? vscode.CommentThreadCollapsibleState.Collapsed
@@ -3560,6 +3748,56 @@ function activate(context) {
                 ? `<div class="q-stop-meta" style="margin-top:6px;color:var(--q-warn);"><strong>🤔 Flagged Question:</strong> ${formatInlineMd(
                     t.uncertaintyQuestion
                   )}</div>`
+                : ''
+            }
+            ${
+              (!session.pr || session.pr.isOwnedByUser !== false) &&
+              t.status !== 'fixed' &&
+              ((Array.isArray(t.solutionOptions) && t.solutionOptions.length >= 2) ||
+                t.selectedSolution)
+                ? `<div class="q-stop-meta" style="margin-top:8px;padding-top:6px;border-top:1px dashed var(--q-border);">
+                    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px;">
+                      <strong>🧭 Choose How to Solve This:</strong>
+                      ${
+                        t.selectedSolution
+                          ? `<a href="#" class="q-stop-link" style="font-size:11px;font-weight:400;" data-act="selectSolutionOption" data-thread-id="${escapeHtmlText(
+                              t.id
+                            )}" data-option-id="clear">Clear selection</a>`
+                          : ''
+                      }
+                    </div>
+                    <div style="display:flex;flex-direction:column;gap:4px;">
+                      ${(t.solutionOptions || [])
+                        .map((opt, idx) => {
+                          const oid = String(opt.id || `opt-${idx + 1}`);
+                          const isSel = t.selectedSolutionId === oid;
+                          return `<button type="button" class="q-btn q-btn-sm ${
+                            isSel ? 'q-btn-primary' : ''
+                          }" style="text-align:left;justify-content:flex-start;white-space:normal;height:auto;padding:5px 8px;" data-act="selectSolutionOption" data-thread-id="${escapeHtmlText(
+                            t.id
+                          )}" data-option-id="${escapeHtmlText(oid)}">
+                            <span>${isSel ? '✅ ' : '○ '}<strong>${escapeHtmlText(
+                            opt.label || `Option ${idx + 1}`
+                          )}</strong>${opt.recommended ? ' <em>(Recommended)</em>' : ''}${
+                            opt.description ? ` — ${escapeHtmlText(opt.description)}` : ''
+                          }</span>
+                          </button>`;
+                        })
+                        .join('')}
+                      ${
+                        t.selectedSolution && t.selectedSolutionId === 'custom'
+                          ? `<div style="padding:4px 8px;border-radius:4px;border:1px solid var(--q-accent);">✅ <strong>Custom approach:</strong> ${escapeHtmlText(
+                              t.selectedSolution
+                            )}</div>`
+                          : ''
+                      }
+                      <div>
+                        <button type="button" class="q-btn q-btn-sm" data-act="selectSolutionOption" data-thread-id="${escapeHtmlText(
+                          t.id
+                        )}" data-option-id="custom">✏️ Custom Approach...</button>
+                      </div>
+                    </div>
+                  </div>`
                 : ''
             }
             ${
@@ -4264,6 +4502,12 @@ function activate(context) {
           vscode.postMessage({ type: 'dismissThread', threadId: el.getAttribute('data-thread-id') });
         } else if (act === 'calibrateThread') {
           vscode.postMessage({ type: 'calibrateThread', threadId: el.getAttribute('data-thread-id') });
+        } else if (act === 'selectSolutionOption') {
+          vscode.postMessage({
+            type: 'selectSolutionOption',
+            threadId: el.getAttribute('data-thread-id'),
+            optionId: el.getAttribute('data-option-id'),
+          });
         } else if (act === 'openRawMarkdown') {
           vscode.postMessage({ type: 'openRawMarkdown' });
         } else if (act === 'runCommand') {
@@ -4443,6 +4687,11 @@ function activate(context) {
             threadData: t,
           });
         }
+      } else if (msg.type === 'selectSolutionOption') {
+        await vscode.commands.executeCommand('quasar.selectSolutionOption', {
+          threadId: msg.threadId,
+          optionId: msg.optionId,
+        });
       } else if (msg.type === 'openRawMarkdown') {
         const rawMd = getWindowCliffsNotesMdPath();
         if (fs.existsSync(rawMd)) {
@@ -4565,6 +4814,13 @@ function activate(context) {
 
   function refreshAllUI(autoOpenIfNew = false) {
     const session = loadActiveSession();
+    vscode.commands
+      .executeCommand(
+        'setContext',
+        'quasar.isOwnedReview',
+        Boolean(session && (!session.pr || session.pr.isOwnedByUser !== false))
+      )
+      .catch(() => {});
     cliffsProvider.refresh();
     commentsProvider.refresh();
     checksProvider.refresh();
@@ -6623,6 +6879,11 @@ function activate(context) {
           action: 'manage-agents',
         },
         {
+          label: '$(settings-gear) Configure Review Lenses per Effort Level...',
+          description: 'Choose which review-* lenses run at low / medium / high effort',
+          action: 'configure-lenses',
+        },
+        {
           label: '$(sparkle) Import Premade Review Skill as Starting Point...',
           description:
             seedSkills.length > 0
@@ -6678,6 +6939,8 @@ function activate(context) {
         await vscode.commands.executeCommand('quasar.calibrateFindingPreference');
       } else if (picked.action === 'manage-agents') {
         await vscode.commands.executeCommand('quasar.manageReviewAgents');
+      } else if (picked.action === 'configure-lenses') {
+        await vscode.commands.executeCommand('quasar.configureEffortLenses');
       } else if (picked.action === 'import-skill') {
         await vscode.commands.executeCommand('quasar.importReviewSkill');
       } else if (picked.action === 'open-guide') {
@@ -6786,6 +7049,117 @@ function activate(context) {
         await runManagePreferences(['--delete-rule-id', toDelete.ruleId]);
         refreshAllUI(false);
         vscode.window.showInformationMessage('Deleted preference rule.');
+      }
+    })
+  );
+
+  // 8c-2. Configure which review lenses run at each effort level
+  function runReviewLensesScript(args) {
+    return new Promise((resolve) => {
+      const scriptPath = path.join(PLUGIN_SCRIPTS_DIR, 'review_lenses.py');
+      const wsRoot = getWindowWorkspaceRoot();
+      const fullArgs = [scriptPath, ...args];
+      if (wsRoot && wsRoot !== EMPTY_WINDOW_FALLBACK_ROOT) fullArgs.push('--workspace-dir', wsRoot);
+      execFile('python3', fullArgs, { timeout: 15000, env: getQuasarScriptEnv() }, (err, stdout, stderr) => {
+        let parsed = null;
+        try {
+          parsed = JSON.parse(stdout || '{}');
+        } catch (_) {}
+        if (err || !parsed || !parsed.ok) {
+          resolve({ ok: false, error: (parsed && parsed.error) || stderr || (err && err.message) });
+        } else {
+          resolve(parsed);
+        }
+      });
+    });
+  }
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.configureEffortLenses', async (arg) => {
+      ensureQuasarPluginBootstrapped();
+      while (true) {
+        const resolved = resolveReviewLenses();
+        const lenses = resolved.filter((a) => a.role === 'lens');
+        let level = arg && typeof arg === 'object' && arg.level ? normalizeEffortLevel(arg.level) : null;
+        arg = null;
+        if (!level) {
+          const levelItems = EFFORT_LEVELS.map((lv) => {
+            const names = getLensNamesForEffort(lv, resolved);
+            const spec = getEffortSpec(lv);
+            return {
+              label: `$(${spec.icon}) ${spec.shortLabel || lv}`,
+              description: names.length ? `${names.length} lens(es)` : 'single pass — no subagents',
+              detail: names.join(', ') || undefined,
+              level: lv,
+            };
+          });
+          const anyOverrides = lenses.some((a) => a.isOverridden);
+          if (anyOverrides) {
+            levelItems.push({
+              label: '$(discard) Reset All Lenses to Defaults',
+              description: 'Use each lens AGENT.md default effort levels',
+              level: '__reset__',
+            });
+          }
+          const pickedLevel = await vscode.window.showQuickPick(levelItems, {
+            title: '🧩 Quasar: Configure Review Lenses per Effort Level',
+            placeHolder: 'Pick an effort level to choose which review lenses run at it',
+          });
+          if (!pickedLevel) return;
+          if (pickedLevel.level === '__reset__') {
+            const res = await runReviewLensesScript(['--reset']);
+            if (!res.ok) {
+              vscode.window.showErrorMessage(`Failed to reset lenses: ${res.error || 'unknown error'}`);
+              return;
+            }
+            refreshAllUI(false);
+            vscode.window.setStatusBarMessage('🧩 Review lenses reset to defaults', 3500);
+            continue;
+          }
+          level = pickedLevel.level;
+        }
+
+        const current = new Set(getLensNamesForEffort(level, resolved));
+        const lensItems = lenses.map((a) => ({
+          label: `${a.isCustom ? '🧩' : '🤖'} ${a.name}`,
+          description: [
+            a.defaultEfforts.includes(level) ? 'default ✓' : '',
+            a.isCustom ? 'custom' : '',
+            a.efforts.length ? `runs at: ${a.efforts.join('/')}` : 'opt-in',
+          ]
+            .filter(Boolean)
+            .join(' • '),
+          detail: [a.description, a.appliesWhen ? `Applies when: ${a.appliesWhen}` : '']
+            .filter(Boolean)
+            .join('  —  '),
+          picked: current.has(a.name),
+          lensName: a.name,
+        }));
+        const chosen = await vscode.window.showQuickPick(lensItems, {
+          canPickMany: true,
+          title: `🧩 Review Lenses for "${level}" Effort (${current.size} enabled)`,
+          placeHolder:
+            level === 'low'
+              ? 'Leave empty for a fast single-pass review with no subagents'
+              : 'Check the lenses to run at this effort level (gated lenses still skip diffs they do not apply to)',
+          matchOnDetail: true,
+        });
+        if (!chosen) return;
+        const res = await runReviewLensesScript([
+          '--set-effort-lenses',
+          level,
+          '--lenses',
+          chosen.map((c) => c.lensName).join(','),
+        ]);
+        if (!res.ok) {
+          vscode.window.showErrorMessage(`Failed to save lens configuration: ${res.error || 'unknown error'}`);
+          return;
+        }
+        refreshAllUI(false);
+        vscode.window.setStatusBarMessage(
+          `🧩 ${level} effort now runs ${chosen.length} lens(es)`,
+          3500
+        );
       }
     })
   );
@@ -7166,9 +7540,168 @@ function activate(context) {
     })
   );
 
+  function unwrapCommandArg(arg) {
+    return Array.isArray(arg) && arg.length > 0 ? arg[0] : arg;
+  }
+
+  async function promptForThreadSolutionChoice(thread, options = {}) {
+    const opts = Array.isArray(thread.solutionOptions) ? thread.solutionOptions : [];
+    const cleanTitle = String(thread.title || path.basename(thread.path || '')).replace(
+      /^(?:🛠️|⚠️|✅|💬|❓|👀|🤔|🔴|🟡|🟢)\s*\[[^\]]+\]\s*/,
+      ''
+    );
+    const items = opts.map((opt, idx) => {
+      const oid = String(opt.id || `opt-${idx + 1}`);
+      const isCurrent = thread.selectedSolutionId === oid;
+      const labelText = String(opt.label || `Option ${idx + 1}`);
+      const descText = String(opt.description || '');
+      const fullText =
+        labelText && descText ? `${labelText} — ${descText}` : labelText || descText;
+      return {
+        label: `${
+          isCurrent
+            ? '$(pass-filled) '
+            : opt.recommended
+            ? '$(star-full) '
+            : '$(circle-large-outline) '
+        }${labelText}`,
+        description: [
+          opt.recommended ? '(Recommended)' : '',
+          isCurrent ? '✓ Currently selected' : '',
+        ]
+          .filter(Boolean)
+          .join(' • '),
+        detail: descText || undefined,
+        optionId: oid,
+        solutionText: fullText,
+      };
+    });
+    items.push({
+      label: '$(edit) Custom approach...',
+      description:
+        thread.selectedSolutionId === 'custom'
+          ? '✓ Currently selected'
+          : 'Specify your own solution',
+      detail:
+        thread.selectedSolutionId === 'custom' && thread.selectedSolution
+          ? `Current: ${thread.selectedSolution}`
+          : 'Describe how you want Quasar to solve this comment',
+      optionId: 'custom',
+      solutionText: '',
+    });
+    if (options.allowClear && thread.selectedSolution) {
+      items.push({
+        label: '$(clear-all) Clear selected solution',
+        description: 'Clear saved choice',
+        optionId: 'clear',
+        solutionText: '',
+      });
+    }
+
+    const picked = await vscode.window.showQuickPick(items, {
+      title: `🧭 ${
+        options.stepLabel ? `${options.stepLabel}: ` : ''
+      }Choose How to Solve "${cleanTitle}" (${path.basename(thread.path || '')}:L${
+        thread.startLine || 1
+      })`,
+      placeHolder:
+        opts.length >= 2
+          ? 'Select one of the possible solutions below, or choose Custom approach...'
+          : 'Choose or enter how you want Quasar to solve this comment',
+      ignoreFocusOut: true,
+    });
+    if (!picked) return undefined;
+    if (picked.optionId === 'custom') {
+      const customVal = await vscode.window.showInputBox({
+        title: `🧭 Custom Solution for "${cleanTitle}"`,
+        prompt: 'Describe how you want Quasar to solve this comment',
+        value: thread.selectedSolutionId === 'custom' ? thread.selectedSolution || '' : '',
+        placeHolder: 'e.g. "Return an empty list instead of throwing, and add a unit test"',
+        ignoreFocusOut: true,
+      });
+      if (!customVal || !customVal.trim()) return undefined;
+      return { id: 'custom', text: customVal.trim() };
+    }
+    if (picked.optionId === 'clear') {
+      return { id: 'clear', text: '' };
+    }
+    return { id: picked.optionId, text: picked.solutionText };
+  }
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.selectSolutionOption', async (rawArg) => {
+      const arg = unwrapCommandArg(rawArg);
+      const session = loadActiveSession();
+      const id = resolveThreadId(arg);
+      if (!session || !id) return;
+      const thread = (session.threads || []).find((t) => String(t.id) === String(id));
+      if (!thread) return;
+
+      const explicitOptId =
+        arg && typeof arg === 'object' && arg.optionId ? String(arg.optionId) : '';
+      let choice = undefined;
+
+      if (explicitOptId === 'clear') {
+        choice = { id: 'clear', text: '' };
+      } else if (explicitOptId === 'custom') {
+        const cleanTitle = String(thread.title || path.basename(thread.path || '')).replace(
+          /^(?:🛠️|⚠️|✅|💬|❓|👀|🤔|🔴|🟡|🟢)\s*\[[^\]]+\]\s*/,
+          ''
+        );
+        const customVal = await vscode.window.showInputBox({
+          title: `🧭 Custom Solution for "${cleanTitle}"`,
+          prompt: 'Describe how you want Quasar to solve this comment',
+          value: thread.selectedSolutionId === 'custom' ? thread.selectedSolution || '' : '',
+          placeHolder: 'e.g. "Return an empty list instead of throwing, and add a unit test"',
+          ignoreFocusOut: true,
+        });
+        if (!customVal || !customVal.trim()) return;
+        choice = { id: 'custom', text: customVal.trim() };
+      } else if (explicitOptId) {
+        const matched = (thread.solutionOptions || []).find(
+          (o, idx) => String((o && o.id) || `opt-${idx + 1}`) === explicitOptId
+        );
+        if (matched) {
+          const labelText = String(matched.label || '');
+          const descText = String(matched.description || '');
+          choice = {
+            id: explicitOptId,
+            text: labelText && descText ? `${labelText} — ${descText}` : labelText || descText,
+          };
+        }
+      }
+
+      if (!choice) {
+        choice = await promptForThreadSolutionChoice(thread, { allowClear: true });
+      }
+      if (!choice) return;
+
+      const cmdArgs = [
+        '--select-solution',
+        '--thread-id',
+        String(thread.id),
+        '--solution-id',
+        choice.id,
+        '--solution-text',
+        choice.text || '',
+      ];
+      if (choice.id === 'custom' && choice.text) {
+        cmdArgs.push('--queue');
+      }
+      await runManageFixes(cmdArgs);
+      refreshAllUI(false);
+      vscode.window.setStatusBarMessage(
+        choice.id === 'clear'
+          ? 'Cleared selected solution option'
+          : `🧭 Selected solution: ${choice.text.slice(0, 80)}`,
+        4000
+      );
+    })
+  );
+
   context.subscriptions.push(
     vscode.commands.registerCommand('quasar.fixSingleComment', async (arg) => {
-      const id = resolveThreadId(arg);
+      const id = resolveThreadId(unwrapCommandArg(arg));
       if (!id) return;
       await vscode.commands.executeCommand('quasar.fixSelectedComments', {
         singleThreadId: String(id),
@@ -7183,6 +7716,7 @@ function activate(context) {
         vscode.window.showWarningMessage('No active Quasar review session found.');
         return;
       }
+      const isOwned = !session.pr || session.pr.isOwnedByUser !== false;
 
       const fixableThreads = (session.threads || []).filter(
         (t) => t.status !== 'dismissed' && t.status !== 'fixed'
@@ -7230,9 +7764,17 @@ function activate(context) {
             /^(?:🛠️|⚠️|✅|💬|❓|👀|🤔|🔴|🟡|🟢)\s*\[[^\]]+\]\s*/,
             ''
           );
+          const solCount =
+            isOwned && Array.isArray(t.solutionOptions) ? t.solutionOptions.length : 0;
+          const solTag =
+            isOwned && t.selectedSolution
+              ? ' • 🧭 Solution ✓'
+              : solCount >= 2
+              ? ` • 🧭 ${solCount} options`
+              : '';
           return {
             label: `${badge}: ${cleanQuickTitle}`,
-            description: `${t.path || ''}:L${t.startLine || 1}`,
+            description: `${t.path || ''}:L${t.startLine || 1}${solTag}`,
             detail: detailStr,
             picked: anyPreChecked ? Boolean(t.selectedForFix) : defaultRecommended,
             threadId: String(t.id),
@@ -7251,6 +7793,32 @@ function activate(context) {
         targetIds = selectedItems.map((item) => item.threadId);
       }
 
+      const solutionChoices = {};
+      if (isOwned) {
+        const unresolvedThreads = targetIds
+          .map((tid) => fixableThreads.find((t) => String(t.id) === String(tid)))
+          .filter(
+            (t) =>
+              t &&
+              Array.isArray(t.solutionOptions) &&
+              t.solutionOptions.length >= 2 &&
+              !t.selectedSolution
+          );
+        for (let i = 0; i < unresolvedThreads.length; i++) {
+          const t = unresolvedThreads[i];
+          const stepLabel =
+            unresolvedThreads.length > 1
+              ? `Solution ${i + 1}/${unresolvedThreads.length}`
+              : '';
+          const choice = await promptForThreadSolutionChoice(t, {
+            allowClear: false,
+            stepLabel,
+          });
+          if (!choice) return;
+          solutionChoices[String(t.id)] = choice;
+        }
+      }
+
       const customInstructions = await vscode.window.showInputBox({
         title: `🔧 Fix ${targetIds.length} Comment(s) with Quasar Agent`,
         prompt:
@@ -7261,6 +7829,9 @@ function activate(context) {
       if (customInstructions === undefined) return;
 
       const prepArgs = ['--prepare-fix', '--thread-ids', targetIds.join(',')];
+      if (Object.keys(solutionChoices).length > 0) {
+        prepArgs.push('--solution-choices-json', JSON.stringify(solutionChoices));
+      }
       if (customInstructions && customInstructions.trim()) {
         prepArgs.push('--instructions', customInstructions.trim());
       }

@@ -1648,9 +1648,98 @@ def sync_top_level_comments_file(session: Dict[str, Any]) -> None:
         pass
 
 
+def normalize_solution_options(raw_options: Any) -> List[Dict[str, Any]]:
+    """Normalizes candidate solution approaches for resolving a review comment.
+
+    Returns a list of 2+ structured option dicts (`id`, `label`, `description`, `recommended`),
+    or an empty list when fewer than 2 distinct valid solutions are provided.
+    """
+    if not isinstance(raw_options, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    seen_labels = set()
+    for item in raw_options:
+        if isinstance(item, str):
+            label = item.strip()
+            desc = ""
+            rec = label.lower().startswith("(recommended)")
+        elif isinstance(item, dict):
+            label = str(
+                item.get("label")
+                or item.get("title")
+                or item.get("summary")
+                or item.get("option")
+                or ""
+            ).strip()
+            desc = str(
+                item.get("description")
+                or item.get("detail")
+                or item.get("tradeoff")
+                or item.get("rationale")
+                or ""
+            ).strip()
+            rec = bool(item.get("recommended")) or label.lower().startswith("(recommended)")
+        else:
+            continue
+        if not label:
+            continue
+        dedupe_key = label.lower()
+        if dedupe_key in seen_labels:
+            continue
+        seen_labels.add(dedupe_key)
+        opt_idx = len(normalized) + 1
+        opt_id = (
+            str(item.get("id")).strip()
+            if isinstance(item, dict) and item.get("id")
+            else f"opt-{opt_idx}"
+        )
+        if rec and not label.lower().startswith("(recommended)"):
+            display_label = f"(Recommended) {label}"
+        else:
+            display_label = label
+        normalized.append(
+            {
+                "id": opt_id,
+                "label": display_label,
+                "description": desc,
+                "recommended": rec,
+            }
+        )
+    return normalized if len(normalized) >= 2 else []
+
+
+def format_solution_option_text(opt: Dict[str, Any]) -> str:
+    label = str(opt.get("label") or "").strip()
+    desc = str(opt.get("description") or "").strip()
+    return f"{label} — {desc}" if desc else label
+
+
+def _render_thread_solutions_markdown_lines(t: Dict[str, Any], indent: str = "  ") -> List[str]:
+    opts = t.get("solutionOptions") or []
+    selected = str(t.get("selectedSolution") or "").strip()
+    selected_id = str(t.get("selectedSolutionId") or "").strip()
+    if len(opts) < 2 and not selected:
+        return []
+    out: List[str] = []
+    if len(opts) >= 2:
+        out.append(f"{indent}- **🧭 Possible Solutions (Select How to Solve):**")
+        for opt in opts:
+            oid = str(opt.get("id") or "")
+            is_sel = bool(selected_id and oid == selected_id)
+            marker = "✅" if is_sel else "🔘"
+            desc_part = f" — {opt['description']}" if opt.get("description") else ""
+            out.append(f"{indent}  - {marker} **{opt.get('label', '')}**{desc_part}")
+        if selected and selected_id == "custom":
+            out.append(f"{indent}  - ✅ **Custom Approach**: {selected}")
+    elif selected:
+        out.append(f"{indent}- **✅ Selected Solution Approach**: {selected}")
+    return out
+
+
 def render_cliffs_notes_markdown(session: Dict[str, Any]) -> str:
     sync_top_level_comments_file(session)
     pr = session.get("pr") or {}
+    is_owned = pr.get("isOwnedByUser", True) is not False
     cn = session.get("cliffsNotes") or {}
     lines: List[str] = []
     pr_num = pr.get("number")
@@ -1806,6 +1895,8 @@ def render_cliffs_notes_markdown(session: Dict[str, Any]) -> str:
             lines.append(f"- **❓ #{idx} {loc_md} — {t.get('title', 'Uncertain Finding')}**")
             if t.get("uncertaintyQuestion"):
                 lines.append(f"  - *Question*: {t['uncertaintyQuestion']}")
+            if is_owned:
+                lines.extend(_render_thread_solutions_markdown_lines(t, "  "))
             lines.append("  <details>")
             lines.append("  <summary>Context & draft comment</summary>")
             lines.append("")
@@ -1852,6 +1943,8 @@ def render_cliffs_notes_markdown(session: Dict[str, Any]) -> str:
             lines.append(f"- **#{idx} [{badge}] {loc_md} — {t.get('title', 'Review Finding')}**")
             if why_short:
                 lines.append(f"  - {why_short}")
+            if is_owned:
+                lines.extend(_render_thread_solutions_markdown_lines(t, "  "))
             lines.append("  <details>")
             lines.append("  <summary>Draft comment & details</summary>")
             lines.append("")
@@ -1885,6 +1978,12 @@ def render_cliffs_notes_markdown(session: Dict[str, Any]) -> str:
                 if t.get("status") == "fixed"
                 else (t.get("triageSummary") or t.get("whyItMatters") or "")
             )
+            if is_owned and len(t.get("solutionOptions") or []) >= 2:
+                opts_str = "; ".join(str(o.get("label") or "") for o in (t.get("solutionOptions") or []))
+                if t.get("selectedSolution"):
+                    summary_note += f" (✅ Chosen: {t['selectedSolution']})"
+                else:
+                    summary_note += f" (🧭 Options: {opts_str})"
             title_clean = (t.get("title") or "GitHub Comment").replace("|", "\\|")
             summary_clean = summary_note.replace("|", "\\|").replace("\n", " ")
             lines.append(
@@ -3008,76 +3107,13 @@ def main() -> None:
 
     win_id, win_pid = resolve_target_window(state_dir)
 
-    def discover_review_agents() -> List[Dict[str, Any]]:
-        builtin_names = {
-            "review-architect",
-            "review-bug-hunter",
-            "review-test-critic",
-            "review-advocate",
-        }
-        plugin_agents_dir = os.path.normpath(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "agents")
-        )
-        candidate_roots = [
-            os.path.expanduser("~/.gemini/config/plugins/quasar/agents"),
-            plugin_agents_dir,
-            os.path.expanduser("~/.gemini/config/agents"),
-        ]
-        for extra_root in (repo_dir, ws_root):
-            if extra_root:
-                candidate_roots.append(os.path.join(extra_root, ".gemini", "agents"))
+    try:
+        from manage_preferences import load_preferences as _load_full_prefs
+        from review_lenses import build_lens_context
 
-        discovered: Dict[str, Dict[str, Any]] = {}
-        for root in candidate_roots:
-            if not root or not os.path.isdir(root):
-                continue
-            try:
-                entries = sorted(os.listdir(root))
-            except Exception:
-                continue
-            for entry in entries:
-                agent_dir = os.path.join(root, entry)
-                if not os.path.isdir(agent_dir):
-                    continue
-                md_file = None
-                for fname in ("AGENT.md", "agent.md"):
-                    cand = os.path.join(agent_dir, fname)
-                    if os.path.isfile(cand):
-                        md_file = cand
-                        break
-                if not md_file:
-                    continue
-                name = entry
-                desc = ""
-                try:
-                    with open(md_file, "r", encoding="utf-8") as af:
-                        head = af.read(4096)
-                    fm = re.match(r"^---\s*\n(.*?)\n---", head, re.DOTALL)
-                    if fm:
-                        fm_text = fm.group(1)
-                        m_name = re.search(r"^name:\s*([^\n]+)", fm_text, re.MULTILINE)
-                        if m_name:
-                            name = m_name.group(1).strip().strip('"').strip("'")
-                        m_desc = re.search(r"^description:\s*([^\n]+)", fm_text, re.MULTILINE)
-                        if m_desc:
-                            desc = m_desc.group(1).strip().strip('"').strip("'")
-                except Exception:
-                    pass
-                if not name.startswith("review-") and root not in (
-                    os.path.expanduser("~/.gemini/config/plugins/quasar/agents"),
-                    plugin_agents_dir,
-                ):
-                    continue
-                if name not in discovered:
-                    discovered[name] = {
-                        "name": name,
-                        "description": desc,
-                        "path": md_file,
-                        "isCustom": name not in builtin_names,
-                    }
-        return list(discovered.values())
-
-    available_review_agents = discover_review_agents()
+        lens_ctx = build_lens_context(_load_full_prefs(), effort_level, repo_dir, ws_root)
+    except Exception:
+        lens_ctx = {"available_review_agents": [], "effort_lenses": {}, "review_lenses": []}
 
     summary: Dict[str, Any] = {
         "mode": "pr" if pr_arg else "local_branch",
@@ -3093,7 +3129,9 @@ def main() -> None:
         "head_snapshot_root": head_root,
         "pr_metadata": metadata,
         "reviewer_preferences": prefs_for_context,
-        "available_review_agents": available_review_agents,
+        "available_review_agents": lens_ctx["available_review_agents"],
+        "effort_lenses": lens_ctx["effort_lenses"],
+        "review_lenses": lens_ctx["review_lenses"],
         "existing_comments": comments,
         "categorized_files": categorized_files,
     }

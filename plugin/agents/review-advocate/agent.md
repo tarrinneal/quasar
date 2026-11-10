@@ -1,6 +1,7 @@
 ---
 name: review-advocate
 description: "Advocate & False-Positive Filter for code reviews. Verifies candidate review findings against the actual codebase and existing PR comments, filtering out false positives and noise."
+quasarRole: filter
 tools:
   - view_file
   - grep_search
