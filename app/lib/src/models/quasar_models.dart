@@ -75,7 +75,7 @@ class SessionSummary {
       stopsRead: (json['stopsRead'] as num?)?.toInt() ?? 0,
       stopsTotal: (json['stopsTotal'] as num?)?.toInt() ?? 0,
       threadsCount: (json['threadsCount'] as num?)?.toInt() ?? 0,
-      effortLevel: '${json['effortLevel'] ?? 'medium'}',
+      effortLevel: '${json['effortLevel'] ?? 'high'}',
       commentsOnly: json['commentsOnly'] == true,
       isTutorial: json['isTutorial'] == true,
     );
@@ -188,7 +188,7 @@ class ReviewSession {
     return ReviewSession(
       sessionId: '${json['sessionId'] ?? ''}',
       pr: PrMetadata.fromJson(rawPr),
-      effortLevel: '${json['effortLevel'] ?? 'medium'}',
+      effortLevel: '${json['effortLevel'] ?? 'high'}',
       commentsOnly: json['commentsOnly'] == true,
       analysisStatus: '${json['analysisStatus'] ?? 'ready'}',
       cliffsNotes: CliffsNotesData.fromJson(rawCn),
@@ -412,6 +412,8 @@ class ReviewThread {
     required this.kind,
     required this.severity,
     required this.status,
+    required this.sourceAgent,
+    required this.sourceAgents,
     required this.path,
     required this.targetFile,
     required this.isTopLevel,
@@ -446,11 +448,23 @@ class ReviewThread {
         (json['solutionOptions'] as List<dynamic>?) ?? const <dynamic>[];
     final List<dynamic> rawMsgs =
         (json['messages'] as List<dynamic>?) ?? const <dynamic>[];
+    final List<dynamic> rawSrcAgents =
+        (json['sourceAgents'] as List<dynamic>?) ?? const <dynamic>[];
+    final List<String> parsedSrcAgents = rawSrcAgents
+        .map((dynamic e) => '$e'.trim())
+        .where((String s) => s.isNotEmpty)
+        .toList();
+    final String singleSrc = '${json['sourceAgent'] ?? ''}'.trim();
+    if (singleSrc.isNotEmpty && !parsedSrcAgents.contains(singleSrc)) {
+      parsedSrcAgents.insert(0, singleSrc);
+    }
     return ReviewThread(
       id: '${json['id'] ?? ''}',
       kind: '${json['kind'] ?? 'ai_candidate'}',
       severity: '${json['severity'] ?? 'DESIGN'}',
       status: '${json['status'] ?? 'candidate'}',
+      sourceAgent: parsedSrcAgents.isNotEmpty ? parsedSrcAgents.first : '',
+      sourceAgents: parsedSrcAgents,
       path: '${json['path'] ?? ''}',
       targetFile: '${json['targetFile'] ?? ''}',
       isTopLevel: json['isTopLevel'] == true,
@@ -491,6 +505,8 @@ class ReviewThread {
   final String kind;
   final String severity;
   final String status;
+  final String sourceAgent;
+  final List<String> sourceAgents;
   final String path;
   final String targetFile;
   final bool isTopLevel;

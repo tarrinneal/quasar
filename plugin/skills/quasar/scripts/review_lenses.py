@@ -193,11 +193,43 @@ def lenses_by_effort(resolved: List[Dict[str, Any]]) -> Dict[str, List[str]]:
     }
 
 
+def _extract_subagent_learned_rules(prefs: Optional[Dict[str, Any]], agent_name: str) -> Dict[str, List[str]]:
+    prefer_list: List[str] = []
+    avoid_list: List[str] = []
+    custom_list: List[str] = []
+    target = (agent_name or "").strip().lower()
+    for r in (prefs or {}).get("rules") or []:
+        if r.get("origin") == "seed_skill":
+            continue
+        sub = str(r.get("subagent") or "").strip().lower()
+        if sub != target:
+            continue
+        txt = str(r.get("rule") or "").strip()
+        if not txt:
+            continue
+        sent = str(r.get("sentiment") or "custom").lower()
+        if sent in ("prefer", "always", "keep", "upvote"):
+            prefer_list.append(txt)
+        elif sent in ("avoid", "never", "skip", "downvote"):
+            avoid_list.append(txt)
+        else:
+            custom_list.append(txt)
+    return {
+        "preferRules": prefer_list,
+        "avoidRules": avoid_list,
+        "customRules": custom_list,
+    }
+
+
 def build_lens_context(
     prefs: Optional[Dict[str, Any]], effort_level: str, repo_dir: Optional[str] = None, ws_root: Optional[str] = None
 ) -> Dict[str, Any]:
     """Returns the lens-related keys embedded in pr_context.json."""
     resolved = resolve_lens_efforts(discover_review_agents(repo_dir, ws_root), prefs)
+    sub_stats = (prefs or {}).get("subagentStats") or {}
+    for a in resolved:
+        a["learnedDirectives"] = _extract_subagent_learned_rules(prefs, a["name"])
+        a["stats"] = sub_stats.get(a["name"], {})
     by_effort = lenses_by_effort(resolved)
     selected = [
         {
@@ -206,6 +238,7 @@ def build_lens_context(
             "appliesWhen": a["appliesWhen"],
             "isCustom": a["isCustom"],
             "path": a["path"],
+            "learnedDirectives": a.get("learnedDirectives") or {"preferRules": [], "avoidRules": [], "customRules": []},
         }
         for a in resolved
         if a["name"] in by_effort.get(effort_level, [])

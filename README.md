@@ -162,6 +162,9 @@ When an agent is asked to set up Quasar, it should execute these exact steps:
 - **👍 / 👎 / 🧠 Feedback on Feedback**:
   - Every inline comment thread and sidebar finding includes **`$(thumbsup) Helpful (More Like This)`**, **`$(thumbsdown) Not Useful (Less Like This...)`**, and **`$(lightbulb-sparkle) Teach Quasar / Give Feedback on This Feedback...`**.
   - You can also type feedback directly into any inline comment reply box and click **`Teach Quasar`**, or edit a draft comment (Quasar automatically records before/after phrasing examples to learn your tone).
+- **🎓 Inline Subagent Attribution & Per-Subagent Learning (`quasar.teachSubagent`)**:
+  - Every inline comment shows which specialist `review-*` subagent(s) suggested it (`🤖 Suggested by: review-bug-hunter`) along with a 1-click **`🎓 Teach review-...`** button.
+  - Reinforce or suppress patterns for **just that subagent** (without affecting other lenses), add custom upgrade-safe directives (`--subagent <lens>` in `manage_preferences.py`), or ask Antigravity to evolve the subagent's `AGENT.md` checklist directly from a review comment.
 - **Persistent Preference Memory (`~/.gemini/quasar/PREFERENCES.md` & `preferences.json`)**:
   - Learned rules, seed skills, style profiles, and phrasing examples are automatically persisted and injected into `pr_context.json` and all review subagents on every future review.
 

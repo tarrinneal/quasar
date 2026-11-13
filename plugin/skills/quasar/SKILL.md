@@ -72,7 +72,8 @@ Users configure which lenses run at each effort level (Quasar sidebar → **Conf
 - **Never spawn lenses that are not in `review_lenses`** unless the user explicitly asks for them by name in their prompt (e.g. "also run the security lens"); in that case add them for this review only.
 - `review-advocate` is a false-positive filter helper (`role: "filter"`), not a lens — it is never listed in `review_lenses`.
 - If `review_lenses` is empty for the current effort, do not spawn any subagents (single-pass review).
-- Pass each lens the PR title/description, changed `core_source` files, `<SCRATCH_DIR>/pr.diff`, and `reviewer_preferences`, and use `Role` = the lens's description title (e.g. `"Security Auditor"`).
+- Pass each lens the PR title/description, changed `core_source` files, `<SCRATCH_DIR>/pr.diff`, global `reviewer_preferences`, **and that lens's own `learnedDirectives`** (`review_lenses[i].learnedDirectives`, or its `### 🤖 \`<lens-name>\`` section in `~/.gemini/quasar/PREFERENCES.md`), and use `Role` = the lens's description title (e.g. `"Security Auditor"`).
+- **Preserve Subagent Attribution (`"sourceAgents"`)**: Record which subagent(s) surfaced every finding in `"sourceAgents"` (e.g. `["review-bug-hunter"]`, or `["review-bug-hunter", "review-security"]` when merging duplicates across lenses, or `["quasar-single-pass"]` when running without subagents) so inline comments show which lens suggested each comment and let the reviewer teach that specific subagent.
 
 Choose the analysis pipeline below that matches `effort_level` (`"low"`, `"medium"`, or `"high"`):
 
@@ -82,19 +83,19 @@ Choose the analysis pipeline below that matches `effort_level` (`"low"`, `"mediu
 - Build a concise CliffsNotes Study Guide (`tldr`, `architectureDiagram`, logical `chapters` & `stops` — **skip this step if `comments_only` is `true`**), triage any `existing_comments`, and include only **obvious, high-confidence bugs or blockers** (skipping deep cross-file hunting and minor nits).
 - Proceed immediately to **Phase 3** (`publish_review_session.py`).
 
-### ⚖️ Option B: `medium` Effort (Balanced — Default — Fast `flash` Subagents in 1 Wave)
+### ⚖️ Option B: `medium` Effort (Balanced — Fast `flash` Subagents in 1 Wave)
 - Spawn the applicable lenses from `review_lenses` **in parallel** in a single `invoke_subagent` call with **`Model: "flash"`** (defaults: `review-architect`, `review-bug-hunter`, `review-security`, plus any custom lenses enabled for `medium`).
   - If `review-architect` is spawned, pass it the PR title/description too. *(If `comments_only` is `true`, instruct `review-architect` to only return API/design `findings` and skip building a reading tour or mental model.)*
 - **Do NOT spawn a second sequential `review-advocate` wave** in `medium` effort — once the `flash` subagents report back, verify and filter their findings directly in the main agent and proceed immediately to **Phase 3**.
 
-### 🔬 Option C: `high` Effort (Deep / Thorough — Full Multi-Lens Pipeline)
+### 🔬 Option C: `high` Effort (Deep / Thorough — Default — Full Multi-Lens Pipeline)
 - Spawn the applicable lenses from `review_lenses` **in parallel** using a single `invoke_subagent` call (`Model: "inherit"`). Pass each subagent the active `reviewer_preferences` summary (or instruct them to read `~/.gemini/quasar/PREFERENCES.md`). Defaults include:
   1. **`review-architect`**: Build the architectural mental model, identify key symbols ("Character List"), evaluate API boundaries & backwards compatibility, and suggest the logical top-down reading order *(if `comments_only` is `true`, skip the reading tour & mental model and focus strictly on architectural/API findings)*.
   2. **`review-bug-hunter`**: Trace execution paths, nullability, state mutations, resource lifecycle, and language-boundary/generator edge cases.
   3. **`review-test-critic`**: Build a coverage matrix, evaluate test falsifiability, verify generated file sync, and check repo hygiene (changelog, version metadata).
   4. **Gated specialist lenses** (spawned only when their `appliesWhen` matches): `review-security`, `review-performance`, `review-concurrency`, `review-compat`, `review-error-handling`, `review-docs`, `review-readability`, `review-dependencies`, `review-accessibility`.
   5. **Custom lenses** (`isCustom: true`) enabled for `high`.
-- When several lenses report the same issue, merge them into a single finding (keep the most specific location and the clearest draft comment).
+- When several lenses report the same issue, merge them into a single finding (keep the most specific location and the clearest draft comment, and list **all** contributing lens names in `"sourceAgents"`, e.g. `["review-bug-hunter", "review-security"]`).
 
 ### Filtering False Positives, Flagging Uncertain Preferences, & Triaging Existing GitHub Comments
 Verify every candidate finding against the actual codebase callers/callees, `existing_comments`, and `reviewer_preferences` (in `high` effort you may invoke `review-advocate` or verify directly; in `low`/`medium` effort always filter directly):
@@ -134,9 +135,9 @@ Write `<SCRATCH_DIR>/review_synthesis.json` and publish it using `publish_review
   "cliffsNotes": {
     "tldr": "One-sentence summary of what the PR does and why.",
     "whatAndWhy": "Concise paragraph explaining the problem solved and the core mechanism.",
-    "architectureDiagram": "flowchart LR\n  A[\"Caller (Entry Point)\"] --> B[\"Generator - Emits Code\"]",
+    "architectureDiagram": "flowchart LR\n  A[\"AuthMiddleware - Entry Point\"] --> B[\"TokenCache - Lookup & Refresh\"]",
     "keySymbols": [
-      { "name": "KotlinGenerator._writeHeader", "role": "Emits the package declaration and file-level annotations." }
+      { "name": "TokenCache.getOrRefresh", "role": "Returns a cached access token or refreshes it before expiry." }
     ],
     "designTradeoffs": [
       "Trade-off 1 that deserves human reviewer judgment."
@@ -146,21 +147,21 @@ Write `<SCRATCH_DIR>/review_synthesis.json` and publish it using `publish_review
     {
       "id": "ch-1",
       "title": "Chapter 1: Core Interfaces & Models",
-      "summary": "Defines the new options and AST representation.",
+      "summary": "Defines the cache configuration options and token entry schema.",
       "cliffsNotesBullets": [
-        "Adds nullable `package` field to `KotlinOptions`.",
+        "Adds optional `namespace` field to `CacheOptions`.",
         "Preserves backwards compatibility when omitted."
       ],
       "stops": [
         {
           "stopNumber": "1.1",
-          "title": "kotlin_generator.dart:140-185",
-          "path": "packages/pigeon/lib/src/kotlin/kotlin_generator.dart",
+          "title": "token_cache.ts:140-185",
+          "path": "src/auth/token_cache.ts",
           "startLine": 140,
           "endLine": 185,
-          "cliffsNotes": "Emits the Kotlin package header and file-level suppression annotations.",
-          "whyItChanged": "Needed to support custom package namespaces in generated output.",
-          "callersAndInvariants": "Called once per generated file from `KotlinGenerator.generate`."
+          "cliffsNotes": "Builds the cache key prefix and TTL metadata for stored tokens.",
+          "whyItChanged": "Needed to isolate cached tokens across multi-tenant namespaces.",
+          "callersAndInvariants": "Called once per lookup from `TokenCache.getOrRefresh`."
         }
       ]
     }
@@ -171,23 +172,24 @@ Write `<SCRATCH_DIR>/review_synthesis.json` and publish it using `publish_review
       "id": "finding-1",
       "severity": "BLOCKING",
       "status": "candidate",
-      "path": "packages/pigeon/lib/src/kotlin/kotlin_generator.dart",
+      "sourceAgents": ["review-bug-hunter"],
+      "path": "src/auth/token_cache.ts",
       "startLine": 142,
       "endLine": 148,
-      "title": "Null-safety crash when kotlinOptions.package is omitted",
-      "whyItMatters": "`options.package` is nullable in `KotlinOptions`, and callers do not default it.",
-      "draftComment": "If `KotlinOptions.package` isn't specified by the caller, `options.package!` here will throw at generation time. Should we guard this with `if (options.package != null)`?",
+      "title": "Null dereference when CacheOptions.namespace is omitted",
+      "whyItMatters": "`options.namespace` is optional in `CacheOptions`, and existing callers do not pass it.",
+      "draftComment": "If `options.namespace` isn't specified by the caller, `options.namespace.trim()` here will throw at runtime. Should we guard this with `if (options.namespace)`?",
       "solutionOptions": [
         {
           "id": "opt-1",
-          "label": "Omit the `package` declaration when `options.package` is null",
-          "description": "Preserves backwards compatibility for existing callers that do not pass `package`.",
+          "label": "Omit the namespace prefix when `options.namespace` is undefined",
+          "description": "Preserves backwards compatibility for existing single-tenant callers.",
           "recommended": true
         },
         {
           "id": "opt-2",
-          "label": "Default `KotlinOptions.package` to a fallback namespace in the constructor",
-          "description": "Guarantees every generated Kotlin file has an explicit package header."
+          "label": "Default `CacheOptions.namespace` to `\"default\"` on initialization",
+          "description": "Guarantees every cache entry uses an explicit two-part key format."
         }
       ]
     },
@@ -195,19 +197,20 @@ Write `<SCRATCH_DIR>/review_synthesis.json` and publish it using `publish_review
       "id": "finding-2",
       "severity": "NIT",
       "status": "uncertain",
+      "sourceAgents": ["review-test-critic"],
       "preferenceCategory": "test_strictness",
-      "uncertaintyQuestion": "Do you want Quasar to flag missing unit tests for private helper methods when the public generator output is already tested?",
+      "uncertaintyQuestion": "Do you want Quasar to flag missing direct unit tests for private helper methods when the public API is already tested?",
       "preferenceOptions": [
         "Flag this & similar cases in future reviews",
         "Skip this pattern in future reviews",
         "Keep this comment once, don't save a rule"
       ],
-      "path": "packages/pigeon/lib/src/kotlin/kotlin_generator.dart",
+      "path": "src/auth/token_cache.ts",
       "startLine": 170,
       "endLine": 185,
-      "title": "No direct unit test for private _sanitizePackage helper",
-      "whyItMatters": "`_sanitizePackage` is only exercised indirectly through `generate()`.",
-      "draftComment": "Consider adding a direct unit test for edge cases in `_sanitizePackage` (e.g. reserved Kotlin keywords)."
+      "title": "No direct unit test for private sanitizeNamespace helper",
+      "whyItMatters": "`sanitizeNamespace` is only exercised indirectly through `getOrRefresh()`.",
+      "draftComment": "Consider adding a direct unit test for edge cases in `sanitizeNamespace` (e.g. colons or whitespace)."
     }
   ],
   "existingCommentAssessments": [
@@ -215,23 +218,23 @@ Write `<SCRATCH_DIR>/review_synthesis.json` and publish it using `publish_review
       "id": "gh-inline-123456",
       "triageStatus": "partially_addressed",
       "triageBadge": "🟡 Partially Addressed — Edge Case Left",
-      "whatIsDone": "Added `if (options.package != null)` guard in `kotlin_generator.dart:142`.",
-      "whatIsNotDone": "Empty string `package: ''` still emits an invalid `package ;` declaration.",
-      "whatShouldBeDone": "Check `options.package != null && options.package!.isNotEmpty` instead."
+      "whatIsDone": "Added `if (options.namespace != null)` guard in `token_cache.ts:142`.",
+      "whatIsNotDone": "An empty string `namespace: \"\"` still produces a leading colon `:user-123` key.",
+      "whatShouldBeDone": "Check `options.namespace && options.namespace.trim().length > 0` instead."
     }
   ],
   "coverageMatrix": [
     {
-      "behavior": "Custom Kotlin package header emission",
+      "behavior": "Custom cache namespace key isolation",
       "status": "✅ Covered",
-      "notes": "Verified in kotlin_generator_test.dart:L184"
+      "notes": "Verified in token_cache.test.ts:L184"
     }
   ],
   "repoChecks": [
-    { "name": "CHANGELOG.md & pubspec.yaml", "passed": true, "detail": "Version bumped and changelog updated" }
+    { "name": "CHANGELOG.md & package.json", "passed": true, "detail": "Version bumped and changelog updated" }
   ],
   "dismissedChecks": [
-    "Checked whether empty string `package: ''` can reach `_writeHeader` — already rejected by parser validation."
+    "Checked whether negative `ttlSeconds` can reach `buildEntry` — already rejected by constructor validation."
   ]
 }
 ```
@@ -259,9 +262,9 @@ python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/publish_review_ses
   --artifact-out <ARTIFACT_DIR>/code_review_briefing.md
 ```
 
-> **Jetski Web & Browser UI Link**:
-> In your final response after publishing a review, always include the interactive Quasar Web UI pill so teammates on **Jetski Web** (or without the VS Code extension) can open the full interactive Study Guide, SVG Flowchart, and Side-by-Side Diff Viewer right inside Jetski or their browser:
-> - `[📖 Open Quasar Review](sidecar://quasar/quasar-web/)` (opens the Quasar Web UI sidecar pane inside Jetski)
+> **Antigravity Web & Browser UI Link**:
+> In your final response after publishing a review, always include the interactive Quasar Web UI pill so users on **Antigravity Web** (or without the VS Code extension) can open the full interactive Study Guide, SVG Flowchart, and Side-by-Side Diff Viewer right inside Antigravity or their browser:
+> - `[📖 Open Quasar Review](sidecar://quasar/quasar-web/)` (opens the Quasar Web UI sidecar pane)
 > - Direct browser URL: `http://127.0.0.1:49341` (or the exported `quasar_review.html` artifact)
 
 ### Flagging Uncertain Comments for Post-Review Inspection (Do NOT Call `ask_question` During Review)
@@ -292,17 +295,18 @@ python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/manage_preferences
 
 ## Phase 4: Answering Inline Questions, Learning from Feedback on Feedback, & Exporting
 
-### 1. When the Reviewer Gives Feedback on Quasar's Feedback (Meta-Feedback / Preference Learning)
-The reviewer can click **👍 Helpful**, **👎 Not Useful**, **🤔 Calibrate Preference**, or **🧠 Teach Quasar / Give Feedback on This Feedback** on any inline comment thread in the editor, or tell you in chat how they want Quasar to adjust its feedback.
-When you receive a meta-feedback prompt:
+### 1. When the Reviewer Gives Feedback on Quasar's Feedback or Teaches a Specific Subagent
+The reviewer can click **👍 Helpful**, **👎 Not Useful**, **🤔 Calibrate Preference**, **🎓 Teach / Tune Review Subagent**, or **🧠 Teach Quasar / Give Feedback on This Feedback** on any inline comment thread in the editor, or tell you in chat how they want Quasar (or a specific `review-*` subagent) to adjust its feedback.
+When you receive a meta-feedback or subagent-teaching prompt:
 1. Distill the user's critique into a clear, reusable preference rule (or tone/verbosity update).
-2. Run `manage_preferences.py` to persist the learned rule into `~/.gemini/quasar/preferences.json` and `~/.gemini/quasar/PREFERENCES.md`, and update the inline thread in `active_session.json` (including `--updated-draft` if the user asked to rephrase or adjust the comment):
+2. Run `manage_preferences.py` to persist the learned rule into `~/.gemini/quasar/preferences.json` and `~/.gemini/quasar/PREFERENCES.md` (passing `--subagent <lens-name>` when the feedback targets a specific `review-*` subagent so only that lens's learned directives are altered, or omitting `--subagent` for a global preference), and update the inline thread in `active_session.json` (including `--updated-draft` if the user asked to rephrase or adjust the comment):
 
 ```bash
 python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/manage_preferences.py \
   --record-feedback \
   --thread-id "<THREAD_ID>" \
   --action meta_feedback \
+  [--subagent "<review-lens-name>"] \
   --category "<CATEGORY>" \
   --sentiment "<prefer|avoid|custom>" \
   --reason "<USER_RAW_FEEDBACK>" \
@@ -310,6 +314,7 @@ python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/manage_preferences
   [--updated-draft "<REFINED_GITHUB_DRAFT_COMMENT>"] \
   [--set-tone "<NEW_TONE_IF_APPLICABLE>"]
 ```
+3. If the prompt also asks to refine a subagent's `AGENT.md` checklist or applicability gate (`quasarAppliesWhen`), update that subagent's `AGENT.md` file cleanly while preserving valid YAML frontmatter (`name`, `subagent: true`, `commandExecutionPolicy: off`).
 
 ### 2. When the Reviewer Provides a Premade Review Skill as a Starting Point
 The reviewer can provide an existing `SKILL.md`, review rubric, or markdown guide via **`Quasar: Import Premade Review Skill as Starting Point...`** or in chat.

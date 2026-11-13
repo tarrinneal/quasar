@@ -2,6 +2,23 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [1.4.0] - 2026-11-12
+
+### Added
+- **Inline Subagent Attribution (`sourceAgents` / `sourceAgent`)**:
+  - Every finding now records which specialist `review-*` lens(es) surfaced it (preserving multiple lenses when duplicate findings are merged) and displays `🤖 <subagent>` badges across native VS Code inline `CommentThread` banners and author headers, sidebar items, interactive Study Guide cards, `quasar-web`, and the standalone Flutter app.
+- **Per-Subagent Continuous Learning & `AGENT.md` Evolution (`quasar.teachSubagent` & `--subagent`)**:
+  - Added **🎓 Teach / Tune Review Subagent...** directly inside inline comment cards, comment thread toolbars, sidebar context menus, the **Review Subagents** tree, `quasar-web`, and the Flutter app—plus 1-click subagent-only scoping inside **👍 Helpful**, **👎 Not Useful**, and **🤔 Calibrate Preference**.
+  - Added `--subagent <review-*>` support, `subagentRules`, and `subagentStats` telemetry in `manage_preferences.py` (`~/.gemini/quasar/preferences.json` and `PREFERENCES.md`), automatic `learnedDirectives` injection per lens in `review_lenses.py` / `pr_context.json`, and 1-click Antigravity subagent evolution to refine a lens's `AGENT.md` alongside its upgrade-safe learned directives.
+
+### Changed
+- **High Effort by Default (`high`)**:
+  - Updated the default review effort level from `medium` to `high` across `bin/quasar`, the VS Code / Antigravity extension, `manage_preferences.py`, `collect_pr_context.py`, `publish_review_session.py`, `quasar-web`, and the standalone Flutter app.
+
+### Fixed
+- **Deterministic Sidebar-to-Comment Scrolling (`revealRangeInVisibleEditor` & `jumpToCommentThread`)**:
+  - Clicking a comment in the sidebar now prefers `vscode.window.activeTextEditor`, centers `range.end.line` on multi-line threads (where VS Code anchors inline `CommentThread` widgets), and verifies `editor.visibleRanges` across async diff folding and ZoneWidget layout passes so comments consistently land in view.
+
 ## [1.3.0] - 2026-11-10
 
 ### Added
@@ -40,14 +57,14 @@ All notable changes to **Quasar** are documented in this file.
 
 ### Changed
 - `medium` effort now includes `review-security` by default (gated to security-relevant diffs).
-- Removed the domain-specific `review-flutter-packages` lens from the shipped plugin; Quasar's built-in lenses are now general-purpose. Domain lenses belong in `~/.gemini/config/agents/` or `<repo>/.gemini/agents/`.
+- Removed the built-in domain-specific lens from the shipped plugin; Quasar's built-in lenses are now general-purpose. Domain lenses belong in `~/.gemini/config/agents/` or `<repo>/.gemini/agents/`.
 
 ## [1.2.3] - 2026-10-30
 
 ### Added
 - **Proxied & Remote Sandbox Support for GitHub Token Verification & Review Publishing**:
   - `submitToken()` in `quasar-web` now verifies GitHub Personal Access Tokens against `https://api.github.com/user` directly from the browser first and sends the verified `login` and `name` to `/api/github-token` (with graceful `RemoteDisconnected` fallback on the backend when outbound DLP proxies drop `ghp_...` / `github_pat_...` headers).
-  - `post_pending_review.py` and `/api/publish-github` now return a hunk-aligned `needs_browser_publish` (`clientSidePublish: true`) payload when backend `POST` requests to `api.github.com` are blocked by outbound proxies (`ÜberProxy` / `RemoteDisconnected`), allowing the browser to `POST` the review directly to GitHub via CORS.
+  - `post_pending_review.py` and `/api/publish-github` now return a hunk-aligned `needs_browser_publish` (`clientSidePublish: true`) payload when backend `POST` requests to `api.github.com` are blocked by outbound proxies (`RemoteDisconnected`), allowing the browser to `POST` the review directly to GitHub via CORS.
   - Added clean simulated review publishing in **Tutorial Sandbox** mode (`status: "tutorial_simulated"`).
 
 ### Fixed
@@ -60,7 +77,7 @@ All notable changes to **Quasar** are documented in this file.
 
 ### Added
 - **Quasar Web UI Sidecar & Standalone Browser App (`quasar-web`)**:
-  - Added `plugin/sidecars/quasar-web` (`sidecar://quasar/quasar-web/` and `http://127.0.0.1:49341`) plus self-contained `quasar_review.html` export for Jetski Web, Desktop Aux/Full Panes, and standalone browser sessions.
+  - Added `plugin/sidecars/quasar-web` (`sidecar://quasar/quasar-web/` and `http://127.0.0.1:49341`) plus self-contained `quasar_review.html` export for Antigravity Web, Desktop Aux/Full Panes, and standalone browser sessions.
   - Supports interactive Study Guides, clickable SVG flowcharts, side-by-side & unified diffs, inline line Q&A, comment revision with the agent, batch comment fixing, and 1-click GitHub review publishing.
   - Added a **Live Agent Activity & Progress Indicator** (`#agentPill` & `#agentActivityBanner`) that tracks pipeline phases (`Phase 1/3` → `Phase 2/3` → `Phase 3/3`), active subagents, live tool steps, and elapsed time in real time.
 - **Update Existing Pending Reviews on GitHub**:
@@ -71,7 +88,7 @@ All notable changes to **Quasar** are documented in this file.
 ### Fixed
 - **Top-Level PR Comment Preservation on Pending Reviews**:
   - Automatically copies the top-level review summary (`TOP_LEVEL_PR_COMMENTS.md`) to the clipboard when creating/updating a GitHub `PENDING` review (since GitHub discards `PENDING` review bodies in the web submit box) and fixed duplicate intro lines in `overflow_notes`.
-- **Jetski Web Sidecar Auth & AgentAPI Context Resolution**:
+- **Antigravity Web Sidecar Auth & AgentAPI Context Resolution**:
   - Added `/preload.js`, `X-Sidecar-Token` forwarding, cross-project `ANTIGRAVITY_PROJECT_ID` / `rootConversationId` resolution in `server.py`, and automatic plugin enablement (`JetboxWriteState` + `GetAllPlugins`) in `install.sh`.
 
 ## [1.2.0] - 2026-10-29

@@ -37,6 +37,7 @@ First decide whether the diff touches any security-relevant surface (see `quasar
 - **Verify before reporting**: Use `view_file` / `grep_search` to confirm no upstream validation, sanitization, or permission check already exists.
 - **Honor Learned Reviewer Preferences**: Check `~/.gemini/quasar/PREFERENCES.md` or the `reviewer_preferences` in your prompt; skip patterns marked `Avoid`.
 - Do not report generic "consider adding security" advice or dependency CVEs you cannot tie to changed code.
+- **Honor Subagent-Specific Learned Directives (`review-security`)**: Also check any `learnedDirectives` passed in your prompt and the `### 🤖 \`review-security\`` section in `~/.gemini/quasar/PREFERENCES.md` — those rules were taught specifically to `review-security` by the reviewer and take top priority.
 
 ## Output Format
 

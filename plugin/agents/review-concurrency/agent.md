@@ -34,6 +34,7 @@ If the diff contains no async, threaded, or shared-state code, reply `No concurr
 - **Concrete interleaving required**: Every finding MUST give a step-by-step interleaving (Thread A does X, Thread B does Y, …) that produces the bad outcome.
 - **Verify the threading model**: Confirm via callers/docs which thread/isolate each piece runs on before flagging affinity issues.
 - **Honor Learned Reviewer Preferences** (`~/.gemini/quasar/PREFERENCES.md` / `reviewer_preferences`).
+- **Honor Subagent-Specific Learned Directives (`review-concurrency`)**: Also check any `learnedDirectives` passed in your prompt and the `### 🤖 \`review-concurrency\`` section in `~/.gemini/quasar/PREFERENCES.md` — those rules were taught specifically to `review-concurrency` by the reviewer and take top priority.
 
 ## Output Format
 

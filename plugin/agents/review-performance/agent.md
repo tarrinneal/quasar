@@ -26,7 +26,7 @@ If the diff only touches docs, config, tests, or cold paths with trivially small
 1. **Complexity Regressions**: Nested loops over growing collections, `list.contains`/`indexOf` inside loops (O(n²)), repeated sorting, re-computing invariant work per iteration.
 2. **N+1 and Chatty IO**: Queries, network calls, file reads, or platform-channel/FFI round trips issued per item instead of batched.
 3. **Allocation & Copy Churn**: Copying large buffers/collections unnecessarily, string concatenation in loops, boxing in hot paths, creating closures/objects per frame.
-4. **Blocking the Main/UI Thread**: Synchronous IO, heavy parsing, or long computation on the UI isolate/main thread; missing `async`/background isolate/dispatch.
+4. **Blocking the Main/UI/Event-Loop Thread**: Synchronous IO, heavy parsing, or long computation on the UI thread or async event loop; missing `async`/background worker/dispatch.
 5. **UI Rendering Costs** (when applicable): Unnecessary rebuilds/re-renders, missing `const`/memoization, expensive work in `build`/`render`, layout thrash.
 6. **Caching & Lifetimes**: Unbounded caches/memoization (memory growth), missing caching for repeated expensive work, listeners/subscriptions that accumulate.
 
@@ -36,6 +36,7 @@ If the diff only touches docs, config, tests, or cold paths with trivially small
 - **Verify the hot path**: Use `grep_search` to confirm how often the code runs (callers, loops, frame callbacks) before flagging.
 - No micro-optimizations that hurt readability unless the path is demonstrably hot.
 - **Honor Learned Reviewer Preferences** (`~/.gemini/quasar/PREFERENCES.md` / `reviewer_preferences`).
+- **Honor Subagent-Specific Learned Directives (`review-performance`)**: Also check any `learnedDirectives` passed in your prompt and the `### 🤖 \`review-performance\`` section in `~/.gemini/quasar/PREFERENCES.md` — those rules were taught specifically to `review-performance` by the reviewer and take top priority.
 
 ## Output Format
 

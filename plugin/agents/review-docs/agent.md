@@ -35,6 +35,7 @@ If the diff changes only private/internal implementation with no user-visible or
 - Follow the repository's own documentation conventions (find an existing well-documented API and match it) rather than imposing a style.
 - Do not demand docs for private/internal helpers unless the logic is non-obvious.
 - **Honor Learned Reviewer Preferences** (`~/.gemini/quasar/PREFERENCES.md` / `reviewer_preferences`).
+- **Honor Subagent-Specific Learned Directives (`review-docs`)**: Also check any `learnedDirectives` passed in your prompt and the `### 🤖 \`review-docs\`` section in `~/.gemini/quasar/PREFERENCES.md` — those rules were taught specifically to `review-docs` by the reviewer and take top priority.
 
 ## Output Format
 

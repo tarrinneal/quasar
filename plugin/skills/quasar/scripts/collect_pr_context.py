@@ -6,7 +6,7 @@ Supports both `gh` CLI (if installed/authenticated) and direct GitHub REST API.
 
 Usage:
   # Review a GitHub PR by URL or number:
-  python3 collect_pr_context.py --pr https://github.com/flutter/packages/pull/13265
+  python3 collect_pr_context.py --pr https://github.com/owner/repo/pull/123
 
   # Review local branch against a base ref:
   python3 collect_pr_context.py --base origin/main --repo-dir /path/to/repo
@@ -190,27 +190,25 @@ ACTIVE_SESSION_PATH = os.path.join(get_workspace_state_dir(), "active_session.js
 CLIFFS_NOTES_MD_PATH = os.path.join(get_workspace_state_dir(), "cliffs_notes.md")
 
 GENERATED_PATTERNS = [
-    r"\.g\.dart$",
-    r"\.mocks\.dart$",
-    r"\.freezed\.dart$",
-    r"\.pigeon\.dart$",
-    r"/generated/",
-    r"platform_tests/.*\.(dart|kt|java|swift|mm|m|h|cc|cpp)$",
+    r"\.(?:gen|generated|g|mocks|freezed)\.[a-z0-9]+$",
+    r"_pb2(?:_grpc)?\.py$",
+    r"\.pb\.(?:go|cc|h|ts|js)$",
+    r"\.min\.(?:js|css)$",
+    r"(?:^|/)(?:generated|__generated__|dist|build)/",
+    r"(?:^|/)(?:package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|poetry\.lock|Pipfile\.lock|go\.sum|pubspec\.lock|Gemfile\.lock|Podfile\.lock)$",
 ]
 
 TEST_PATTERNS = [
-    r"_test\.(dart|kt|java|swift|cc|cpp|py|ts|js)$",
-    r"(^|/)test/",
-    r"(^|/)tests/",
-    r"(^|/)integration_test/",
+    r"(?:_test|\.(?:test|spec))\.[a-z0-9]+$",
+    r"(?:^|/)test_[^/]+\.py$",
+    r"(?:^|/)(?:test|tests|__tests__|spec|e2e|integration_test)/",
 ]
 
 DOC_CONFIG_PATTERNS = [
-    r"(^|/)CHANGELOG\.md$",
-    r"(^|/)pubspec\.yaml$",
-    r"(^|/)package\.json$",
-    r"(^|/)README\.md$",
-    r"(^|/)AGENTS\.md$",
+    r"(?:^|/)CHANGELOG\.md$",
+    r"(?:^|/)(?:package\.json|pyproject\.toml|Cargo\.toml|go\.mod|pubspec\.yaml|pom\.xml|build\.gradle(?:\.kts)?)$",
+    r"(?:^|/)README\.md$",
+    r"(?:^|/)AGENTS\.md$",
     r"\.md$",
 ]
 
@@ -289,7 +287,6 @@ def auto_detect_repo_dir(owner: str, repo: str, provided_dir: Optional[str]) -> 
         os.path.join(home, "src", repo),
         os.path.join(home, "projects", repo),
         os.path.join(home, repo),
-        os.path.join(home, "work", "packages"),
     ]
     for cand in candidates:
         if repo_matches_remote(cand, owner, repo):
@@ -320,7 +317,10 @@ def infer_owner_repo(pr_arg: str, cwd: str) -> Tuple[str, str, int]:
             return rm.group(1), rm.group(2), pr_num
     except Exception:
         pass
-    return "flutter", "packages", pr_num
+    raise RuntimeError(
+        f"Could not infer GitHub owner/repo from git remotes in '{cwd}' for PR #{pr_num}. "
+        f"Pass the full PR URL (https://github.com/owner/repo/pull/{pr_num}) or specify --repo-dir."
+    )
 
 
 def github_api_get(url: str, accept: str = "application/vnd.github.v3+json") -> Any:
@@ -3134,6 +3134,8 @@ describe('checkout_service promo codes', () => {
             "kind": "ai_candidate",
             "severity": "BLOCKING",
             "status": "staged",
+            "sourceAgent": "review-bug-hunter",
+            "sourceAgents": ["review-bug-hunter"],
             "selectedForFix": True,
             "uncertain": False,
             "path": "src/checkout_service.ts",
@@ -3162,6 +3164,8 @@ describe('checkout_service promo codes', () => {
             "kind": "ai_candidate",
             "severity": "NIT",
             "status": "uncertain",
+            "sourceAgent": "review-test-critic",
+            "sourceAgents": ["review-test-critic"],
             "selectedForFix": False,
             "uncertain": True,
             "preferenceCategory": "test_strictness",
@@ -3231,6 +3235,8 @@ describe('checkout_service promo codes', () => {
             "kind": "ai_candidate",
             "severity": "DESIGN",
             "status": "staged",
+            "sourceAgent": "review-architect",
+            "sourceAgents": ["review-architect", "review-bug-hunter"],
             "selectedForFix": False,
             "uncertain": False,
             "path": "src/checkout_service.ts",
@@ -3265,7 +3271,7 @@ describe('checkout_service promo codes', () => {
         "windowPid": win_pid,
         "updatedAt": now_iso,
         "analysisStatus": "ready",
-        "effortLevel": "medium",
+        "effortLevel": "high",
         "commentsOnly": comments_only,
         "workspaceDir": ws_root,
         "stateDir": state_dir,
@@ -3645,9 +3651,9 @@ def main() -> None:
     except Exception:
         prefs_for_context = {}
 
-    effort_level = (args.effort or prefs_for_context.get("defaultEffort") or "medium").lower()
+    effort_level = (args.effort or prefs_for_context.get("defaultEffort") or "high").lower()
     if effort_level not in ("low", "medium", "high"):
-        effort_level = "medium"
+        effort_level = "high"
 
     if args.comments_only:
         comments_only = True

@@ -38,7 +38,7 @@ def default_preferences() -> Dict[str, Any]:
     return {
         "version": 2,
         "updatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "defaultEffort": "medium",
+        "defaultEffort": "high",
         "defaultCommentsOnly": False,
         "styleProfile": {
             "commentTone": "constructive, collaborative questions rather than prescriptive demands",
@@ -54,9 +54,36 @@ def default_preferences() -> Dict[str, Any]:
             "NIT": {"upvotes": 0, "downvotes": 0, "staged": 0, "dismissed": 0},
             "UNCERTAIN": {"calibrated_keep": 0, "calibrated_skip": 0},
         },
+        "subagentStats": {},
         "editedDraftExamples": [],
         "feedbackHistory": [],
     }
+
+
+def normalize_subagent_name(val: Optional[str]) -> Optional[str]:
+    if not val:
+        return None
+    cleaned = re.sub(r"[`*_\"']", "", str(val)).strip().lower()
+    cleaned = re.sub(r"[^a-z0-9._-]+", "-", cleaned).strip("-")
+    return cleaned or None
+
+
+def extract_thread_subagents(thread: Optional[Dict[str, Any]]) -> List[str]:
+    if not isinstance(thread, dict):
+        return []
+    out: List[str] = []
+    raw_list = thread.get("sourceAgents") or thread.get("subagents") or []
+    if isinstance(raw_list, str):
+        raw_list = [p.strip() for p in raw_list.split(",") if p.strip()]
+    if isinstance(raw_list, list):
+        for item in raw_list:
+            norm = normalize_subagent_name(str(item))
+            if norm and norm not in out:
+                out.append(norm)
+    single = normalize_subagent_name(thread.get("sourceAgent") or thread.get("subagent"))
+    if single and single not in out:
+        out.insert(0, single)
+    return out
 
 
 def load_preferences() -> Dict[str, Any]:
@@ -71,10 +98,11 @@ def load_preferences() -> Dict[str, Any]:
         base = default_preferences()
         base.update(data)
         if base.get("defaultEffort") not in ("low", "medium", "high"):
-            base["defaultEffort"] = "medium"
+            base["defaultEffort"] = "high"
         base["defaultCommentsOnly"] = bool(base.get("defaultCommentsOnly", False))
         base.setdefault("seedSkills", [])
         base.setdefault("rules", [])
+        base.setdefault("subagentStats", {})
         return base
     except Exception:
         return default_preferences()
@@ -368,6 +396,8 @@ def render_preferences_markdown(prefs: Dict[str, Any]) -> str:
     history: List[Dict[str, Any]] = prefs.get("feedbackHistory") or []
 
     learned_rules = [r for r in rules if r.get("origin") != "seed_skill"]
+    global_learned = [r for r in learned_rules if not r.get("subagent")]
+    subagent_learned = [r for r in learned_rules if r.get("subagent")]
     seed_rules = [r for r in rules if r.get("origin") == "seed_skill"]
 
     lines: List[str] = [
@@ -399,21 +429,22 @@ def render_preferences_markdown(prefs: Dict[str, Any]) -> str:
     lines.append("")
 
     prefer_learned = [
-        r for r in learned_rules if r.get("sentiment") in ("prefer", "always", "keep", "upvote")
+        r for r in global_learned if r.get("sentiment") in ("prefer", "always", "keep", "upvote")
     ]
     avoid_learned = [
-        r for r in learned_rules if r.get("sentiment") in ("avoid", "never", "skip", "downvote")
+        r for r in global_learned if r.get("sentiment") in ("avoid", "never", "skip", "downvote")
     ]
     custom_learned = [
-        r for r in learned_rules if r not in prefer_learned and r not in avoid_learned
+        r for r in global_learned if r not in prefer_learned and r not in avoid_learned
     ]
 
     lines.append("## 3. Learned Preferences — What to Flag & Prioritize (Highest Priority)")
     if prefer_learned:
         for r in prefer_learned:
             scope_badge = f" `[repo: {r['repo']}]`" if r.get("repo") else ""
+            src_ag = f" `[via: {r['sourceSubagent']}]`" if r.get("sourceSubagent") else ""
             cat_badge = f" *({r.get('category', 'general')})*" if r.get("category") else ""
-            lines.append(f"- ✅ **{r.get('rule', '')}**{scope_badge}{cat_badge}")
+            lines.append(f"- ✅ **{r.get('rule', '')}**{scope_badge}{src_ag}{cat_badge}")
     else:
         lines.append(
             "- *No learned positive rules yet. Click 👍 or calibrate uncertain findings to teach Quasar.*"
@@ -424,8 +455,9 @@ def render_preferences_markdown(prefs: Dict[str, Any]) -> str:
     if avoid_learned:
         for r in avoid_learned:
             scope_badge = f" `[repo: {r['repo']}]`" if r.get("repo") else ""
+            src_ag = f" `[via: {r['sourceSubagent']}]`" if r.get("sourceSubagent") else ""
             cat_badge = f" *({r.get('category', 'general')})*" if r.get("category") else ""
-            lines.append(f"- 🚫 **{r.get('rule', '')}**{scope_badge}{cat_badge}")
+            lines.append(f"- 🚫 **{r.get('rule', '')}**{scope_badge}{src_ag}{cat_badge}")
     else:
         lines.append(
             "- *No learned suppression rules yet. Click 👎 on noisy findings to teach Quasar what to skip.*"
@@ -436,7 +468,41 @@ def render_preferences_markdown(prefs: Dict[str, Any]) -> str:
         lines.append("## 5. Learned Custom Guidelines & Conventions")
         for r in custom_learned:
             scope_badge = f" `[repo: {r['repo']}]`" if r.get("repo") else ""
-            lines.append(f"- 📌 **{r.get('rule', '')}**{scope_badge}")
+            src_ag = f" `[via: {r['sourceSubagent']}]`" if r.get("sourceSubagent") else ""
+            lines.append(f"- 📌 **{r.get('rule', '')}**{scope_badge}{src_ag}")
+        lines.append("")
+
+    lines.append("## 5b. Subagent-Specific Learned Directives (Per-Lens Evolution)")
+    if subagent_learned:
+        lines.append(
+            "> Each specialist `review-*` subagent MUST apply the directives listed under its own name below (in addition to global preferences above):"
+        )
+        lines.append("")
+        by_subagent: Dict[str, List[Dict[str, Any]]] = {}
+        for r in subagent_learned:
+            ag_key = str(r.get("subagent") or "").strip()
+            if ag_key:
+                by_subagent.setdefault(ag_key, []).append(r)
+        for ag_name in sorted(by_subagent.keys()):
+            lines.append(f"### 🤖 `{ag_name}`")
+            for r in by_subagent[ag_name]:
+                sent = r.get("sentiment") or "custom"
+                icon = (
+                    "✅ **Hunt For / Prioritize**:"
+                    if sent in ("prefer", "always", "keep", "upvote")
+                    else (
+                        "🚫 **Suppress / Do Not Flag**:"
+                        if sent in ("avoid", "never", "skip", "downvote")
+                        else "📌 **Directive**:"
+                    )
+                )
+                scope_badge = f" `[repo: {r['repo']}]`" if r.get("repo") else ""
+                lines.append(f"- {icon} {r.get('rule', '')}{scope_badge}")
+            lines.append("")
+    else:
+        lines.append(
+            "- *No subagent-specific directives yet. Click **🎓 Teach / Tune Subagent** on any inline comment (or in Review Subagents) to tailor individual `review-*` lenses.*"
+        )
         lines.append("")
 
     if seed_rules:
@@ -477,14 +543,27 @@ def render_preferences_markdown(prefs: Dict[str, Any]) -> str:
     )
     lines.append("")
 
+    sub_stats = prefs.get("subagentStats") or {}
+    if sub_stats:
+        lines.append("### 🤖 Subagent Feedback & Learning Telemetry")
+        lines.append("| Subagent | 👍 Upvotes | ✅ Staged | 👎 Downvotes | 🗑️ Dismissed |")
+        lines.append("| :--- | :---: | :---: | :---: | :---: |")
+        for ag_name in sorted(sub_stats.keys()):
+            st = sub_stats.get(ag_name) or {}
+            lines.append(
+                f"| **`{ag_name}`** | {st.get('upvotes', 0)} | {st.get('staged', 0)} | {st.get('downvotes', 0)} | {st.get('dismissed', 0)} |"
+            )
+        lines.append("")
+
     if history:
         lines.append("## 9. Recent Meta-Feedback & Skill Evolution Log")
         for item in reversed(history[-15:]):
             ts = (item.get("timestamp") or "")[:19].replace("T", " ")
             action = item.get("action", "feedback")
             title = item.get("findingTitle") or item.get("path") or "General"
+            ag_tag = f" `[🤖 {item['subagent']}]`" if item.get("subagent") else ""
             fb = item.get("userFeedback") or item.get("learnedRule") or ""
-            lines.append(f"- `{ts}` **[{action.upper()}]** *{title}* — {fb}")
+            lines.append(f"- `{ts}` **[{action.upper()}]**{ag_tag} *{title}* — {fb}")
         lines.append("")
 
     return "\n".join(lines)
@@ -506,10 +585,30 @@ def build_prompt_summary(prefs: Dict[str, Any], repo_name: Optional[str] = None)
         r for r in rules if not r.get("repo") or r.get("repo") == repo_name
     ]
     learned_rules = [r for r in applicable_rules if r.get("origin") != "seed_skill"]
+    global_learned = [r for r in learned_rules if not r.get("subagent")]
+    subagent_learned = [r for r in learned_rules if r.get("subagent")]
     seed_rules = [r for r in applicable_rules if r.get("origin") == "seed_skill"]
 
+    subagent_rules_map: Dict[str, Dict[str, Any]] = {}
+    for r in subagent_learned:
+        ag = str(r.get("subagent") or "").strip()
+        if not ag:
+            continue
+        bucket = subagent_rules_map.setdefault(
+            ag,
+            {"preferRules": [], "avoidRules": [], "customRules": [], "rules": []},
+        )
+        bucket["rules"].append(r)
+        sent = r.get("sentiment") or "custom"
+        if sent in ("prefer", "always", "keep", "upvote"):
+            bucket["preferRules"].append(r.get("rule"))
+        elif sent in ("avoid", "never", "skip", "downvote"):
+            bucket["avoidRules"].append(r.get("rule"))
+        else:
+            bucket["customRules"].append(r.get("rule"))
+
     return {
-        "defaultEffort": prefs.get("defaultEffort") if prefs.get("defaultEffort") in ("low", "medium", "high") else "medium",
+        "defaultEffort": prefs.get("defaultEffort") if prefs.get("defaultEffort") in ("low", "medium", "high") else "high",
         "defaultCommentsOnly": bool(prefs.get("defaultCommentsOnly", False)),
         "styleProfile": prefs.get("styleProfile") or {},
         "seedSkills": [
@@ -526,7 +625,7 @@ def build_prompt_summary(prefs: Dict[str, Any], repo_name: Optional[str] = None)
         "seedRulesCount": len(seed_rules),
         "preferRules": [
             r.get("rule")
-            for r in learned_rules
+            for r in global_learned
             if r.get("sentiment") in ("prefer", "always", "keep", "upvote")
         ]
         + [
@@ -536,7 +635,7 @@ def build_prompt_summary(prefs: Dict[str, Any], repo_name: Optional[str] = None)
         ],
         "avoidRules": [
             r.get("rule")
-            for r in learned_rules
+            for r in global_learned
             if r.get("sentiment") in ("avoid", "never", "skip", "downvote")
         ]
         + [
@@ -546,7 +645,7 @@ def build_prompt_summary(prefs: Dict[str, Any], repo_name: Optional[str] = None)
         ],
         "customRules": [
             r.get("rule")
-            for r in learned_rules
+            for r in global_learned
             if r.get("sentiment")
             not in ("prefer", "always", "keep", "upvote", "avoid", "never", "skip", "downvote")
         ]
@@ -556,6 +655,8 @@ def build_prompt_summary(prefs: Dict[str, Any], repo_name: Optional[str] = None)
             if r.get("sentiment")
             not in ("prefer", "always", "keep", "upvote", "avoid", "never", "skip", "downvote")
         ],
+        "subagentRules": subagent_rules_map,
+        "subagentStats": prefs.get("subagentStats") or {},
         "recentEditedDrafts": (prefs.get("editedDraftExamples") or [])[-5:],
         "categoryStats": prefs.get("categoryStats") or {},
         "preferencesMarkdownPath": PREFERENCES_MD_PATH,
@@ -570,19 +671,28 @@ def add_or_update_rule(
     repo: Optional[str] = None,
     source_title: Optional[str] = None,
     origin: str = "learned",
+    subagent: Optional[str] = None,
+    source_subagent: Optional[str] = None,
 ) -> Dict[str, Any]:
     cleaned = rule_text.strip()
     if not cleaned:
         return {}
+    norm_sub = normalize_subagent_name(subagent)
+    norm_src = normalize_subagent_name(source_subagent) or norm_sub
     rules: List[Dict[str, Any]] = prefs.get("rules") or []
-    # Deduplicate by case-insensitive rule text; if a seed rule matches, promote it to learned!
+    # Deduplicate by case-insensitive rule text + subagent scope; if a seed rule matches, promote it to learned!
     for existing in rules:
-        if (existing.get("rule") or "").strip().lower() == cleaned.lower():
+        existing_sub = normalize_subagent_name(existing.get("subagent"))
+        if (existing.get("rule") or "").strip().lower() == cleaned.lower() and existing_sub == norm_sub:
             existing["sentiment"] = sentiment
             existing["origin"] = origin
             existing["category"] = category or existing.get("category") or "general"
             if repo:
                 existing["repo"] = repo
+            if norm_sub:
+                existing["subagent"] = norm_sub
+            if norm_src and not existing.get("sourceSubagent"):
+                existing["sourceSubagent"] = norm_src
             existing["updatedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             return existing
 
@@ -593,6 +703,8 @@ def add_or_update_rule(
         "sentiment": sentiment,
         "category": category or "general",
         "repo": repo,
+        "subagent": norm_sub,
+        "sourceSubagent": norm_src,
         "rule": cleaned,
         "sourceFindingTitle": source_title or "",
     }
@@ -618,6 +730,7 @@ def update_active_session_thread(
     updated_draft: Optional[str] = None,
     prefs: Optional[Dict[str, Any]] = None,
     workspace_dir: Optional[str] = None,
+    subagent: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     try:
         from collect_pr_context import get_session_paths, render_cliffs_notes_markdown
@@ -663,16 +776,19 @@ def update_active_session_thread(
             except Exception:
                 pass
 
+        scope_suffix = f" (scoped to `{subagent}`)" if subagent else ""
+        learner_author = f"Quasar Subagent Learner ({subagent})" if subagent else "Quasar Preference Learner"
+
         if action in ("upvote", "calibrate_keep"):
             target_thread["feedbackRating"] = "up"
             if target_thread.get("status") == "uncertain" or action == "calibrate_keep":
                 target_thread["status"] = "staged"
                 target_thread["uncertaintyResolved"] = True
-            badge = "👍 **Marked Helpful & Learned Preference**"
+            badge = f"👍 **Marked Helpful & Learned Preference{scope_suffix}**"
             note = learned_rule or user_feedback or "Reinforced this finding pattern for future reviews."
             msgs.append(
                 {
-                    "author": "Quasar Preference Learner",
+                    "author": learner_author,
                     "body": f"{badge}\n> {note}",
                     "timestamp": now_iso,
                 }
@@ -681,11 +797,11 @@ def update_active_session_thread(
             target_thread["feedbackRating"] = "down"
             target_thread["status"] = "dismissed"
             target_thread["uncertaintyResolved"] = True
-            badge = "👎 **Dismissed & Learned Suppression Rule**"
+            badge = f"👎 **Dismissed & Learned Suppression Rule{scope_suffix}**"
             note = learned_rule or user_feedback or "Will avoid similar findings in future reviews."
             msgs.append(
                 {
-                    "author": "Quasar Preference Learner",
+                    "author": learner_author,
                     "body": f"{badge}\n> {note}",
                     "timestamp": now_iso,
                 }
@@ -695,7 +811,7 @@ def update_active_session_thread(
             target_thread["uncertaintyResolved"] = True
             msgs.append(
                 {
-                    "author": "Quasar Preference Learner",
+                    "author": learner_author,
                     "body": "📌 **Kept for this review only** (no global rule saved).",
                     "timestamp": now_iso,
                 }
@@ -703,12 +819,16 @@ def update_active_session_thread(
         elif action == "meta_feedback":
             target_thread["feedbackRating"] = "calibrated"
             note = learned_rule or user_feedback
-            body = f"🧠 **Feedback Recorded**:\n> {note}"
+            body = (
+                f"🎓 **Taught Subagent `{subagent}`**:\n> {note}"
+                if subagent
+                else f"🧠 **Feedback Recorded**:\n> {note}"
+            )
             if updated_draft:
                 body += f"\n\n---\n**Updated Draft GitHub Comment**:\n> {target_thread['draftComment']}"
             msgs.append(
                 {
-                    "author": "Quasar Preference Learner",
+                    "author": learner_author,
                     "body": body,
                     "timestamp": now_iso,
                 }
@@ -765,6 +885,7 @@ def main() -> None:
     parser.add_argument("--sentiment", choices=["prefer", "avoid", "custom"], help="Whether Quasar should prefer or avoid this pattern")
     parser.add_argument("--origin", choices=["learned", "seed_skill"], default="learned", help="Rule origin tier")
     parser.add_argument("--repo", help="Optional repository name if rule is repo-specific")
+    parser.add_argument("--subagent", help="Optional review-* subagent name to scope this learned rule/feedback to")
     parser.add_argument("--original-draft", help="Original draft comment before user edit")
     parser.add_argument("--updated-draft", help="Updated draft comment after user edit or refinement")
     parser.add_argument("--add-rule", help="Directly add a preference rule string")
@@ -828,6 +949,8 @@ def main() -> None:
             r for r in (prefs.get("rules") or []) if r.get("id") != args.delete_rule_id
         ]
 
+    norm_arg_subagent = normalize_subagent_name(args.subagent)
+
     if args.add_rule:
         sentiment = args.sentiment or "custom"
         add_or_update_rule(
@@ -837,6 +960,7 @@ def main() -> None:
             category=args.category,
             repo=args.repo,
             origin=args.origin,
+            subagent=norm_arg_subagent,
         )
 
     thread_info: Optional[Dict[str, Any]] = None
@@ -863,6 +987,9 @@ def main() -> None:
         except Exception:
             pass
 
+    thread_subagents = extract_thread_subagents(thread_info)
+    primary_thread_subagent = norm_arg_subagent or (thread_subagents[0] if thread_subagents else None)
+
     if args.record_feedback:
         sev_bucket = normalize_sev_bucket((thread_info or {}).get("severity", "DESIGN"))
         cat_stats = prefs.setdefault("categoryStats", {})
@@ -885,6 +1012,24 @@ def main() -> None:
             unc_stats["calibrated_keep"] = unc_stats.get("calibrated_keep", 0) + 1
         elif args.action == "calibrate_skip":
             unc_stats["calibrated_skip"] = unc_stats.get("calibrated_skip", 0) + 1
+
+        # Track per-subagent performance & learning telemetry
+        stat_targets = [norm_arg_subagent] if norm_arg_subagent else list(thread_subagents)
+        sub_stats_map = prefs.setdefault("subagentStats", {})
+        for ag_target in stat_targets:
+            if not ag_target:
+                continue
+            ag_s = sub_stats_map.setdefault(
+                ag_target, {"upvotes": 0, "downvotes": 0, "staged": 0, "dismissed": 0}
+            )
+            if args.action in ("upvote", "calibrate_keep"):
+                ag_s["upvotes"] = ag_s.get("upvotes", 0) + 1
+            elif args.action in ("downvote", "calibrate_skip"):
+                ag_s["downvotes"] = ag_s.get("downvotes", 0) + 1
+            elif args.action == "stage":
+                ag_s["staged"] = ag_s.get("staged", 0) + 1
+            elif args.action == "dismiss":
+                ag_s["dismissed"] = ag_s.get("dismissed", 0) + 1
 
         finding_title = (thread_info or {}).get("title") or ""
         finding_path = (thread_info or {}).get("path") or ""
@@ -913,6 +1058,8 @@ def main() -> None:
                 repo=args.repo,
                 source_title=finding_title,
                 origin="learned",
+                subagent=norm_arg_subagent,
+                source_subagent=primary_thread_subagent,
             )
 
         if args.action == "edit_draft" and args.original_draft and args.updated_draft:
@@ -923,6 +1070,7 @@ def main() -> None:
                         "timestamp": now_iso,
                         "path": finding_path,
                         "title": finding_title,
+                        "subagent": primary_thread_subagent,
                         "originalDraft": args.original_draft.strip(),
                         "editedDraft": args.updated_draft.strip(),
                     }
@@ -935,6 +1083,7 @@ def main() -> None:
                 "id": f"fb-{len(history) + 1}-{int(datetime.datetime.now().timestamp())}",
                 "timestamp": now_iso,
                 "repo": session_repo,
+                "subagent": norm_arg_subagent or primary_thread_subagent,
                 "threadId": args.thread_id,
                 "path": finding_path,
                 "findingTitle": finding_title,
@@ -956,6 +1105,7 @@ def main() -> None:
             updated_draft=args.updated_draft,
             prefs=prefs,
             workspace_dir=args.workspace_dir,
+            subagent=norm_arg_subagent,
         )
     elif os.path.isfile(active_sess_path_for_main):
         update_active_session_thread(

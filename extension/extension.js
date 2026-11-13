@@ -245,12 +245,12 @@ const EFFORT_LEVEL_SPECS = {
 function normalizeEffortLevel(val) {
   const s = String(val || '').trim().toLowerCase();
   if (s === 'low' || s === 'medium' || s === 'high') return s;
-  return 'medium';
+  return 'high';
 }
 
 function getEffortSpec(level) {
   const norm = normalizeEffortLevel(level);
-  const base = { ...(EFFORT_LEVEL_SPECS[norm] || EFFORT_LEVEL_SPECS.medium) };
+  const base = { ...(EFFORT_LEVEL_SPECS[norm] || EFFORT_LEVEL_SPECS.high) };
   let lensNames = null;
   try {
     if (typeof discoverInstalledReviewAgents === 'function') {
@@ -278,14 +278,14 @@ function getEffortSpec(level) {
 function loadReviewerPreferences() {
   try {
     if (!fs.existsSync(PREFERENCES_JSON_PATH)) {
-      return { defaultEffort: 'medium', defaultCommentsOnly: false, styleProfile: {}, rules: [], categoryStats: {}, feedbackHistory: [] };
+      return { defaultEffort: 'high', defaultCommentsOnly: false, styleProfile: {}, rules: [], categoryStats: {}, feedbackHistory: [] };
     }
     const parsed = JSON.parse(fs.readFileSync(PREFERENCES_JSON_PATH, 'utf-8'));
     parsed.defaultEffort = normalizeEffortLevel(parsed.defaultEffort);
     parsed.defaultCommentsOnly = Boolean(parsed.defaultCommentsOnly);
     return parsed;
   } catch (_) {
-    return { defaultEffort: 'medium', defaultCommentsOnly: false, styleProfile: {}, rules: [], categoryStats: {}, feedbackHistory: [] };
+    return { defaultEffort: 'high', defaultCommentsOnly: false, styleProfile: {}, rules: [], categoryStats: {}, feedbackHistory: [] };
   }
 }
 
@@ -297,6 +297,34 @@ function getDefaultEffortLevel() {
 function getDefaultCommentsOnly() {
   const prefs = loadReviewerPreferences();
   return Boolean(prefs.defaultCommentsOnly);
+}
+
+function getThreadSourceAgents(t) {
+  if (!t || typeof t !== 'object') return [];
+  const out = [];
+  const rawList = Array.isArray(t.sourceAgents)
+    ? t.sourceAgents
+    : typeof t.sourceAgents === 'string'
+    ? t.sourceAgents.split(',')
+    : [];
+  for (const item of rawList) {
+    const cleaned = String(item || '')
+      .replace(/[`*_"']/g, '')
+      .trim();
+    if (cleaned && !out.includes(cleaned)) out.push(cleaned);
+  }
+  const single = String(t.sourceAgent || t.subagent || '')
+    .replace(/[`*_"']/g, '')
+    .trim();
+  if (single && !out.includes(single)) out.unshift(single);
+  return out;
+}
+
+function formatShortSubagentName(agentName) {
+  return String(agentName || '')
+    .trim()
+    .replace(/^review-/, '')
+    .replace(/^quasar-/, '');
 }
 
 function buildEffortPromptInstruction(effortLevel, commentsOnly = false) {
@@ -312,7 +340,7 @@ function buildEffortPromptInstruction(effortLevel, commentsOnly = false) {
     ? ' (instruct `review-architect` to skip the reading tour/mental model and only return API/design findings)'
     : '';
   const lensRule =
-    ` Spawn only the configured lenses for this effort level (\`review_lenses\` in \`pr_context.json\`), skipping any whose \`appliesWhen\` gate clearly does not match this diff.`;
+    ` Spawn only the configured lenses for this effort level (\`review_lenses\` in \`pr_context.json\`), skipping any whose \`appliesWhen\` gate clearly does not match this diff, pass each lens its \`learnedDirectives\` from \`review_lenses[i].learnedDirectives\`, and record \`"sourceAgents": ["<lens-name>"]\` on every finding in \`review_synthesis.json\` (listing all contributing lenses when merging duplicates).`;
 
   const noChatQuestionsRule =
     ` Do NOT call \`ask_question\` during the review — complete and publish the review uninterrupted, and flag any borderline or preference-dependent comments with \`"status": "uncertain"\` so the user can review them in the UI alongside the code.`;
@@ -330,8 +358,8 @@ function buildEffortPromptInstruction(effortLevel, commentsOnly = false) {
       `EFFORT LEVEL: ${level.toUpperCase()} (FAST SINGLE-PASS — NO SUBAGENTS). ` +
       `Do NOT call \`invoke_subagent\`. Read \`pr_context.json\` and \`pr.diff\` directly in a single fast pass, ` +
       (commentsOnly
-        ? `produce only high-confidence review comments (\`findings\`) and \`existingCommentAssessments\``
-        : `synthesize the concise CliffsNotes Study Guide and Guided Tour plus only obvious high-confidence bugs/blockers`) +
+        ? `produce only high-confidence review comments (\`findings\` with \`"sourceAgents": ["quasar-single-pass"]\`) and \`existingCommentAssessments\``
+        : `synthesize the concise CliffsNotes Study Guide and Guided Tour plus only obvious high-confidence bugs/blockers (with \`"sourceAgents": ["quasar-single-pass"]\`)`) +
       `, and immediately run ${publishCmd}.` +
       noChatQuestionsRule
     );
@@ -340,7 +368,7 @@ function buildEffortPromptInstruction(effortLevel, commentsOnly = false) {
     return (
       modePrefix +
       `EFFORT LEVEL: HIGH (DEEP MULTI-LENS PIPELINE — ${lensNames.length} CONFIGURED LENSES). ` +
-      `Spawn ${lensList}${architectNote} in a single parallel \`invoke_subagent\` call with \`Model: "inherit"\`, then do thorough false-positive filtering (merging duplicate findings across lenses) before running ${publishCmd}.` +
+      `Spawn ${lensList}${architectNote} in a single parallel \`invoke_subagent\` call with \`Model: "inherit"\`, then do thorough false-positive filtering (merging duplicate findings across lenses while preserving \`"sourceAgents"\`) before running ${publishCmd}.` +
       lensRule +
       noChatQuestionsRule
     );
@@ -348,7 +376,7 @@ function buildEffortPromptInstruction(effortLevel, commentsOnly = false) {
   return (
     modePrefix +
     `EFFORT LEVEL: ${level.toUpperCase()} (BALANCED — ${lensNames.length} CONFIGURED FAST FLASH LENSES). ` +
-    `Spawn ${lensList}${architectNote} in a single parallel \`invoke_subagent\` call using \`Model: "flash"\` (do NOT spawn a second sequential \`review-advocate\` wave), filter their findings directly, and immediately run ${publishCmd}.` +
+    `Spawn ${lensList}${architectNote} in a single parallel \`invoke_subagent\` call using \`Model: "flash"\` (do NOT spawn a second sequential \`review-advocate\` wave), filter their findings directly (preserving \`"sourceAgents"\`), and immediately run ${publishCmd}.` +
     lensRule +
     noChatQuestionsRule
   );
@@ -2525,10 +2553,17 @@ class CommentsTreeProvider {
           : isOwned && !isFixed && t.selectedSolution
           ? ' • 🧭 Solution ✓'
           : '';
+        const srcAgents = !isExistingGh ? getThreadSourceAgents(t) : [];
+        const srcDescSuffix =
+          srcAgents.length > 0
+            ? ` • 🤖 ${srcAgents.map(formatShortSubagentName).join('+')}`
+            : '';
         item.description =
           (isExistingGh && inferredAuthor
             ? `@${inferredAuthor.replace(/^@/, '')} • ${locStr}`
-            : locStr) + solDescSuffix;
+            : locStr) +
+          srcDescSuffix +
+          solDescSuffix;
         item.contextValue = isFixed
           ? 'thread-fixed'
           : t.status === 'uncertain'
@@ -2571,6 +2606,9 @@ class CommentsTreeProvider {
         const tip = new vscode.MarkdownString(
           `### ${prefix} ${t.title || 'Comment'}\n` +
             fileHeaderMd +
+            (srcAgents.length > 0
+              ? `**🤖 Suggested by**: ${srcAgents.map((a) => `\`${a}\``).join(', ')}\n\n`
+              : '') +
             (isFixed && t.fixedSummary
               ? `**✅ Applied Fix**: ${t.fixedSummary}\n\n`
               : '') +
@@ -2671,25 +2709,60 @@ class ChecksTreeProvider {
       children.push(configureLensesItem);
 
       const agents = resolveReviewLenses();
+      const prefsData = loadReviewerPreferences();
+      const allRules = Array.isArray(prefsData.rules) ? prefsData.rules : [];
+      const subStatsMap = prefsData.subagentStats || {};
       for (const ag of agents) {
+        const agRules = allRules.filter(
+          (r) =>
+            r &&
+            r.origin !== 'seed_skill' &&
+            String(r.subagent || '').toLowerCase() === String(ag.name || '').toLowerCase()
+        );
+        const agStat = subStatsMap[ag.name] || {};
         const agItem = new vscode.TreeItem(
           `${ag.isCustom ? '🧩' : '🤖'} ${ag.name}`,
           vscode.TreeItemCollapsibleState.None
         );
+        agItem.contextValue = 'review-subagent';
+        agItem.agent = ag;
         const effortBadge =
           ag.role !== 'lens'
             ? 'helper'
             : ag.efforts.length > 0
             ? ag.efforts.join('/')
             : 'opt-in (off)';
+        const learnedBadge = agRules.length > 0 ? ` • 🧠 ${agRules.length} learned` : '';
+        const statBadge =
+          (agStat.upvotes || 0) + (agStat.downvotes || 0) > 0
+            ? ` • 👍${agStat.upvotes || 0}/👎${agStat.downvotes || 0}`
+            : '';
         agItem.description = `${ag.isCustom ? 'Custom' : 'Built-in'} • ${effortBadge}${
           ag.isOverridden ? ' ✎' : ''
-        } • ${ag.description || ag.scopeLabel}`;
+        }${learnedBadge}${statBadge} • ${ag.description || ag.scopeLabel}`;
+        const learnedTooltipSection =
+          agRules.length > 0
+            ? `\n**🧠 Learned Directives (${agRules.length})**:\n` +
+              agRules
+                .slice(-8)
+                .map((r) => {
+                  const sIcon =
+                    r.sentiment === 'prefer'
+                      ? '✅'
+                      : r.sentiment === 'avoid'
+                      ? '🚫'
+                      : '📌';
+                  return `- ${sIcon} ${r.rule || ''}`;
+                })
+                .join('\n') +
+              '\n\n'
+            : '\n';
         agItem.tooltip = new vscode.MarkdownString(
           `### ${ag.isCustom ? '🧩 Custom' : '🤖 Built-in'} Review Subagent: \`${ag.name}\`\n\n` +
             `${ag.description ? `${ag.description}\n\n` : ''}` +
-            `**Location**: \`${ag.mdPath}\`\n\n` +
-            `*Click to open \`AGENT.md\`, refine with Antigravity, or manage this subagent.*`
+            `**Location**: \`${ag.mdPath}\`\n` +
+            learnedTooltipSection +
+            `*Click to teach/tune learned directives, refine with Antigravity, or open \`AGENT.md\`.*`
         );
         agItem.command = {
           command: 'quasar.manageReviewAgents',
@@ -3241,15 +3314,35 @@ function activate(context) {
    * inline CommentThread widget right below it) stays centered on screen even after Monaco's
    * async diff chunks, folded unchanged regions, and ZoneWidget heights finish laying out.
    */
-  function revealRangeInVisibleEditor(targetFsPath, targetRange, focusCursor = true) {
+  function revealRangeInVisibleEditor(
+    targetFsPath,
+    targetRange,
+    focusCursor = true,
+    opts = {}
+  ) {
     if (!targetFsPath || !targetRange) return;
     const myToken = ++activeRevealToken;
     const normTarget = path.resolve(targetFsPath);
-    const applyReveal = () => {
-      if (myToken !== activeRevealToken) return;
-      const editor = vscode.window.visibleTextEditors.find(
+    const focusCommentAnchor = Boolean(opts && opts.focusCommentAnchor);
+    let hasRevealedOnce = false;
+
+    const findTargetEditor = () => {
+      const active = vscode.window.activeTextEditor;
+      if (
+        active &&
+        active.document &&
+        path.resolve(active.document.uri.fsPath) === normTarget
+      ) {
+        return active;
+      }
+      return vscode.window.visibleTextEditors.find(
         (ed) => ed && ed.document && path.resolve(ed.document.uri.fsPath) === normTarget
       );
+    };
+
+    const applyReveal = () => {
+      if (myToken !== activeRevealToken) return;
+      const editor = findTargetEditor();
       if (!editor) return;
       const maxLine = Math.max(0, editor.document.lineCount - 1);
       const clampedStart = new vscode.Position(
@@ -3260,22 +3353,49 @@ function activate(context) {
         Math.min(maxLine, Math.max(clampedStart.line, targetRange.end.line)),
         0
       );
-      const safeRange = new vscode.Range(clampedStart, clampedEnd);
-      if (focusCursor) {
+      // CommentThread widgets anchor below range.end.line; for multi-line findings,
+      // center the anchor line so the expanded comment box isn't pushed off-screen.
+      const useEndAnchor =
+        focusCommentAnchor && clampedEnd.line - clampedStart.line > 6;
+      const revealTarget = useEndAnchor
+        ? new vscode.Range(clampedEnd, clampedEnd)
+        : new vscode.Range(clampedStart, clampedEnd);
+      const cursorPos = useEndAnchor ? clampedEnd : clampedStart;
+
+      if (focusCursor && !hasRevealedOnce) {
         const curSel = editor.selection;
         if (
           !curSel ||
-          curSel.active.line !== clampedStart.line ||
-          curSel.anchor.line !== clampedStart.line
+          curSel.active.line !== cursorPos.line ||
+          curSel.anchor.line !== cursorPos.line
         ) {
-          editor.selection = new vscode.Selection(clampedStart, clampedStart);
+          editor.selection = new vscode.Selection(cursorPos, cursorPos);
         }
       }
-      editor.revealRange(safeRange, vscode.TextEditorRevealType.InCenter);
+
+      if (hasRevealedOnce && editor.visibleRanges && editor.visibleRanges.length > 0) {
+        const vis = editor.visibleRanges[0];
+        const anchorLine = revealTarget.end.line;
+        const visSpan = Math.max(1, vis.end.line - vis.start.line);
+        const relPos = (anchorLine - vis.start.line) / visSpan;
+        if (
+          anchorLine >= vis.start.line &&
+          anchorLine <= vis.end.line &&
+          relPos >= 0.15 &&
+          relPos <= 0.70
+        ) {
+          return;
+        }
+      }
+
+      hasRevealedOnce = true;
+      editor.revealRange(revealTarget, vscode.TextEditorRevealType.InCenter);
     };
+
     applyReveal();
-    setTimeout(applyReveal, 80);
-    setTimeout(applyReveal, 240);
+    for (const delayMs of [60, 180, 350, 600, 950]) {
+      setTimeout(applyReveal, delayMs);
+    }
   }
 
   function updateStatusBar(session) {
@@ -3415,20 +3535,43 @@ function activate(context) {
         solutionOptionsMd = optLines.join('\n');
       }
 
+      const srcAgents =
+        t.kind !== 'github_existing' && t.kind !== 'user_qa' ? getThreadSourceAgents(t) : [];
+      const shortAgentSummary =
+        srcAgents.length > 0 ? srcAgents.map(formatShortSubagentName).join('+') : '';
+      const subagentLabelSuffix = shortAgentSummary ? ` [🤖 ${shortAgentSummary}]` : '';
+
+      let subagentActionBarMd = '';
+      if (t.kind === 'ai_candidate' || t.kind === 'user_staged') {
+        if (srcAgents.length > 0) {
+          const teachLinks = srcAgents
+            .map((ag) => {
+              const agArg = encodeURIComponent(JSON.stringify({ threadId: t.id, subagent: ag }));
+              return `[$(mortar-board) Teach \`${ag}\`...](command:quasar.teachSubagent?${agArg})`;
+            })
+            .join('  •  ');
+          subagentActionBarMd = `\n\n🤖 **Suggested by**: ${srcAgents
+            .map((a) => `\`${a}\``)
+            .join(', ')}  •  ${teachLinks}`;
+        } else {
+          subagentActionBarMd = `\n\n[$(mortar-board) Teach / Tune Review Subagent...](command:quasar.teachSubagent?${cmdArg})`;
+        }
+      }
+
       const isAlreadyAddressedGh =
         t.kind === 'github_existing' &&
         ghTriage &&
         ghTriage.triageStatus === 'addressed_or_refuted';
       const fixActionBarMd =
         t.status === 'fixed'
-          ? `\n\n---\n✅ **Fixed in Working Tree**${t.fixedSummary ? ` — ${t.fixedSummary}` : ''}`
+          ? `\n\n---\n✅ **Fixed in Working Tree**${t.fixedSummary ? ` — ${t.fixedSummary}` : ''}${subagentActionBarMd}`
           : isFixInProgress
-          ? `\n\n---\n⏳ **🔧 Agent Fix in Progress...**  •  [$(debug-restart) Retry Fix Now](command:quasar.fixSingleComment?${cmdArg})  •  [$(close) Remove from Fix Queue](command:quasar.unqueueForFix?${cmdArg})`
+          ? `\n\n---\n⏳ **🔧 Agent Fix in Progress...**  •  [$(debug-restart) Retry Fix Now](command:quasar.fixSingleComment?${cmdArg})  •  [$(close) Remove from Fix Queue](command:quasar.unqueueForFix?${cmdArg})${subagentActionBarMd}`
           : isQueuedForFix
-          ? `\n\n---\n✅ **🔧 Queued for Agent Fix**  •  [$(close) Remove from Fix Queue](command:quasar.unqueueForFix?${cmdArg})  •  [$(wrench) Fix Now](command:quasar.fixSingleComment?${cmdArg})`
+          ? `\n\n---\n✅ **🔧 Queued for Agent Fix**  •  [$(close) Remove from Fix Queue](command:quasar.unqueueForFix?${cmdArg})  •  [$(wrench) Fix Now](command:quasar.fixSingleComment?${cmdArg})${subagentActionBarMd}`
           : isAlreadyAddressedGh
           ? `\n\n---\n✅ **No Code Changes Needed**  •  [$(tools) Queue Fix Anyway](command:quasar.queueForFix?${cmdArg})`
-          : `\n\n---\n[$(tools) Queue for Agent Fix](command:quasar.queueForFix?${cmdArg})  •  [$(wrench) Fix Now](command:quasar.fixSingleComment?${cmdArg})`;
+          : `\n\n---\n[$(tools) Queue for Agent Fix](command:quasar.queueForFix?${cmdArg})  •  [$(wrench) Fix Now](command:quasar.fixSingleComment?${cmdArg})${subagentActionBarMd}`;
 
       const actionTargetIdx =
         t.kind === 'github_existing'
@@ -3439,11 +3582,26 @@ function activate(context) {
                 : rawMessages.length - 1
             )
           : 0;
-      const commentPayloads = rawMessages.map((m, idx) => ({
-        authorName: m.author || 'Quasar',
-        bodyText: (m.body || '') + (idx === actionTargetIdx ? solutionOptionsMd + fixActionBarMd : ''),
-        contextValue: `quasar-comment:${fixStateTag}`,
-      }));
+      const commentPayloads = rawMessages.map((m, idx) => {
+        const baseAuthor = m.author || 'Quasar';
+        const authorWithSubagent =
+          idx === 0 &&
+          srcAgents.length > 0 &&
+          baseAuthor === 'Quasar' &&
+          (t.kind === 'ai_candidate' || t.kind === 'user_staged')
+            ? `Quasar • 🤖 ${srcAgents.join(', ')}`
+            : baseAuthor;
+        let cleanBody = String(m.body || '');
+        if (idx === actionTargetIdx && srcAgents.length > 0) {
+          // Avoid duplicate "Suggested by" lines since subagentActionBarMd includes clickable Teach links
+          cleanBody = cleanBody.replace(/\n\n🤖 \*Suggested by\*: [^\n]+/g, '');
+        }
+        return {
+          authorName: authorWithSubagent,
+          bodyText: cleanBody + (idx === actionTargetIdx ? solutionOptionsMd + fixActionBarMd : ''),
+          contextValue: `quasar-comment:${fixStateTag}`,
+        };
+      });
       const comments = commentPayloads.map((cp) => {
         const md = new vscode.MarkdownString(cp.bodyText, true);
         md.isTrusted = true;
@@ -3476,11 +3634,11 @@ function activate(context) {
 
       if (t.status === 'fixed') {
         desiredContextValue = `fixed:${fixStateTag}`;
-        desiredLabel = `✅ Fixed in Working Tree — ${t.title || ''}`;
+        desiredLabel = `✅ Fixed in Working Tree${subagentLabelSuffix} — ${t.title || ''}`;
         initialCollapsible = vscode.CommentThreadCollapsibleState.Collapsed;
       } else if (t.status === 'uncertain') {
         desiredContextValue = `uncertain:${fixStateTag}${hasSolutionsTag}`;
-        desiredLabel = `🤔 Flagged to Review (Calibrate Preference)${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
+        desiredLabel = `🤔 Flagged to Review (Calibrate Preference)${subagentLabelSuffix}${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
       } else if (t.status === 'staged') {
         desiredContextValue = `staged:${fixStateTag}${hasSolutionsTag}`;
         const sev = (t.severity || '').toUpperCase();
@@ -3492,7 +3650,7 @@ function activate(context) {
           ? '🟢 Nit'
           : '💬 Review';
         desiredContextValue = `staged:${fixStateTag}${hasSolutionsTag}`;
-        desiredLabel = `✅ Staged for GitHub Review (${badge})${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
+        desiredLabel = `✅ Staged for GitHub Review (${badge})${subagentLabelSuffix}${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
       } else if (t.kind === 'ai_candidate') {
         desiredContextValue = `candidate:${fixStateTag}${hasSolutionsTag}`;
         const sev = (t.severity || '').toUpperCase();
@@ -3501,7 +3659,7 @@ function activate(context) {
           : sev.includes('DESIGN')
           ? '🟡 Design'
           : '🟢 Nit';
-        desiredLabel = `${badge} Draft (Unstaged)${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
+        desiredLabel = `${badge} Draft (Unstaged)${subagentLabelSuffix}${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
       } else if (t.kind === 'user_qa') {
         desiredContextValue = `qa:${fixStateTag}${hasSolutionsTag}`;
         desiredLabel = `💬 Quasar Q&A${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
@@ -3632,6 +3790,10 @@ function activate(context) {
       ? Math.max(startLine0, liveThread.range.end.line)
       : Math.max(startLine0, (t.endLine || t.startLine || 1) - 1);
     const targetRange = new vscode.Range(startLine0, 0, endLine0, 0);
+    const initialSelection =
+      endLine0 - startLine0 > 6
+        ? new vscode.Range(endLine0, 0, endLine0, 0)
+        : targetRange;
 
     if (!t.path) {
       const tf = t.targetFile || '';
@@ -3639,11 +3801,13 @@ function activate(context) {
       if (localFile && fs.existsSync(localFile)) {
         const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(localFile));
         await vscode.window.showTextDocument(doc, {
-          selection: targetRange,
+          selection: initialSelection,
           preserveFocus,
           preview: true,
         });
-        revealRangeInVisibleEditor(localFile, targetRange, !preserveFocus);
+        revealRangeInVisibleEditor(localFile, targetRange, !preserveFocus, {
+          focusCommentAnchor: true,
+        });
         return;
       }
       await vscode.commands.executeCommand('quasar.openCliffsNotes');
@@ -3661,11 +3825,13 @@ function activate(context) {
     if (!session.baseSnapshotRoot || !fs.existsSync(baseFilePath)) {
       const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(headFilePath));
       await vscode.window.showTextDocument(doc, {
-        selection: targetRange,
+        selection: initialSelection,
         preserveFocus,
         preview: true,
       });
-      revealRangeInVisibleEditor(headFilePath, targetRange, !preserveFocus);
+      revealRangeInVisibleEditor(headFilePath, targetRange, !preserveFocus, {
+        focusCommentAnchor: true,
+      });
       return;
     }
 
@@ -3677,7 +3843,7 @@ function activate(context) {
       headUri,
       `${path.basename(t.path)} (PR Diff)`,
       {
-        selection: targetRange,
+        selection: initialSelection,
         preserveFocus,
         preview: true,
       }
@@ -3685,7 +3851,9 @@ function activate(context) {
     if (liveThread) {
       liveThread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
     }
-    revealRangeInVisibleEditor(headFilePath, targetRange, !preserveFocus);
+    revealRangeInVisibleEditor(headFilePath, targetRange, !preserveFocus, {
+      focusCommentAnchor: true,
+    });
   }
 
   /**
@@ -4075,6 +4243,7 @@ function activate(context) {
             : `${t.status === 'staged' ? '📤 Staged • ' : '📝 Draft • '}${sev}`;
         const canStage = t.kind === 'ai_candidate' || t.kind === 'user_staged';
         const isStaged = t.status === 'staged';
+        const srcAgents = !isExisting ? getThreadSourceAgents(t) : [];
         const cleanTitle = String(t.title || path.basename(t.path || '')).replace(
           /^(?:🛠️|⚠️|✅|💬|❓|👀|🤔|🔴|🟡|🟢)\s*\[[^\]]+\]\s*/,
           ''
@@ -4090,6 +4259,13 @@ function activate(context) {
                     ? 'q-pill-accent'
                     : ''
                 }">${escapeHtmlText(badgeText)}</span>
+                ${
+                  srcAgents.length > 0
+                    ? `<span class="q-pill" title="Suggested by ${escapeHtmlText(
+                        srcAgents.join(', ')
+                      )}">🤖 ${escapeHtmlText(srcAgents.join(', '))}</span>`
+                    : ''
+                }
                 <a href="#" class="q-stop-link" data-act="jumpToThread" data-thread-id="${escapeHtmlText(
                   t.id
                 )}">${escapeHtmlText(cleanTitle)}</a>
@@ -4105,6 +4281,13 @@ function activate(context) {
                 <button type="button" class="q-btn q-btn-sm" data-act="jumpToThread" data-thread-id="${escapeHtmlText(
                   t.id
                 )}">🔍 Jump</button>
+                ${
+                  canStage
+                    ? `<button type="button" class="q-btn q-btn-sm" data-act="teachSubagent" data-thread-id="${escapeHtmlText(
+                        t.id
+                      )}" title="Teach or tune the review subagent that suggested this comment">🎓 Teach Subagent</button>`
+                    : ''
+                }
                 ${
                   t.status !== 'fixed'
                     ? `<button type="button" class="q-btn q-btn-sm" data-act="commentOnThread" data-thread-id="${escapeHtmlText(
@@ -4940,6 +5123,8 @@ function activate(context) {
           vscode.postMessage({ type: 'dismissThread', threadId: el.getAttribute('data-thread-id') });
         } else if (act === 'calibrateThread') {
           vscode.postMessage({ type: 'calibrateThread', threadId: el.getAttribute('data-thread-id') });
+        } else if (act === 'teachSubagent') {
+          vscode.postMessage({ type: 'teachSubagent', threadId: el.getAttribute('data-thread-id') });
         } else if (act === 'selectSolutionOption') {
           vscode.postMessage({
             type: 'selectSolutionOption',
@@ -5123,6 +5308,13 @@ function activate(context) {
         if (t) {
           await vscode.commands.executeCommand('quasar.calibrateFindingPreference', {
             threadData: t,
+          });
+        }
+      } else if (msg.type === 'teachSubagent') {
+        const t = (curSession.threads || []).find((th) => th.id === msg.threadId);
+        if (t) {
+          await vscode.commands.executeCommand('quasar.teachSubagent', {
+            threadId: t.id,
           });
         }
       } else if (msg.type === 'selectSolutionOption') {
@@ -5778,7 +5970,7 @@ function activate(context) {
         (await vscode.window.showInputBox({
           title: 'Quasar: GitHub PR Link or Local Branch',
           prompt: 'Paste a GitHub PR URL/number, or enter a local branch name (e.g. feature/my-branch or HEAD)',
-          placeHolder: 'https://github.com/flutter/packages/pull/13265 or feature/my-branch',
+          placeHolder: 'https://github.com/owner/repo/pull/123 or feature/my-branch',
         }));
       if (!prUrl || !prUrl.trim()) return;
 
@@ -6154,7 +6346,7 @@ function activate(context) {
   function syncPrimaryThreadMessageInJs(t) {
     if (!t || !Array.isArray(t.messages) || t.messages.length === 0) return;
     const first = t.messages[0];
-    if (!first || first.author !== 'Quasar') return;
+    if (!first || !String(first.author || '').startsWith('Quasar')) return;
     const firstBody = String(first.body || '');
     if (
       !firstBody.includes('**Draft GitHub Comment**:') &&
@@ -6166,19 +6358,24 @@ function activate(context) {
     const title = t.title || 'Review Finding';
     const why = t.whyItMatters || '';
     const draft = t.draftComment || '';
+    const srcAgents = getThreadSourceAgents(t);
+    const srcMd =
+      srcAgents.length > 0
+        ? `\n\n🤖 *Suggested by*: ${srcAgents.map((a) => `\`${a}\``).join(', ')}`
+        : '';
     if (t.status === 'uncertain') {
       const q =
         t.uncertaintyQuestion ||
         `Do you want Quasar to flag issues like "${title}" in future reviews, or skip this pattern?`;
       first.body =
-        `### 🤔 Preference Check: ${title}\n\n` +
+        `### 🤔 Preference Check: ${title}${srcMd}\n\n` +
         `**Question for You**: *${q}*\n\n` +
         `*Context & Trade-off*: ${why}\n\n` +
         `---\n` +
         `**Candidate GitHub Comment (if kept)**:\n> ${draft}\n\n` +
         `*(Use the **🤔 Calibrate Preference** button above or 👍/👎 to teach Quasar how to handle this in the future.)*`;
     } else {
-      const parts = [`**${title}**`];
+      const parts = [`**${title}**${srcMd}`];
       if (why) parts.push(`*CliffsNotes Context*: ${why}`);
       if (draft) parts.push(`---\n**Draft GitHub Comment**:\n> ${draft}`);
       first.body = parts.join('\n\n');
@@ -6712,20 +6909,44 @@ function activate(context) {
         target.uncertaintyQuestion ||
         `Do you want Quasar to flag issues like "${target.title}" in future reviews?`;
       const category = target.preferenceCategory || 'general';
+      const targetSubagents = getThreadSourceAgents(target);
+      const primarySubagent = targetSubagents[0] || '';
 
       const options = [
         {
           label: '$(check) Yes — Stage this comment & flag similar cases in future reviews',
-          description: 'Saves a "Prefer" rule so Quasar actively looks for this pattern',
+          description: 'Saves a global "Prefer" rule across all review lenses',
           action: 'calibrate_keep',
           defaultRule: `Always flag ${category.replace(/_/g, ' ')} issues like: ${target.title}`,
         },
+        ...(primarySubagent
+          ? [
+              {
+                label: `$(mortar-board) Yes (Subagent-Only) — Teach \`${primarySubagent}\` to flag similar cases`,
+                description: `Stages comment & scopes the learned rule strictly to ${primarySubagent}`,
+                action: 'calibrate_keep',
+                subagent: primarySubagent,
+                defaultRule: `Always flag ${category.replace(/_/g, ' ')} issues like: ${target.title}`,
+              },
+            ]
+          : []),
         {
           label: '$(circle-slash) No — Dismiss this & skip similar patterns in future reviews',
-          description: 'Saves an "Avoid" rule so Quasar stops flagging this pattern',
+          description: 'Saves a global "Avoid" rule across all review lenses',
           action: 'calibrate_skip',
           defaultRule: `Do not flag ${category.replace(/_/g, ' ')} issues like: ${target.title}`,
         },
+        ...(primarySubagent
+          ? [
+              {
+                label: `$(mortar-board) No (Subagent-Only) — Teach \`${primarySubagent}\` to stop flagging this`,
+                description: `Dismisses comment & scopes the suppression rule strictly to ${primarySubagent}`,
+                action: 'calibrate_skip',
+                subagent: primarySubagent,
+                defaultRule: `Do not flag ${category.replace(/_/g, ' ')} issues like: ${target.title}`,
+              },
+            ]
+          : []),
         {
           label: '$(pin) Keep this comment for this PR only (do not save a global rule)',
           description: 'Moves finding to Candidate without changing long-term preferences',
@@ -6741,7 +6962,9 @@ function activate(context) {
       ];
 
       const picked = await vscode.window.showQuickPick(options, {
-        title: `🤔 Calibrate Preference: ${target.title}`,
+        title: `🤔 Calibrate Preference: ${target.title}${
+          primarySubagent ? ` (${primarySubagent})` : ''
+        }`,
         placeHolder: question,
       });
       if (!picked) return;
@@ -6754,15 +6977,19 @@ function activate(context) {
       let ruleText = picked.defaultRule;
       if (picked.action !== 'calibrate_once') {
         const refinedRule = await vscode.window.showInputBox({
-          title: 'Confirm or Customize Learned Preference Rule',
+          title: picked.subagent
+            ? `Confirm Learned Rule for ${picked.subagent}`
+            : 'Confirm or Customize Learned Preference Rule',
           value: picked.defaultRule,
-          prompt: `Question: "${question}" — Edit the rule Quasar will remember for future reviews (or press Enter to accept)`,
+          prompt: `Question: "${question}" — Edit the rule ${
+            picked.subagent || 'Quasar'
+          } will remember for future reviews (or press Enter to accept)`,
         });
         if (refinedRule === undefined) return;
         ruleText = refinedRule.trim() || picked.defaultRule;
       }
 
-      await runManagePreferences([
+      const calArgs = [
         '--record-feedback',
         '--thread-id',
         id,
@@ -6774,13 +7001,17 @@ function activate(context) {
         question,
         '--learned-rule',
         ruleText,
-      ]);
+      ];
+      if (picked.subagent) {
+        calArgs.push('--subagent', picked.subagent);
+      }
+      await runManagePreferences(calArgs);
       refreshAllUI(false);
       vscode.window.showInformationMessage(
         picked.action === 'calibrate_keep'
-          ? `✅ Staged comment & learned preference: "${ruleText}"`
+          ? `✅ Staged comment & taught ${picked.subagent || 'Quasar'}: "${ruleText}"`
           : picked.action === 'calibrate_skip'
-          ? `🚫 Dismissed & learned suppression rule: "${ruleText}"`
+          ? `🚫 Dismissed & taught ${picked.subagent || 'Quasar'}: "${ruleText}"`
           : `📌 Kept comment for this review without saving a global rule.`
       );
     })
@@ -6793,14 +7024,26 @@ function activate(context) {
       if (!session || !id) return;
       const target = (session.threads || []).find((t) => t.id === id);
       if (!target) return;
+      const upSubagent = getThreadSourceAgents(target)[0] || '';
 
       const quickChoices = [
         {
           label: '$(thumbsup) High-Signal Catch — Flag more issues like this in future reviews',
-          description: 'Reinforces this pattern and stages the comment',
+          description: 'Reinforces this pattern globally and stages the comment',
           rule: `Prioritize findings like "${target.title}" (${target.whyItMatters || target.severity || 'high signal'})`,
           stage: true,
         },
+        ...(upSubagent
+          ? [
+              {
+                label: `$(mortar-board) Reinforce in \`${upSubagent}\` Only — Stage & teach \`${upSubagent}\``,
+                description: `Scopes this positive rule specifically to ${upSubagent}`,
+                rule: `Prioritize findings like "${target.title}" (${target.whyItMatters || target.severity || 'high signal'})`,
+                subagent: upSubagent,
+                stage: true,
+              },
+            ]
+          : []),
         {
           label: '$(thumbsup) Good Catch (Keep as Candidate without staging yet)',
           description: 'Reinforces this pattern without staging right now',
@@ -6815,7 +7058,7 @@ function activate(context) {
       ];
 
       const picked = await vscode.window.showQuickPick(quickChoices, {
-        title: `👍 Helpful Feedback: ${target.title}`,
+        title: `👍 Helpful Feedback: ${target.title}${upSubagent ? ` (${upSubagent})` : ''}`,
         placeHolder: 'How should Quasar learn from this positive feedback?',
       });
       if (!picked) return;
@@ -6836,7 +7079,7 @@ function activate(context) {
         saveActiveSession(session);
       }
 
-      await runManagePreferences([
+      const upArgs = [
         '--record-feedback',
         '--thread-id',
         id,
@@ -6850,9 +7093,16 @@ function activate(context) {
         learnedRule,
         '--learned-rule',
         learnedRule,
-      ]);
+      ];
+      if (picked.subagent) {
+        upArgs.push('--subagent', picked.subagent);
+      }
+      await runManagePreferences(upArgs);
       refreshAllUI(false);
-      vscode.window.setStatusBarMessage(`👍 Quasar learned: "${learnedRule}"`, 4000);
+      vscode.window.setStatusBarMessage(
+        `👍 Taught ${picked.subagent || 'Quasar'}: "${learnedRule}"`,
+        4000
+      );
     })
   );
 
@@ -6863,11 +7113,23 @@ function activate(context) {
       if (!session || !id) return;
       const target = (session.threads || []).find((t) => t.id === id);
       if (!target) return;
+      const downSubagent = getThreadSourceAgents(target)[0] || '';
 
       const reasons = [
+        ...(downSubagent
+          ? [
+              {
+                label: `$(mortar-board) Tune \`${downSubagent}\` — Stop \`${downSubagent}\` from flagging patterns like this`,
+                description: `Dismisses comment & scopes suppression rule strictly to ${downSubagent} (other lenses unaffected)`,
+                category: target.preferenceCategory || 'nit_threshold',
+                subagent: downSubagent,
+                rule: `Do not flag patterns similar to: ${target.title}`,
+              },
+            ]
+          : []),
         {
-          label: '$(circle-slash) Too nitpicky / low signal — stop flagging similar nits',
-          description: 'Dismisses comment and teaches Quasar to skip this type of nit',
+          label: '$(circle-slash) Too nitpicky / low signal — stop flagging similar nits (Global)',
+          description: 'Dismisses comment and teaches all Quasar lenses to skip this type of nit',
           category: 'nit_threshold',
           rule: `Skip low-signal nits similar to: ${target.title}`,
         },
@@ -6875,6 +7137,7 @@ function activate(context) {
           label: '$(shield) False positive — already guaranteed safe by surrounding code',
           description: 'Dismisses comment and reminds Quasar to verify upstream invariants for this pattern',
           category: 'false_positive',
+          subagent: downSubagent || undefined,
           rule: `Verify upstream callers/invariants before flagging: ${target.title}`,
         },
         {
@@ -6889,19 +7152,26 @@ function activate(context) {
           action: 'rewrite',
         },
         {
-          label: '$(pencil) Write custom feedback to teach Quasar...',
+          label: '$(pencil) Write custom feedback to teach Quasar or this subagent...',
           description: 'Explain in your own words why this feedback missed the mark',
           action: 'custom',
         },
       ];
 
       const picked = await vscode.window.showQuickPick(reasons, {
-        title: `👎 Feedback on "${target.title}"`,
+        title: `👎 Feedback on "${target.title}"${downSubagent ? ` (${downSubagent})` : ''}`,
         placeHolder: 'Why was this comment not useful? Quasar will learn from your choice.',
       });
       if (!picked) return;
 
       if (picked.action === 'rewrite' || picked.action === 'custom') {
+        if (downSubagent && picked.action === 'custom') {
+          await vscode.commands.executeCommand('quasar.teachSubagent', {
+            threadId: id,
+            subagent: downSubagent,
+          });
+          return;
+        }
         await vscode.commands.executeCommand('quasar.giveMetaFeedback', {
           threadId: id,
           mode: picked.action,
@@ -6910,14 +7180,18 @@ function activate(context) {
       }
 
       const customRule = await vscode.window.showInputBox({
-        title: 'Confirm Suppression Rule for Future Reviews',
+        title: picked.subagent
+          ? `Confirm Suppression Rule for ${picked.subagent}`
+          : 'Confirm Suppression Rule for Future Reviews',
         value: picked.rule,
-        prompt: 'Edit the rule Quasar will remember (or press Enter to save & dismiss)',
+        prompt: `Edit the rule ${
+          picked.subagent || 'Quasar'
+        } will remember (or press Enter to save & dismiss)`,
       });
       if (customRule === undefined) return;
       const finalRule = customRule.trim() || picked.rule;
 
-      await runManagePreferences([
+      const downArgs = [
         '--record-feedback',
         '--thread-id',
         id,
@@ -6931,9 +7205,366 @@ function activate(context) {
         finalRule,
         '--learned-rule',
         finalRule,
-      ]);
+      ];
+      if (picked.subagent) {
+        downArgs.push('--subagent', picked.subagent);
+      }
+      await runManagePreferences(downArgs);
       refreshAllUI(false);
-      vscode.window.showInformationMessage(`🚫 Dismissed & taught Quasar: "${finalRule}"`);
+      vscode.window.showInformationMessage(
+        `🚫 Dismissed & taught ${picked.subagent || 'Quasar'}: "${finalRule}"`
+      );
+    })
+  );
+
+  // 8b-subagent. Teach / Tune Individual Review Subagent (Per-Lens Learning & AGENT.md Evolution)
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.teachSubagent', async (arg) => {
+      ensureQuasarPluginBootstrapped();
+      const session = loadActiveSession();
+      const id = resolveThreadId(arg);
+      const target = session && id ? (session.threads || []).find((t) => t.id === id) : null;
+      const installedAgents = discoverInstalledReviewAgents();
+
+      let subagentName =
+        (arg && typeof arg.subagent === 'string' && arg.subagent.trim()) ||
+        (arg && arg.agent && arg.agent.name) ||
+        '';
+
+      if (!subagentName && target) {
+        const srcList = getThreadSourceAgents(target);
+        if (srcList.length === 1) {
+          subagentName = srcList[0];
+        } else if (srcList.length > 1) {
+          const pickedSrc = await vscode.window.showQuickPick(
+            srcList.map((name) => {
+              const foundAg = installedAgents.find((a) => a.name === name);
+              return {
+                label: `$(hubot) ${name}`,
+                description: foundAg ? foundAg.description : 'Suggested this comment',
+                subagentName: name,
+              };
+            }),
+            {
+              title: '🎓 Which Subagent Do You Want to Teach?',
+              placeHolder: `Multiple lenses contributed to "${target.title}" — choose which subagent to tune`,
+            }
+          );
+          if (!pickedSrc) return;
+          subagentName = pickedSrc.subagentName;
+        }
+      }
+
+      if (!subagentName) {
+        const pickedAg = await vscode.window.showQuickPick(
+          installedAgents.map((a) => ({
+            label: `${a.isCustom ? '🧩' : '🤖'} ${a.name}`,
+            description: a.description || a.mdPath,
+            subagentName: a.name,
+          })),
+          {
+            title: '🎓 Choose Review Subagent to Teach / Tune',
+            placeHolder: 'Select which specialist review-* lens you want to customize in a learning way',
+          }
+        );
+        if (!pickedAg) return;
+        subagentName = pickedAg.subagentName;
+      }
+
+      const matchedAgent = installedAgents.find(
+        (a) => String(a.name || '').toLowerCase() === subagentName.toLowerCase()
+      );
+      const prefs = loadReviewerPreferences();
+      const subagentRules = (prefs.rules || []).filter(
+        (r) =>
+          r &&
+          r.origin !== 'seed_skill' &&
+          String(r.subagent || '').toLowerCase() === subagentName.toLowerCase()
+      );
+
+      const menuItems = [];
+      if (target) {
+        menuItems.push(
+          {
+            label: `$(thumbsup) Reinforce in \`${subagentName}\` — Flag more issues like "${target.title}"`,
+            description: 'Stages comment & adds a subagent-specific "Prefer" directive (upgrade-safe)',
+            action: 'reinforce',
+          },
+          {
+            label: `$(circle-slash) Suppress in \`${subagentName}\` — Stop flagging patterns like "${target.title}"`,
+            description: 'Dismisses comment & adds a subagent-specific "Avoid" directive (upgrade-safe)',
+            action: 'suppress',
+          }
+        );
+      }
+      menuItems.push(
+        {
+          label: `$(mortar-board) Add Learned Directive to \`${subagentName}\` (Fast & Upgrade-Safe)...`,
+          description: 'Teach what to hunt for, what to ignore, or how this subagent should reason',
+          action: 'add-directive',
+        },
+        {
+          label: `$(sparkle) Ask Antigravity to Evolve \`${subagentName}\` (Learn + Update AGENT.md)...`,
+          description: target
+            ? 'Give natural-language feedback on this comment so Antigravity updates learned directives & AGENT.md'
+            : 'Describe how this subagent should change so Antigravity updates learned directives & AGENT.md',
+          action: 'evolve-ai',
+        }
+      );
+      if (subagentRules.length > 0) {
+        menuItems.push({
+          label: `$(list-unordered) View / Remove Learned Directives for \`${subagentName}\` (${subagentRules.length} active)...`,
+          description: 'Inspect or delete learned rules scoped to this subagent',
+          action: 'manage-directives',
+        });
+      }
+      if (matchedAgent && matchedAgent.mdPath && fs.existsSync(matchedAgent.mdPath)) {
+        menuItems.push({
+          label: `$(edit) Open \`${subagentName}/AGENT.md\` in Editor`,
+          description: matchedAgent.mdPath,
+          action: 'open-md',
+        });
+      }
+
+      const choice = await vscode.window.showQuickPick(menuItems, {
+        title: `🎓 Teach / Tune Subagent: ${subagentName}${
+          subagentRules.length > 0 ? ` (${subagentRules.length} learned)` : ''
+        }`,
+        placeHolder: target
+          ? `Triggered from "${target.title}" (${path.basename(target.path || '')}:L${target.startLine || 1})`
+          : matchedAgent
+          ? matchedAgent.description
+          : `Customize how ${subagentName} reviews future PRs`,
+      });
+      if (!choice) return;
+
+      if (choice.action === 'open-md' && matchedAgent) {
+        await vscode.window.showTextDocument(vscode.Uri.file(matchedAgent.mdPath), {
+          viewColumn: vscode.ViewColumn.Active,
+        });
+        return;
+      }
+
+      if (choice.action === 'manage-directives') {
+        const rulePick = await vscode.window.showQuickPick(
+          subagentRules.map((r) => ({
+            label: `${
+              r.sentiment === 'prefer' ? '✅ [Hunt For]' : r.sentiment === 'avoid' ? '🚫 [Suppress]' : '📌 [Directive]'
+            } ${r.rule}`,
+            description: r.repo ? `repo: ${r.repo}` : 'All repositories',
+            detail: r.sourceFindingTitle ? `Learned from: "${r.sourceFindingTitle}" — Select to delete` : 'Select to delete this directive',
+            ruleId: r.id,
+          })),
+          {
+            title: `🧠 Learned Directives for ${subagentName} (Select One to Remove)`,
+            placeHolder: 'Press Esc to keep all directives, or select a rule to delete it',
+          }
+        );
+        if (!rulePick) return;
+        await runManagePreferences(['--delete-rule-id', rulePick.ruleId]);
+        refreshAllUI(false);
+        vscode.window.showInformationMessage(`Removed directive from ${subagentName}.`);
+        return;
+      }
+
+      if (choice.action === 'reinforce' && target) {
+        const defaultRule = `Prioritize findings like "${target.title}" (${target.whyItMatters || target.severity || 'high signal'})`;
+        const edited = await vscode.window.showInputBox({
+          title: `👍 Teach ${subagentName} What to Flag More Of`,
+          value: defaultRule,
+          prompt: `Confirm or customize the positive directive saved for ${subagentName}`,
+        });
+        if (edited === undefined) return;
+        const finalRule = edited.trim() || defaultRule;
+        target.status = 'staged';
+        saveActiveSession(session);
+        await runManagePreferences([
+          '--record-feedback',
+          '--thread-id',
+          target.id,
+          '--subagent',
+          subagentName,
+          '--action',
+          'upvote',
+          '--sentiment',
+          'prefer',
+          '--category',
+          target.preferenceCategory || 'general',
+          '--reason',
+          finalRule,
+          '--learned-rule',
+          finalRule,
+        ]);
+        refreshAllUI(false);
+        vscode.window.showInformationMessage(`🎓 Taught ${subagentName}: "${finalRule}"`);
+        return;
+      }
+
+      if (choice.action === 'suppress' && target) {
+        const defaultRule = `Do not flag patterns similar to: ${target.title}`;
+        const edited = await vscode.window.showInputBox({
+          title: `🚫 Teach ${subagentName} What to Skip`,
+          value: defaultRule,
+          prompt: `Confirm or customize the suppression directive saved for ${subagentName}`,
+        });
+        if (edited === undefined) return;
+        const finalRule = edited.trim() || defaultRule;
+        await runManagePreferences([
+          '--record-feedback',
+          '--thread-id',
+          target.id,
+          '--subagent',
+          subagentName,
+          '--action',
+          'downvote',
+          '--sentiment',
+          'avoid',
+          '--category',
+          target.preferenceCategory || 'nit_threshold',
+          '--reason',
+          finalRule,
+          '--learned-rule',
+          finalRule,
+        ]);
+        refreshAllUI(false);
+        vscode.window.showInformationMessage(`🚫 Dismissed & taught ${subagentName}: "${finalRule}"`);
+        return;
+      }
+
+      if (choice.action === 'add-directive') {
+        const sentPick = await vscode.window.showQuickPick(
+          [
+            {
+              label: '✅ Hunt For / Prioritize',
+              description: `Tell ${subagentName} a specific bug pattern, edge case, or check to actively look for`,
+              sentiment: 'prefer',
+            },
+            {
+              label: '🚫 Suppress / Do Not Flag',
+              description: `Tell ${subagentName} a pattern or nit to stop reporting`,
+              sentiment: 'avoid',
+            },
+            {
+              label: '📌 Custom Reasoning / Style Directive',
+              description: `Shape how ${subagentName} investigates code or phrases comments`,
+              sentiment: 'custom',
+            },
+          ],
+          {
+            title: `🎓 Directive Type for ${subagentName}`,
+            placeHolder: 'What kind of learned behavior do you want to add to this subagent?',
+          }
+        );
+        if (!sentPick) return;
+        const ruleText = await vscode.window.showInputBox({
+          title: `🎓 New Learned Directive for ${subagentName}`,
+          prompt: `Saved in ~/.gemini/quasar/preferences.json & PREFERENCES.md under ${subagentName} (survives Quasar upgrades)`,
+          placeHolder:
+            sentPick.sentiment === 'avoid'
+              ? 'e.g. Do not flag missing unit tests on trivial getter/setter wrappers'
+              : 'e.g. Always verify async listeners and resources are cleaned up on disposal',
+        });
+        if (!ruleText || !ruleText.trim()) return;
+        if (target) {
+          await runManagePreferences([
+            '--record-feedback',
+            '--thread-id',
+            target.id,
+            '--subagent',
+            subagentName,
+            '--action',
+            'meta_feedback',
+            '--sentiment',
+            sentPick.sentiment,
+            '--reason',
+            ruleText.trim(),
+            '--learned-rule',
+            ruleText.trim(),
+          ]);
+        } else {
+          await runManagePreferences([
+            '--add-rule',
+            ruleText.trim(),
+            '--subagent',
+            subagentName,
+            '--sentiment',
+            sentPick.sentiment,
+          ]);
+        }
+        refreshAllUI(false);
+        vscode.window.showInformationMessage(`🎓 Saved learned directive for ${subagentName}!`);
+        return;
+      }
+
+      if (choice.action === 'evolve-ai') {
+        const instructions = await vscode.window.showInputBox({
+          title: `🤖 Evolve ${subagentName} with Antigravity`,
+          prompt: target
+            ? `Tell Antigravity how ${subagentName} should learn from "${target.title}" (updates learned directives & AGENT.md)`
+            : `Tell Antigravity how ${subagentName} should evolve its checklist, applicability gate, or heuristics`,
+          placeHolder:
+            'e.g. Only flag performance issues when inside a hot loop or rendering path, never on one-time CLI startup',
+        });
+        if (!instructions || !instructions.trim()) return;
+        const feedbackClean = instructions.trim();
+        const manageScript = path.join(PLUGIN_SCRIPTS_DIR, 'manage_preferences.py');
+
+        if (target) {
+          await runManagePreferences([
+            '--record-feedback',
+            '--thread-id',
+            target.id,
+            '--subagent',
+            subagentName,
+            '--action',
+            'meta_feedback',
+            '--reason',
+            feedbackClean,
+            '--learned-rule',
+            feedbackClean,
+          ]);
+        } else {
+          await runManagePreferences([
+            '--add-rule',
+            feedbackClean,
+            '--subagent',
+            subagentName,
+            '--sentiment',
+            'custom',
+          ]);
+        }
+        refreshAllUI(false);
+
+        const mdPathInfo =
+          matchedAgent && matchedAgent.mdPath
+            ? `Subagent AGENT.md path: \`${matchedAgent.mdPath}\`\n`
+            : '';
+        const findingContext = target
+          ? `Context Finding (\`${target.id}\` in \`${target.path}:L${target.startLine}\`):\n` +
+            `- Title: "${target.title}"\n` +
+            `- Draft Comment: "${target.draftComment || ''}"\n\n`
+          : '';
+        const prompt =
+          `The reviewer wants to alter and teach the Quasar review subagent \`${subagentName}\` in a persistent, learning way:\n\n` +
+          `${findingContext}` +
+          `${mdPathInfo}` +
+          `Reviewer Instructions for \`${subagentName}\`: "${feedbackClean}"\n\n` +
+          `Please:\n` +
+          `1. Distill this into a crisp, reusable subagent directive scoped to \`${subagentName}\` (so it survives plugin updates) by running:\n` +
+          `   \`python3 "${manageScript}" ${
+            target ? `--record-feedback --thread-id "${target.id}" --action meta_feedback` : '--add-rule "<DISTILLED_DIRECTIVE>"'
+          } --subagent "${subagentName}" --sentiment <prefer|avoid|custom>${
+            target ? ' --learned-rule "<DISTILLED_DIRECTIVE>" [--updated-draft "<REFINED_DRAFT_IF_APPLICABLE>"]' : ''
+          }\`\n` +
+          (matchedAgent && matchedAgent.mdPath
+            ? `2. Also inspect \`${matchedAgent.mdPath}\` and, if appropriate, refine its checklist, rules of engagement, or \`quasarAppliesWhen\` gate to reflect this learning while keeping valid YAML frontmatter (\`name: ${subagentName}\`, \`subagent: true\`, \`commandExecutionPolicy: off\`).`
+            : '');
+
+        await sendPromptToQuasar(prompt, `Evolve Subagent: ${subagentName}`);
+        vscode.window.showInformationMessage(
+          `🎓 Recorded directive for ${subagentName} & dispatched to Antigravity to evolve the subagent!`
+        );
+      }
     })
   );
 
@@ -7099,7 +7730,7 @@ function activate(context) {
           const nameInput = await vscode.window.showInputBox({
             title: 'Name Your Starting-Point Review Skill',
             prompt: 'Give this review skill or rubric a short name',
-            placeHolder: 'e.g. Team Flutter Review Rubric or Security Checklist',
+            placeHolder: 'e.g. Team API Review Rubric or Security Checklist',
           });
           if (!nameInput || !nameInput.trim()) return;
           customSkillName = nameInput.trim();
@@ -7688,6 +8319,11 @@ function activate(context) {
         const ag = clickedArg.agent;
         const agActions = [
           {
+            label: '$(mortar-board) Teach / Manage Learned Directives for This Subagent...',
+            description: 'Add upgrade-safe learned rules, inspect active directives, or evolve with Antigravity',
+            action: 'teach',
+          },
+          {
             label: '$(edit) Open & Edit AGENT.md in Editor',
             description: ag.mdPath,
             action: 'open',
@@ -7711,6 +8347,10 @@ function activate(context) {
         });
         if (!pickedAgAction) return;
 
+        if (pickedAgAction.action === 'teach') {
+          await vscode.commands.executeCommand('quasar.teachSubagent', { subagent: ag.name });
+          return;
+        }
         if (pickedAgAction.action === 'open') {
           if (fs.existsSync(ag.mdPath)) {
             await vscode.window.showTextDocument(vscode.Uri.file(ag.mdPath), {
@@ -7722,7 +8362,7 @@ function activate(context) {
             title: `Refine ${ag.name} with Antigravity`,
             prompt: `How should Antigravity update ${ag.name} (${ag.mdPath})?`,
             placeHolder:
-              'e.g. Add checks for Swift concurrency MainActor isolation and XCTest memory leaks',
+              'e.g. Add checks for database transaction boundaries and retry idempotency',
           });
           if (!instructions || !instructions.trim()) return;
           const prompt =
@@ -8339,7 +8979,7 @@ function activate(context) {
           },
           {
             label:
-              '$(globe) Create a Classic Token on GitHub (Recommended — pre-fills "public_repo" for all public orgs like flutter/*)...',
+              '$(globe) Create a Classic Token on GitHub (Recommended — pre-fills "public_repo" for all public orgs & repos)...',
             description:
               'Opens github.com/settings/tokens/new?scopes=public_repo (minimum needed to post reviews on any public repo/org)',
             action: 'open_github_classic_public',
@@ -8354,7 +8994,7 @@ function activate(context) {
             label:
               '$(globe) Create a Fine-Grained Token on GitHub (Single Resource Owner only)...',
             description:
-              'Note: GitHub restricts fine-grained tokens to 1 Resource Owner (read-only on external orgs like flutter/* unless org is selected)',
+              'Note: GitHub restricts fine-grained tokens to 1 Resource Owner (read-only on external orgs unless that org is selected)',
             action: 'open_github_fine',
           },
           {
@@ -8387,7 +9027,7 @@ function activate(context) {
         [
           {
             label:
-              '$(globe) Generate a Classic Token on GitHub (Recommended — pre-fills "public_repo" for all public orgs like flutter/*)...',
+              '$(globe) Generate a Classic Token on GitHub (Recommended — pre-fills "public_repo" for all public orgs & repos)...',
             description:
               'Opens github.com/settings/tokens/new?scopes=public_repo (works across all public orgs & repos)',
             action: 'generate_classic_public',
@@ -8407,7 +9047,7 @@ function activate(context) {
             label:
               '$(globe) Generate a Fine-Grained Token on GitHub (Single Resource Owner only)...',
             description:
-              'Note: Fine-grained tokens are read-only on external orgs like flutter/* unless that org is selected as Resource Owner',
+              'Note: Fine-grained tokens are read-only on external orgs unless that org is selected as Resource Owner',
             action: 'generate_fine',
           },
         ],
@@ -8430,7 +9070,7 @@ function activate(context) {
     const tokenInput = await vscode.window.showInputBox({
       title: '🔑 Enter Your GitHub Personal Access Token (API Key)',
       prompt:
-        'Paste your GitHub Personal Access Token (Classic "ghp_..." with "public_repo" or "repo" scope works across all orgs like flutter/*). Stored locally in ~/.gemini/quasar/github_auth.json (0600).',
+        'Paste your GitHub Personal Access Token (Classic "ghp_..." with "public_repo" or "repo" scope works across all orgs & repos). Stored locally in ~/.gemini/quasar/github_auth.json (0600).',
       placeHolder: 'ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx or github_pat_...',
       password: true,
       ignoreFocusOut: true,

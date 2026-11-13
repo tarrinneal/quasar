@@ -151,6 +151,129 @@ class _ThreadCardState extends State<ThreadCard> {
     }
   }
 
+  Future<void> _showTeachSubagentDialog() async {
+    final ReviewThread t = widget.thread;
+    final TextEditingController agentCtrl = TextEditingController(
+      text: t.sourceAgent.isNotEmpty ? t.sourceAgent : 'review-bug-hunter',
+    );
+    final TextEditingController ruleCtrl = TextEditingController(
+      text: 'Do not flag patterns similar to: ${t.cleanTitle}',
+    );
+    String sentiment = 'avoid';
+    bool evolveAgent = false;
+
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext ctx) => StatefulBuilder(
+        builder: (BuildContext ctx, StateSetter setModalState) => AlertDialog(
+          backgroundColor: const Color(0xFF161B22),
+          title: Text(
+            '🎓 Teach / Tune Subagent (${agentCtrl.text})',
+            style: const TextStyle(fontSize: 15, color: Color(0xFFE6EDF3)),
+          ),
+          content: SizedBox(
+            width: 540,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                TextField(
+                  controller: agentCtrl,
+                  style: const TextStyle(fontSize: 12.5, fontFamily: 'monospace'),
+                  decoration: const InputDecoration(
+                    labelText: 'Target Review Subagent (review-*)',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                DropdownButtonFormField<String>(
+                  initialValue: sentiment,
+                  dropdownColor: const Color(0xFF21262D),
+                  decoration: const InputDecoration(
+                    labelText: 'Learning Action',
+                    border: OutlineInputBorder(),
+                  ),
+                  items: const <DropdownMenuItem<String>>[
+                    DropdownMenuItem<String>(
+                      value: 'avoid',
+                      child: Text('🚫 Suppress — Stop flagging patterns like this'),
+                    ),
+                    DropdownMenuItem<String>(
+                      value: 'prefer',
+                      child: Text('✅ Reinforce — Prioritize issues like this'),
+                    ),
+                    DropdownMenuItem<String>(
+                      value: 'custom',
+                      child: Text('📌 Custom Directive — Adjust subagent reasoning/style'),
+                    ),
+                  ],
+                  onChanged: (String? v) {
+                    if (v == null) return;
+                    setModalState(() {
+                      sentiment = v;
+                      if (v == 'prefer') {
+                        ruleCtrl.text =
+                            'Prioritize findings like "${t.cleanTitle}"';
+                      } else if (v == 'avoid') {
+                        ruleCtrl.text =
+                            'Do not flag patterns similar to: ${t.cleanTitle}';
+                      }
+                    });
+                  },
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: ruleCtrl,
+                  maxLines: 3,
+                  style: const TextStyle(fontSize: 12.5),
+                  decoration: const InputDecoration(
+                    labelText: 'Learned Directive (saved in preferences.json & PREFERENCES.md)',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: evolveAgent,
+                  onChanged: (bool? v) =>
+                      setModalState(() => evolveAgent = v ?? false),
+                  title: const Text(
+                    '🤖 Also ask Antigravity CLI to evolve this subagent\'s AGENT.md',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('🎓 Save Subagent Learning'),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    final String subagent = agentCtrl.text.trim();
+    final String rule = ruleCtrl.text.trim();
+    agentCtrl.dispose();
+    ruleCtrl.dispose();
+
+    if (confirmed == true && subagent.isNotEmpty && rule.isNotEmpty) {
+      await widget.onThreadAction('teachSubagent', <String, dynamic>{
+        'subagent': subagent,
+        'sentiment': sentiment,
+        'rule': rule,
+        'evolveAgent': evolveAgent,
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final ReviewThread t = widget.thread;
@@ -193,6 +316,11 @@ class _ThreadCardState extends State<ThreadCard> {
                 const _PillBadge(
                   label: '☁️ Staged for GitHub',
                   color: Color(0xFF388BFD),
+                ),
+              if (!isGh && t.sourceAgents.isNotEmpty)
+                _PillBadge(
+                  label: '🤖 ${t.sourceAgents.join(', ')}',
+                  color: const Color(0xFFA371F7),
                 ),
               if (isGh && t.author.isNotEmpty)
                 _PillBadge(
@@ -520,6 +648,12 @@ class _ThreadCardState extends State<ThreadCard> {
                 }),
               ),
               if (!isGh && !t.isFixed) ...<Widget>[
+                _SmallActionBtn(
+                  label: t.sourceAgent.isNotEmpty
+                      ? '🎓 Teach ${t.sourceAgent.replaceFirst('review-', '')}'
+                      : '🎓 Teach Subagent',
+                  onTap: _showTeachSubagentDialog,
+                ),
                 _SmallActionBtn(
                   label: '✨ Ask Agent to Revise',
                   onTap: () => setState(() {

@@ -843,9 +843,10 @@ def main() -> None:
         )
     except Exception as exc:
         err_str = str(exc)
+        err_lower = err_str.lower()
         if (
-            "ÜberProxy" in err_str
-            or "uberproxy" in err_str.lower()
+            "proxy" in err_lower
+            or "tunnel connection failed" in err_lower
             or "Denied access to requested resource" in err_str
             or "Remote end closed connection" in err_str
             or "RemoteDisconnected" in err_str

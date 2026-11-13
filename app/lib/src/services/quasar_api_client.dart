@@ -73,7 +73,7 @@ class QuasarApiClient {
     String prUrl = '',
     String repoDir = '',
     String branch = '',
-    String effort = 'medium',
+    String effort = 'high',
     bool commentsOnly = false,
   }) async {
     await _postJson('/api/start-review', <String, dynamic>{

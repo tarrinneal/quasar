@@ -34,6 +34,7 @@ If no dependency manifest, lockfile, vendored code, or install script changed, r
 
 - Base claims on what is in the repo (manifests, lockfiles, existing imports). Don't assert CVEs or maintenance status you cannot verify — phrase those as questions.
 - **Honor Learned Reviewer Preferences** (`~/.gemini/quasar/PREFERENCES.md` / `reviewer_preferences`), including any rules about temporary overrides or publish ordering.
+- **Honor Subagent-Specific Learned Directives (`review-dependencies`)**: Also check any `learnedDirectives` passed in your prompt and the `### 🤖 \`review-dependencies\`` section in `~/.gemini/quasar/PREFERENCES.md` — those rules were taught specifically to `review-dependencies` by the reviewer and take top priority.
 
 ## Output Format
 

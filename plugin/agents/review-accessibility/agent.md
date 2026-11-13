@@ -35,6 +35,7 @@ If the diff contains no UI-facing changes, reply `No UI/accessibility-relevant c
 - Use the platform/framework's own a11y APIs and the repo's existing patterns (find an accessible component in the repo and cite it).
 - Each finding must name the affected user group and the concrete failure (e.g. "VoiceOver reads this as 'button' with no name").
 - **Honor Learned Reviewer Preferences** (`~/.gemini/quasar/PREFERENCES.md` / `reviewer_preferences`).
+- **Honor Subagent-Specific Learned Directives (`review-accessibility`)**: Also check any `learnedDirectives` passed in your prompt and the `### 🤖 \`review-accessibility\`` section in `~/.gemini/quasar/PREFERENCES.md` — those rules were taught specifically to `review-accessibility` by the reviewer and take top priority.
 
 ## Output Format
 

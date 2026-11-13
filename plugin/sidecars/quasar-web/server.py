@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Quasar Web UI Sidecar & Standalone HTML Exporter.
 
-Serves the interactive Quasar Code Review Web App in Jetski Web / Desktop
+Serves the interactive Quasar Code Review Web App in Antigravity Web / Desktop
 Aux Pane (`SIDECAR_UI_ENTRYPOINT_AUX_PANE`), Full Pane (`SIDECAR_UI_ENTRYPOINT_FULL_PANE`),
 and standalone browser (`http://127.0.0.1:49341`), and can also export a self-contained
 interactive HTML artifact (`--export-html /path/to/quasar_review.html`).
@@ -208,13 +208,13 @@ def resolve_conversation_context(
 
     if not conv_id:
         try:
-            brain_dir = os.path.expanduser("~/.gemini/jetski/brain")
             candidates: List[Tuple[float, str]] = []
-            if os.path.isdir(brain_dir):
-                for entry in os.listdir(brain_dir):
-                    t_path = os.path.join(brain_dir, entry, ".system_generated", "logs", "transcript.jsonl")
-                    if os.path.isfile(t_path):
-                        candidates.append((os.path.getmtime(t_path), entry))
+            for brain_dir in list_all_brain_dirs():
+                if os.path.isdir(brain_dir):
+                    for entry in os.listdir(brain_dir):
+                        t_path = os.path.join(brain_dir, entry, ".system_generated", "logs", "transcript.jsonl")
+                        if os.path.isfile(t_path):
+                            candidates.append((os.path.getmtime(t_path), entry))
             candidates.sort(reverse=True)
             if candidates:
                 conv_id = candidates[0][1]
@@ -248,9 +248,7 @@ def resolve_conversation_context(
                     for uri in ws_uris:
                         if isinstance(uri, str) and uri.startswith("file://"):
                             cand_ws = urllib.parse.unquote(uri[len("file://") :])
-                            if os.path.isdir(os.path.join(cand_ws, "google3")):
-                                resolved_ws = os.path.join(cand_ws, "google3")
-                            elif os.path.isdir(cand_ws):
+                            if os.path.isdir(cand_ws):
                                 resolved_ws = cand_ws
                             break
         except Exception:
@@ -273,7 +271,7 @@ def dispatch_via_agy_cli(
     title: str = "Quasar Code Review",
     conversation_id: Optional[str] = None,
     workspace_dir: Optional[str] = None,
-    effort: str = "medium",
+    effort: str = "high",
     allow_edits: bool = True,
     baseline_mtime: float = 0.0,
 ) -> Dict[str, Any]:
@@ -283,9 +281,9 @@ def dispatch_via_agy_cli(
     if not agy_bin:
         return {"ok": False, "error": "Antigravity CLI (`agy`) binary not found at ~/.gemini/bin/agy or PATH."}
 
-    eff = effort.lower().strip() if effort else "medium"
+    eff = effort.lower().strip() if effort else "high"
     if eff not in ("low", "medium", "high", "xhigh", "max"):
-        eff = "medium"
+        eff = "high"
 
     cmd: List[str] = [
         agy_bin,
@@ -390,7 +388,7 @@ def dispatch_to_agent(
     title: str = "Quasar Code Review",
     conversation_id: Optional[str] = None,
     workspace_dir: Optional[str] = None,
-    effort: str = "medium",
+    effort: str = "high",
     allow_edits: bool = True,
 ) -> Dict[str, Any]:
     import time
@@ -1102,7 +1100,7 @@ def build_state_payload(
             "stopsRead": stops_read,
             "stopsTotal": stops_total,
             "threadsCount": threads_active,
-            "effortLevel": s.get("effortLevel") or "medium",
+            "effortLevel": s.get("effortLevel") or "high",
             "commentsOnly": bool(s.get("commentsOnly", False)),
             "isTutorial": bool(s.get("isTutorial") or pr.get("isTutorial")),
         })
@@ -1127,7 +1125,7 @@ def build_state_payload(
 
         prefs = load_preferences()
         prefs_summary = {
-            "defaultEffort": prefs.get("default_effort") or prefs.get("defaultEffort") or "medium",
+            "defaultEffort": prefs.get("default_effort") or prefs.get("defaultEffort") or "high",
             "defaultCommentsOnly": bool(prefs.get("default_comments_only", prefs.get("defaultCommentsOnly", False))),
             "rulesCount": len((prefs.get("prefer_rules") or []) + (prefs.get("avoid_rules") or []) + (prefs.get("custom_rules") or [])),
             "rules": ((prefs.get("prefer_rules") or []) + (prefs.get("avoid_rules") or []) + (prefs.get("custom_rules") or []))[:30],
@@ -1594,7 +1592,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
               </div>
             </div>
             <div class="flex items-center gap-1.5">
-              <span class="q-badge">${esc((session.effortLevel || 'medium').toUpperCase())} EFFORT</span>
+              <span class="q-badge">${esc((session.effortLevel || 'high').toUpperCase())} EFFORT</span>
               ${pr.url ? `<a href="${esc(pr.url)}" target="_blank" class="q-btn">🔗 GitHub PR</a>` : ''}
             </div>
           </div>
@@ -1711,6 +1709,13 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         ? '<span class="q-badge text-blue-300 border-blue-500/50">☁️ Staged for GitHub</span>'
         : '<span class="q-badge text-[var(--q-muted)]">Draft</span>';
 
+      const srcAgents = (!isExistingGh && Array.isArray(t.sourceAgents) && t.sourceAgents.length)
+        ? t.sourceAgents
+        : (!isExistingGh && t.sourceAgent ? [t.sourceAgent] : []);
+      const subagentBadge = srcAgents.length
+        ? `<span class="q-badge text-purple-200 border-purple-400/40" title="Suggested by ${esc(srcAgents.join(', '))}">🤖 ${esc(srcAgents.join(', '))}</span>`
+        : '';
+
       const showFixBtn = t.status !== 'fixed' && (!isExistingGh || t.selectedForFix || t.triageStatus !== 'addressed_or_refuted');
       const whatDone = t.whatIsDone || (t.triageStatus === 'addressed_or_refuted' ? (t.triageSummary || 'Already addressed in code or thread.') : 'Checked against current HEAD code.');
       const whatNotDone = t.whatIsNotDone || (t.triageStatus === 'addressed_or_refuted' ? 'None — comment has been addressed.' : (t.triageSummary || 'See comment details.'));
@@ -1722,6 +1727,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
             <div class="flex items-center gap-2 flex-wrap">
               ${sevBadge}
               ${statusBadge}
+              ${subagentBadge}
               <span class="text-xs font-bold">${esc(t.title || 'Comment')}</span>
               <button class="text-[11px] text-blue-400 hover:underline font-mono" onclick="openFileInDiff('${esc(t.path)}', ${t.startLine || 1})">
                 ${esc(t.targetFile || t.path)}:${t.startLine || 1}
@@ -1734,6 +1740,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
               </button>` : ''}
               <button class="q-btn" onclick="openReviseCommentModal('${esc(t.id)}')">💬 Ask / Follow Up...</button>
               ${!isExistingGh ? `
+              <button class="q-btn" onclick="openTeachSubagentModal('${esc(t.id)}', '${esc(srcAgents[0] || '')}')" title="Teach or tune this review subagent">🎓 Teach Subagent</button>
               <button class="q-btn" onclick="openEditDraftModal('${esc(t.id)}')">✏️ Edit</button>
               <button class="q-btn" onclick="threadAction('${esc(t.id)}', 'toggleStage')">
                 ${isStaged ? 'Unstage' : '☁️ Stage'}
@@ -2288,6 +2295,56 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       `);
     }
 
+    function openTeachSubagentModal(threadId, defaultAgent) {
+      const t = (STATE.activeSession?.threads || []).find((x) => x.id === threadId);
+      const ag = defaultAgent || (t?.sourceAgents && t.sourceAgents[0]) || t?.sourceAgent || 'review-bug-hunter';
+      showModal(`
+        <div class="text-sm font-bold">🎓 Teach / Tune Subagent: <code>${esc(ag)}</code></div>
+        <p class="text-xs text-[var(--q-muted)]">
+          Save a persistent learned directive scoped to <code>${esc(ag)}</code> (upgrade-safe in <code>~/.gemini/quasar/preferences.json</code>), and optionally ask Antigravity to evolve <code>${esc(ag)}/AGENT.md</code>.
+        </p>
+        <div class="space-y-2 text-xs">
+          <div>
+            <label class="block font-semibold mb-1">Subagent Name</label>
+            <input id="teachSubagentName" type="text" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2 font-mono" value="${esc(ag)}" />
+          </div>
+          <div>
+            <label class="block font-semibold mb-1">Directive Type</label>
+            <select id="teachSubagentSentiment" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2">
+              <option value="avoid">🚫 Suppress / Stop Flagging Patterns Like This</option>
+              <option value="prefer">✅ Hunt For / Prioritize Similar Issues</option>
+              <option value="custom">📌 Custom Reasoning / Style Directive</option>
+            </select>
+          </div>
+          <div>
+            <label class="block font-semibold mb-1">Learned Directive / Feedback</label>
+            <textarea id="teachSubagentRule" rows="3" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2">${esc(t ? `Do not flag patterns similar to: ${t.title}` : '')}</textarea>
+          </div>
+          <label class="flex items-center gap-2">
+            <input id="teachSubagentEvolve" type="checkbox" />
+            <span>Also ask Antigravity CLI to evolve <code>AGENT.md</code> with this feedback</span>
+          </label>
+        </div>
+        <div class="flex justify-end gap-2">
+          <button class="q-btn" onclick="closeModal()">Cancel</button>
+          <button class="q-btn q-btn-primary" onclick="submitTeachSubagent('${esc(threadId)}')">🎓 Save Subagent Learning</button>
+        </div>
+      `);
+    }
+
+    async function submitTeachSubagent(threadId) {
+      const subagent = document.getElementById('teachSubagentName')?.value?.trim() || '';
+      const sentiment = document.getElementById('teachSubagentSentiment')?.value || 'custom';
+      const rule = document.getElementById('teachSubagentRule')?.value?.trim() || '';
+      const evolveAgent = Boolean(document.getElementById('teachSubagentEvolve')?.checked);
+      if (!subagent || !rule) {
+        showToast('Please enter a subagent name and directive', true);
+        return;
+      }
+      closeModal();
+      await threadAction(threadId, 'teachSubagent', { subagent, sentiment, rule, evolveAgent });
+    }
+
     async function submitToken() {
       const token = document.getElementById('ghTokenInput')?.value?.trim() || '';
       if (!token) {
@@ -2350,8 +2407,8 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
               <label class="block font-semibold mb-1">Effort Level</label>
               <select id="newReviewEffort" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2">
                 <option value="low">⚡ Low Effort (Fast)</option>
-                <option value="medium" selected>⚖️ Medium Effort (Balanced)</option>
-                <option value="high">🔬 High Effort (Deep Multi-Lens)</option>
+                <option value="medium">⚖️ Medium Effort (Balanced)</option>
+                <option value="high" selected>🔬 High Effort (Deep Multi-Lens)</option>
               </select>
             </div>
             <div>
@@ -2373,7 +2430,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
     async function submitNewReview() {
       const prUrl = document.getElementById('newReviewPrInput')?.value?.trim() || '';
       const repoDir = document.getElementById('newReviewRepoInput')?.value?.trim() || '';
-      const effort = document.getElementById('newReviewEffort')?.value || 'medium';
+      const effort = document.getElementById('newReviewEffort')?.value || 'high';
       const commentsOnly = document.getElementById('newReviewMode')?.value === 'comments_only';
       closeModal();
       startOptimisticAgentBanner(
@@ -2460,10 +2517,10 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
 
         if pathname == "/preload.js":
             preload_candidates = [
-                "/google/src/files/head/depot/google3/third_party/jetski/sidecar_sdk/preload.js",
+                os.environ.get("ANTIGRAVITY_SIDECAR_PRELOAD_JS") or "",
                 os.path.join(THIS_DIR, "preload.js"),
             ]
-            p_path = next((p for p in preload_candidates if os.path.isfile(p)), None)
+            p_path = next((p for p in preload_candidates if p and os.path.isfile(p)), None)
             content = open(p_path, "r", encoding="utf-8").read() if p_path else "// preload.js fallback\nwindow.sidecar = window.sidecar || {};\n"
             body = content.encode("utf-8")
             self.send_response(200)
@@ -2655,6 +2712,55 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                     "upvote" if rating == "up" else "downvote",
                 ]
                 msg = "Recorded positive feedback 👍" if rating == "up" else "Recorded feedback 👎"
+            elif act == "teachSubagent":
+                subagent_name = str(data.get("subagent") or target.get("sourceAgent") or "").strip()
+                sentiment = str(data.get("sentiment") or "custom").strip().lower()
+                if sentiment not in ("prefer", "avoid", "custom"):
+                    sentiment = "custom"
+                rule_text = str(data.get("rule") or "").strip()
+                evolve_agent = bool(data.get("evolveAgent"))
+                fb_action = "downvote" if sentiment == "avoid" else ("upvote" if sentiment == "prefer" else "meta_feedback")
+                if sentiment == "avoid":
+                    target["status"] = "dismissed"
+                    target["stagedForGithub"] = False
+                    target["selectedForFix"] = False
+                elif sentiment == "prefer":
+                    target["status"] = "staged"
+                    target["stagedForGithub"] = True
+                if rule_text:
+                    pref_cmd = [
+                        sys.executable,
+                        pref_script,
+                        "--record-feedback",
+                        "--thread-id",
+                        str(tid),
+                        "--action",
+                        fb_action,
+                        "--sentiment",
+                        sentiment,
+                        "--reason",
+                        rule_text,
+                        "--learned-rule",
+                        rule_text,
+                    ]
+                    if subagent_name:
+                        pref_cmd.extend(["--subagent", subagent_name])
+                if evolve_agent and subagent_name and rule_text:
+                    evolve_prompt = (
+                        f"Using the `quasar` skill, evolve the review subagent `{subagent_name}` based on reviewer feedback on "
+                        f"`{target.get('path')}:{target.get('startLine')}` (\"{target.get('title')}\"):\n\n"
+                        f"> {rule_text}\n\n"
+                        f"1. Distill and save a clean reusable directive scoped to `{subagent_name}` via `manage_preferences.py --subagent {subagent_name}`.\n"
+                        f"2. If `{subagent_name}` has an `AGENT.md` file under `~/.gemini/config/plugins/quasar/agents/{subagent_name}/` or workspace `.gemini/agents/{subagent_name}/`, refine its rules/checklist while keeping valid YAML frontmatter."
+                    )
+                    dispatch_to_agent(
+                        evolve_prompt,
+                        title=f"Evolve Subagent: {subagent_name}",
+                        conversation_id=session.get("conversationId"),
+                        workspace_dir=ws_dir,
+                        effort=session.get("effortLevel") or "high",
+                    )
+                msg = f"🎓 Taught {subagent_name or 'Quasar'}: {rule_text}"
             elif act == "selectSolution":
                 opt_id = str(data.get("optionId") or "").strip()
                 custom_text = str(data.get("customText") or "").strip()
@@ -2967,7 +3073,7 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 title=f"Quasar Thread Q&A: {os.path.basename(rel_path)}:L{start_l}",
                 conversation_id=data.get("conversationId") or session.get("conversationId"),
                 workspace_dir=ws_dir,
-                effort=session.get("effortLevel") or "medium",
+                effort=session.get("effortLevel") or "high",
             )
             self._send_json(200 if res.get("ok") else 500, {"ok": bool(res.get("ok")), "error": res.get("error"), "dispatch": res})
             return
@@ -3005,7 +3111,7 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
             conv_id, _, default_ws, _ = resolve_conversation_context(data.get("conversationId"))
             pr_url = (data.get("prUrl") or "").strip()
             repo_dir = (data.get("repoDir") or default_ws or os.getcwd()).strip()
-            effort = (data.get("effort") or "medium").strip()
+            effort = (data.get("effort") or "high").strip()
             comments_only = bool(data.get("commentsOnly", False))
             mode_str = " (comments only)" if comments_only else ""
             if pr_url:

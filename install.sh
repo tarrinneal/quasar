@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="1.3.0"
+VERSION="1.4.0"
 EXT_NAME="codeium.codeium-dev-${VERSION}"
 OLD_CODEIUM_EXT_NAME="codeium.codeium-dev-1.0.0"
 OLD_EXT_NAME="antigravity.antigravity-code-review-1.0.0"
@@ -99,15 +99,15 @@ run_doctor() {
     fi
   done
   if [ "${ext_found}" -eq 0 ]; then
-    echo "  ℹ️  Quasar Native Extension: Not found in local IDE extensions (Jetski Web UI & Standalone HTML still active)"
+    echo "  ℹ️  Quasar Native Extension: Not found in local IDE extensions (Antigravity Web UI & Standalone HTML still active)"
   fi
 
   echo "=================================================================="
   if [ "${ok}" -eq 1 ]; then
     echo "🎉 Quasar v${VERSION} is installed and ready!"
-    echo "👉 Next step in Antigravity / VS Code / Jetski Web:"
+    echo "👉 Next step in Antigravity / VS Code / Browser:"
     echo "   • Desktop IDE: Press Cmd+Shift+P -> 'Developer: Reload Window', then click 'Quasar' in the Status Bar"
-    echo "   • Jetski Web / Browser: Open sidecar://quasar/quasar-web/ or http://127.0.0.1:49341"
+    echo "   • Antigravity Web / Browser: Open sidecar://quasar/quasar-web/ or http://127.0.0.1:49341"
     return 0
   else
     echo "❌ Quasar installation is incomplete. Run ./install.sh to fix."
@@ -168,7 +168,7 @@ if [ -d "${SCRIPT_DIR}/plugin/sidecars/quasar-web" ]; then
     fi
   fi
   chmod +x "${PLUGIN_DEST}/sidecars/quasar-web/server.py" 2>/dev/null || true
-  # Auto-enable the Quasar plugin and start its sidecar in any running Jetski / Antigravity Language Server
+  # Auto-enable the Quasar plugin and start its sidecar in any running Antigravity Language Server
   SIDECAR_MANAGED=0
   if python3 - "${PLUGIN_DEST}/sidecars/quasar-web" <<'PY' 2>/dev/null; then
 import json
@@ -370,7 +370,16 @@ for EXT_ROOT in "${HOME}"/.*/extensions; do
     cp "${SCRIPT_DIR}/extension/media/"* "${TARGET_EXT_DIR}/media/"
     cp "${SCRIPT_DIR}/README.md" "${TARGET_EXT_DIR}/README.md" 2>/dev/null || true
     cp "${SCRIPT_DIR}/CHANGELOG.md" "${TARGET_EXT_DIR}/CHANGELOG.md" 2>/dev/null || true
-    cp -R "${SCRIPT_DIR}/plugin/"* "${TARGET_EXT_DIR}/bundled_plugin/" 2>/dev/null || true
+    if [ -d "${SCRIPT_DIR}/.git" ] && command -v git >/dev/null 2>&1; then
+      while IFS= read -r rel_plugin_file; do
+        [ -z "${rel_plugin_file}" ] && continue
+        rel_sub="${rel_plugin_file#plugin/}"
+        mkdir -p "${TARGET_EXT_DIR}/bundled_plugin/$(dirname "${rel_sub}")"
+        cp "${SCRIPT_DIR}/${rel_plugin_file}" "${TARGET_EXT_DIR}/bundled_plugin/${rel_sub}" 2>/dev/null || true
+      done < <(git -C "${SCRIPT_DIR}" ls-files plugin)
+    else
+      cp -R "${SCRIPT_DIR}/plugin/"* "${TARGET_EXT_DIR}/bundled_plugin/" 2>/dev/null || true
+    fi
 
     python3 - "${EXT_ROOT}/extensions.json" "${TARGET_EXT_DIR}" "${EXT_NAME}" "${VERSION}" <<'PY'
 import json

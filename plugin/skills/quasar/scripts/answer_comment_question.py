@@ -41,25 +41,31 @@ from collect_pr_context import (
 def rebuild_primary_finding_message_body(t: Dict[str, Any]) -> str:
     """Rebuilds the primary Quasar message body for an AI finding thread so the
     top message in the inline VS Code CommentThread always reflects the latest
-    title, rationale, and draftComment.
+    title, rationale, subagent attribution, and draftComment.
     """
     title = t.get("title") or "Review Finding"
     why = t.get("whyItMatters") or ""
     draft = t.get("draftComment") or ""
+    src_agents = list(t.get("sourceAgents") or ([] if not t.get("sourceAgent") else [t.get("sourceAgent")]))
+    src_md = (
+        "\n\n🤖 *Suggested by*: " + ", ".join(f"`{a}`" for a in src_agents if a)
+        if src_agents
+        else ""
+    )
     if t.get("status") == "uncertain":
         uncertainty_q = (
             t.get("uncertaintyQuestion")
             or f'Do you want Quasar to flag issues like "{title}" in future reviews, or skip this pattern?'
         )
         return (
-            f"### 🤔 Preference Check: {title}\n\n"
+            f"### 🤔 Preference Check: {title}{src_md}\n\n"
             f"**Question for You**: *{uncertainty_q}*\n\n"
             f"*Context & Trade-off*: {why}\n\n"
             f"---\n"
             f"**Candidate GitHub Comment (if kept)**:\n> {draft}\n\n"
             f"*(Use the **🤔 Calibrate Preference** button above or 👍/👎 to teach Quasar how to handle this in the future.)*"
         )
-    parts = [f"**{title}**"]
+    parts = [f"**{title}**{src_md}"]
     if why:
         parts.append(f"*CliffsNotes Context*: {why}")
     if draft:
@@ -74,7 +80,7 @@ def sync_primary_message_if_applicable(t: Dict[str, Any], msgs: list) -> None:
     first = msgs[0]
     first_author = str(first.get("author") or "")
     first_body = str(first.get("body") or "")
-    if first_author == "Quasar" and (
+    if first_author.startswith("Quasar") and (
         "**Draft GitHub Comment**:" in first_body
         or "**Candidate GitHub Comment (if kept)**:" in first_body
         or t.get("kind") in ("ai_candidate", "user_staged")
@@ -134,6 +140,11 @@ def main() -> None:
         "--sentiment",
         choices=["prefer", "avoid", "custom"],
         help="Optional sentiment for --learned-rule",
+    )
+    parser.add_argument(
+        "--subagent",
+        default=None,
+        help="Optional review-* subagent name to scope --learned-rule to",
     )
     parser.add_argument("--workspace-dir", default=None, help="Window workspace directory")
     args = parser.parse_args()
@@ -301,6 +312,10 @@ def main() -> None:
             prefs_changed = True
 
         if args.learned_rule and args.learned_rule.strip():
+            src_ag = (
+                args.subagent
+                or (target_thread.get("sourceAgent") if target_thread else None)
+            )
             add_or_update_rule(
                 prefs,
                 rule_text=args.learned_rule.strip(),
@@ -308,6 +323,8 @@ def main() -> None:
                 category="comment_tone",
                 source_title=finding_title,
                 origin="learned",
+                subagent=args.subagent,
+                source_subagent=src_ag,
             )
             prefs_changed = True
 

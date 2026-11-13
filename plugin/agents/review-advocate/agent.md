@@ -34,6 +34,7 @@ For every candidate issue passed to you:
 4. **Evaluate Signal-to-Noise & Identify `UNCERTAIN` (Preference-Dependent) Findings**:
    - Would a senior engineer actually leave this comment on a teammate's PR, or is it pedantic bike-shedding?
    - **When You Are Uncertain of the Reviewer's Preference**: If a finding is technically valid (not a false positive), but whether to flag it depends on the reviewer's personal philosophy or team convention (e.g., strict unit testing of private helpers, defensive null checks on internal callers, API visibility trade-offs, or borderline `NIT` polish) AND it is not yet covered by `PREFERENCES.md`, classify it as **`UNCERTAIN`** instead of guessing!
+- **Honor Subagent-Specific Learned Directives (`review-advocate`)**: Also check any `learnedDirectives` passed in your prompt and the `### 🤖 \`review-advocate\`` section in `~/.gemini/quasar/PREFERENCES.md` — those rules were taught specifically to `review-advocate` by the reviewer and take top priority.
 
 ## Output Format
 

@@ -247,9 +247,9 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
         payload.get("effortLevel")
         or payload.get("effort_level")
         or existing.get("effortLevel")
-        or "medium"
+        or "high"
     )
-    session["effortLevel"] = str(effort).lower() if str(effort).lower() in ("low", "medium", "high") else "medium"
+    session["effortLevel"] = str(effort).lower() if str(effort).lower() in ("low", "medium", "high") else "high"
     comments_only = bool(
         payload.get(
             "commentsOnly",
@@ -480,9 +480,37 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
             else ""
         )
 
+        raw_sources = (
+            finding.get("sourceAgents")
+            or finding.get("source_agents")
+            or finding.get("subagents")
+            or finding.get("lenses")
+            or finding.get("sourceAgent")
+            or finding.get("source_agent")
+            or finding.get("subagent")
+            or finding.get("lens")
+            or prior_t.get("sourceAgents")
+            or prior_t.get("sourceAgent")
+            or []
+        )
+        if isinstance(raw_sources, str):
+            raw_sources = [p.strip() for p in raw_sources.split(",") if p.strip()]
+        source_agents: List[str] = []
+        if isinstance(raw_sources, list):
+            for s_ag in raw_sources:
+                cleaned_ag = re.sub(r"[`*_\"']", "", str(s_ag or "")).strip()
+                if cleaned_ag and cleaned_ag not in source_agents:
+                    source_agents.append(cleaned_ag)
+
+        source_agents_md = (
+            "\n\n🤖 *Suggested by*: " + ", ".join(f"`{a}`" for a in source_agents)
+            if source_agents
+            else ""
+        )
+
         if is_uncertain:
             default_body = (
-                f"### 🤔 Preference Check: {title}{top_level_note}\n\n"
+                f"### 🤔 Preference Check: {title}{top_level_note}{source_agents_md}\n\n"
                 f"**Question for You**: *{uncertainty_q}*\n\n"
                 f"*Context & Trade-off*: {why}\n\n"
                 f"---\n"
@@ -491,7 +519,7 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
             )
         else:
             default_body = (
-                f"**{title}**{top_level_note}\n\n"
+                f"**{title}**{top_level_note}{source_agents_md}\n\n"
                 f"*CliffsNotes Context*: {why}\n\n"
                 f"---\n"
                 f"**Draft GitHub Comment**:\n> {draft}"
@@ -502,6 +530,8 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
             "kind": kind,
             "severity": sev,
             "status": status,
+            "sourceAgent": source_agents[0] if source_agents else "",
+            "sourceAgents": source_agents,
             "isTopLevel": is_top_level,
             "targetFile": target_file,
             "selectedForFix": bool(finding.get("selectedForFix", prior_t.get("selectedForFix", False))),

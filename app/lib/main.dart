@@ -183,7 +183,7 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
     );
     final TextEditingController branchCtrl = TextEditingController();
     bool isPrMode = true;
-    String effort = 'medium';
+    String effort = 'high';
     bool commentsOnly = false;
 
     final bool? confirmed = await showDialog<bool>(
@@ -260,11 +260,11 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
                         ),
                         DropdownMenuItem<String>(
                           value: 'medium',
-                          child: Text('⚖️ Medium (Balanced — Default)'),
+                          child: Text('⚖️ Medium (Balanced)'),
                         ),
                         DropdownMenuItem<String>(
                           value: 'high',
-                          child: Text('🔬 High (Deep Multi-Lens)'),
+                          child: Text('🔬 High (Deep Multi-Lens — Default)'),
                         ),
                       ],
                       onChanged: (String? v) {
