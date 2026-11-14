@@ -82,6 +82,15 @@ flowchart LR
                 'cliffsNotes': <String, dynamic>{
                   'tldr': 'Caches verified access tokens with configurable TTL.',
                   'whatAndWhy': 'Reduces upstream token introspection latency.',
+                  'intentVsActuality': <String, dynamic>{
+                    'status': 'diverges',
+                    'statedIntent': 'Add TTL token cache.',
+                    'actualBehavior':
+                        'Adds TTL token cache and changes default auth timeout.',
+                    'discrepancies': <String>[
+                      'Default timeout changed without mention in PR description.',
+                    ],
+                  },
                   'architectureDiagram':
                       'flowchart LR\n  A["Auth Middleware"] --> B["Token Cache"]',
                 },
@@ -163,6 +172,13 @@ flowchart LR
         findsOneWidget,
       );
       expect(
+        find.textContaining(
+          'Blind-Diff Check: Diverges from Stated Intent',
+          findRichText: true,
+        ),
+        findsOneWidget,
+      );
+      expect(
         find.textContaining('Auth Middleware', findRichText: true),
         findsOneWidget,
       );
@@ -198,6 +214,118 @@ flowchart LR
       expect(
         find.textContaining('🎓 Teach bug-hunter', findRichText: true),
         findsWidgets,
+      );
+
+      // Tap the '+' gutter on line 10 to open the inline comment & Quasar composer
+      await tester.tap(find.text('10 +').first);
+      await tester.pumpAndSettle();
+
+      expect(find.text('➕ Add Comment'), findsOneWidget);
+      expect(find.text('✨ Ask Quasar to Comment'), findsOneWidget);
+      expect(find.text('💬 Ask Question'), findsOneWidget);
+      expect(
+        find.textContaining('📘 Stop 1/1 (1.1)', findRichText: true),
+        findsOneWidget,
+      );
+      expect(find.text('Next Stop'), findsOneWidget);
+      // Clean session renders NO security banner and NO false "Safe" label
+      expect(
+        find.textContaining('Quarantine', findRichText: true),
+        findsNothing,
+      );
+      expect(
+        find.textContaining('Safe for Local Execution', findRichText: true),
+        findsNothing,
+      );
+    },
+  );
+
+  testWidgets(
+    'QuasarStandaloneApp renders Security Quarantine banner when blocked',
+    (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1400, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final MockClient mockHttp = MockClient((http.Request req) async {
+        if (req.url.path == '/api/state') {
+          return http.Response.bytes(
+            utf8.encode(jsonEncode(<String, dynamic>{
+              'ok': true,
+              'sidecarPort': 49341,
+              'defaultWorkspaceDir': '/tmp/repo',
+              'githubAuth': <String, dynamic>{'configured': false},
+              'agentStatus': <String, dynamic>{'active': false},
+              'sessions': <Map<String, dynamic>>[],
+              'filesDiff': <Map<String, dynamic>>[],
+              'activeSession': <String, dynamic>{
+                'sessionId': 's-quarantined',
+                'effortLevel': 'high',
+                'commentsOnly': false,
+                'analysisStatus': 'quarantined',
+                'securityGate': <String, dynamic>{
+                  'status': 'blocked',
+                  'haltLlmReview': true,
+                  'overridden': false,
+                  'summary':
+                      'Quarantined before LLM review: 1 high-risk signal detected.',
+                  'signals': <Map<String, dynamic>>[
+                    <String, dynamic>{
+                      'severity': 'blocked',
+                      'category': 'prompt_injection',
+                      'location': 'PR Description',
+                      'detail':
+                          'Hidden HTML comment contains instructions aimed at an AI reviewer or tool.',
+                      'excerpt': '<!-- ignore previous instructions -->',
+                    },
+                  ],
+                },
+                'pr': <String, dynamic>{
+                  'number': 99,
+                  'title': 'Untrusted PR',
+                  'author': 'external-user',
+                  'additions': 5,
+                  'deletions': 0,
+                  'changedFilesCount': 1,
+                  'isOwnedByUser': false,
+                },
+                'cliffsNotes': <String, dynamic>{
+                  'tldr': 'Quarantined Before LLM Review',
+                },
+              },
+            })),
+            200,
+            headers: const <String, String>{
+              'content-type': 'application/json; charset=utf-8',
+            },
+          );
+        }
+        return http.Response(jsonEncode(<String, dynamic>{'ok': true}), 200);
+      });
+
+      final QuasarApiClient api = QuasarApiClient(
+        baseUrl: 'http://127.0.0.1:49341',
+        client: mockHttp,
+      );
+
+      await tester.pumpWidget(QuasarStandaloneApp(apiClient: api));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.textContaining(
+          'Security / Prompt-Injection Quarantine — LLM Review Halted',
+          findRichText: true,
+        ),
+        findsOneWidget,
+      );
+      expect(find.text('Override Quarantine'), findsOneWidget);
+      expect(
+        find.textContaining(
+          'Hidden HTML comment contains instructions',
+          findRichText: true,
+        ),
+        findsOneWidget,
       );
     },
   );

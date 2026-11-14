@@ -312,6 +312,21 @@ class _ThreadCardState extends State<ThreadCard> {
             crossAxisAlignment: WrapCrossAlignment.center,
             children: <Widget>[
               _PillBadge(label: pill.label, color: pill.color),
+              if (!t.isFixed && t.fixStatus == 'in_progress')
+                const _PillBadge(
+                  label: '⏳ Fixing Now...',
+                  color: Color(0xFF58A6FF),
+                )
+              else if (!t.isFixed && t.fixStatus == 'needs_input')
+                const _PillBadge(
+                  label: '💬 Waiting in Chat',
+                  color: Color(0xFFD29922),
+                )
+              else if (!t.isFixed && t.fixStatus == 'needs_attention')
+                const _PillBadge(
+                  label: '⚠️ Check Fix',
+                  color: Color(0xFFF0883E),
+                ),
               if (t.isStaged && !isGh)
                 const _PillBadge(
                   label: '☁️ Staged for GitHub',
@@ -624,7 +639,9 @@ class _ThreadCardState extends State<ThreadCard> {
             children: <Widget>[
               if (!t.isFixed && (!isAddressedGh || t.selectedForFix))
                 _SmallActionBtn(
-                  label: t.selectedForFix ? '🔧 Queued for Fix ✓' : '🔧 Queue Fix',
+                  label: t.fixStatus == 'in_progress'
+                      ? '⏳ Fixing...'
+                      : (t.selectedForFix ? '🔧 Queued for Fix ✓' : '🔧 Queue Fix'),
                   primary: t.selectedForFix,
                   onTap: () => widget.onThreadAction('toggleFix'),
                 )
@@ -639,6 +656,15 @@ class _ThreadCardState extends State<ThreadCard> {
                       color: Color(0xFF3FB950),
                     ),
                   ),
+                ),
+              if (!t.isFixed &&
+                  (t.fixStatus == 'in_progress' ||
+                      t.fixStatus == 'needs_input' ||
+                      t.fixStatus == 'needs_attention' ||
+                      t.selectedForFix))
+                _SmallActionBtn(
+                  label: '✓ Mark Fixed',
+                  onTap: () => widget.onThreadAction('markFixed'),
                 ),
               _SmallActionBtn(
                 label: '💬 Ask / Reply',

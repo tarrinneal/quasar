@@ -130,12 +130,18 @@ class QuasarApiClient {
     required String path,
     required int line,
     required String question,
+    String mode = 'qa',
+    String severity = 'DESIGN',
   }) async {
+    final String endpoint =
+        mode == 'manual' ? '/api/add-comment' : '/api/ask-line';
     final Map<String, dynamic> res =
-        await _postJson('/api/ask-line', <String, dynamic>{
+        await _postJson(endpoint, <String, dynamic>{
       'sessionId': sessionId,
       'path': path,
       'line': line,
+      'mode': mode,
+      'severity': severity,
       'question': question,
     });
     return '${res['threadId'] ?? ''}';
@@ -234,6 +240,14 @@ class QuasarApiClient {
       'sessionId': sessionId,
       'path': path,
       'line': line,
+    });
+  }
+
+  Future<void> overrideQuarantine({
+    required String sessionId,
+  }) async {
+    await _postJson('/api/override-quarantine', <String, dynamic>{
+      'sessionId': sessionId,
     });
   }
 }

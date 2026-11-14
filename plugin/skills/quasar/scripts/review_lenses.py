@@ -32,6 +32,7 @@ CUSTOM_DEFAULT_EFFORTS = ["medium", "high"]
 
 BUILTIN_REVIEW_AGENT_NAMES = {
     "review-architect",
+    "review-blind-diff",
     "review-bug-hunter",
     "review-test-critic",
     "review-advocate",
@@ -51,6 +52,7 @@ BUILTIN_REVIEW_AGENT_NAMES = {
 BUILTIN_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "review-advocate": {"role": "filter", "efforts": []},
     "review-architect": {"efforts": ["medium", "high"]},
+    "review-blind-diff": {"efforts": ["medium", "high"], "blindDiff": True},
     "review-bug-hunter": {"efforts": ["medium", "high"]},
     "review-test-critic": {"efforts": ["high"]},
     "review-security": {"efforts": ["medium", "high"]},
@@ -86,6 +88,10 @@ def _parse_agent_frontmatter(md_text: str) -> Dict[str, Any]:
         val = scalar(key)
         if val is not None:
             meta[key] = val
+
+    blind_raw = scalar("quasarBlindDiff")
+    if blind_raw is not None:
+        meta["quasarBlindDiff"] = blind_raw.lower() in ("true", "1", "yes")
 
     m_eff = re.search(r"^quasarEfforts:\s*([^\n]*)", fm_text, re.MULTILINE)
     if m_eff:
@@ -154,6 +160,11 @@ def discover_review_agents(repo_dir: Optional[str] = None, ws_root: Optional[str
                 default_efforts = ["high"]
             else:
                 default_efforts = list(CUSTOM_DEFAULT_EFFORTS) if role == "lens" else []
+            blind_diff = bool(
+                meta["quasarBlindDiff"]
+                if "quasarBlindDiff" in meta
+                else builtin_fb.get("blindDiff", False)
+            )
             discovered[name] = {
                 "name": name,
                 "description": meta.get("description") or "",
@@ -161,6 +172,7 @@ def discover_review_agents(repo_dir: Optional[str] = None, ws_root: Optional[str
                 "scope": scope,
                 "isCustom": is_custom,
                 "role": role,
+                "blindDiff": blind_diff,
                 "appliesWhen": meta.get("quasarAppliesWhen") or "",
                 "defaultEfforts": default_efforts,
             }
@@ -236,6 +248,7 @@ def build_lens_context(
             "name": a["name"],
             "description": a["description"],
             "appliesWhen": a["appliesWhen"],
+            "blindDiff": bool(a.get("blindDiff", False)),
             "isCustom": a["isCustom"],
             "path": a["path"],
             "learnedDirectives": a.get("learnedDirectives") or {"preferRules": [], "avoidRules": [], "customRules": []},

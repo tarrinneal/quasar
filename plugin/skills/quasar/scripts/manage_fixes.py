@@ -27,6 +27,7 @@ Responsibilities:
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import shutil
@@ -73,6 +74,19 @@ def save_session(session: Dict[str, Any], session_path: str, md_path: str) -> No
     except Exception:
         pass
     archive_review_session(session, md_text)
+
+
+def file_sha256(file_path: str) -> str:
+    if not file_path or not os.path.isfile(file_path):
+        return ""
+    try:
+        h = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
 
 
 def read_code_snippet(file_path: str, start_line: int, end_line: int, pad: int = 12) -> str:
@@ -230,6 +244,9 @@ def main() -> None:
     parser.add_argument("--solution-choices-json", default="", help="JSON map of threadId -> {id, text} selected solutions for --prepare-fix")
     parser.add_argument("--instructions", default="", help="Optional custom instructions from the user for how to fix the selected comments")
     parser.add_argument("--complete-fix", action="store_true", help="Mark threads as fixed in active_session.json and sync head snapshots from working tree")
+    parser.add_argument("--reconcile-fixes", action="store_true", help="Reconcile in-progress fixes against working-tree file hashes and agent state")
+    parser.add_argument("--agent-idle", action="store_true", help="Indicates the dispatched agent turn is no longer actively running")
+    parser.add_argument("--paused-on-question", action="store_true", help="Indicates the dispatched agent is waiting for user answer in chat")
     parser.add_argument("--summary", default="Applied fix in local working tree.", help="Summary of the fix applied by the agent")
     parser.add_argument("--workspace-dir", default=None, help="Window workspace directory")
     args = parser.parse_args()
@@ -336,6 +353,7 @@ def main() -> None:
         head_root = session.get("headSnapshotRoot") or ""
         pr = session.get("pr") or {}
         is_owned = pr.get("isOwnedByUser", True) is not False
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         for t in selected_threads:
             tid_str = str(t.get("id"))
@@ -355,8 +373,12 @@ def main() -> None:
                         solution_text=choice_val.strip(),
                         queue_mode="keep",
                     )
+            rel_p = t.get("path") or ""
+            abs_p = os.path.join(repo_dir, rel_p) if rel_p else ""
             t["selectedForFix"] = True
             t["fixStatus"] = "in_progress"
+            t["fixStartedAt"] = now_iso
+            t["fixBeforeSha256"] = file_sha256(abs_p)
             if args.instructions.strip():
                 t["fixUserInstructions"] = args.instructions.strip()
 
@@ -472,7 +494,7 @@ def main() -> None:
             + solution_policy_step
             + f"{1 + step_offset}. Edit the real working-tree files under `{repo_dir}` (do **not** edit the snapshot copies directly, and do **not** create a git commit unless asked).\n"
             f"{2 + step_offset}. Run any relevant analyzer or unit tests to verify your fix compiles and passes.\n"
-            f"{3 + step_offset}. Once fixed, sync the Quasar review session and mark the comment thread(s) as `✅ Fixed` by running:\n"
+            f"{3 + step_offset}. **REQUIRED FINAL STEP (do NOT skip — updates the user's IDE status & diff)**: Run `--complete-fix` as soon as the edits are applied so Quasar marks the comment(s) `✅ Fixed` and notifies the user:\n"
             f"   ```bash\n"
             f'   python3 "{script_path}" --complete-fix --thread-ids "{ids_csv}"{ws_arg} --summary "<CONCISE_SUMMARY_OF_FIXES>"\n'
             f"   ```"
@@ -552,6 +574,108 @@ def main() -> None:
                     "completedThreadIds": completed_ids,
                     "syncedSnapshotFiles": synced_files,
                     "summary": args.summary.strip(),
+                },
+                indent=2,
+            )
+        )
+        return
+
+    if args.reconcile_fixes:
+        repo_dir = session.get("repoDir") or ""
+        head_root = session.get("headSnapshotRoot") or ""
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        now_iso = now_dt.isoformat()
+        auto_completed_ids: List[str] = []
+        needs_input_ids: List[str] = []
+        needs_attention_ids: List[str] = []
+        synced_files_rec: List[str] = []
+        changed_session = False
+
+        for t in threads:
+            if t.get("status") == "fixed":
+                continue
+            f_status = str(t.get("fixStatus") or "")
+            if f_status not in ("in_progress", "needs_input"):
+                continue
+
+            if args.paused_on_question:
+                if f_status != "needs_input":
+                    t["fixStatus"] = "needs_input"
+                    changed_session = True
+                needs_input_ids.append(str(t.get("id")))
+                continue
+
+            # If agent resumed working after a question, restore in_progress
+            if not args.agent_idle:
+                if f_status == "needs_input":
+                    t["fixStatus"] = "in_progress"
+                    changed_session = True
+                continue
+
+            # Agent is idle — check elapsed time since fixStartedAt to avoid racing fresh dispatches
+            started_raw = str(t.get("fixStartedAt") or "").strip()
+            elapsed_s = 999.0
+            if started_raw:
+                try:
+                    st_dt = datetime.datetime.fromisoformat(started_raw.replace("Z", "+00:00"))
+                    elapsed_s = (now_dt - st_dt).total_seconds()
+                except Exception:
+                    elapsed_s = 999.0
+            if elapsed_s < 10.0:
+                continue
+
+            rel_path = t.get("path") or ""
+            src_file = os.path.join(repo_dir, rel_path) if (repo_dir and rel_path) else ""
+            before_sha = str(t.get("fixBeforeSha256") or "")
+            after_sha = file_sha256(src_file) if src_file else ""
+
+            if src_file and after_sha and after_sha != before_sha:
+                if head_root and rel_path:
+                    dst_file = os.path.join(head_root, rel_path)
+                    if os.path.isfile(src_file):
+                        os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+                        shutil.copy2(src_file, dst_file)
+                        if rel_path not in synced_files_rec:
+                            synced_files_rec.append(rel_path)
+                auto_summary = "Updated in local working tree (detected automatically when agent turn completed)."
+                t["status"] = "fixed"
+                t["fixStatus"] = "fixed"
+                t["selectedForFix"] = False
+                t["fixedAt"] = now_iso
+                t["fixedSummary"] = auto_summary
+                msgs = t.setdefault("messages", [])
+                msgs.append(
+                    {
+                        "author": "Quasar Fix Agent",
+                        "body": f"✅ **Fixed in working tree** (`{rel_path}`):\n\n{auto_summary}",
+                        "timestamp": now_iso,
+                    }
+                )
+                auto_completed_ids.append(str(t.get("id")))
+                changed_session = True
+            elif elapsed_s >= 15.0:
+                t["fixStatus"] = "needs_attention"
+                needs_attention_ids.append(str(t.get("id")))
+                changed_session = True
+
+        if changed_session:
+            save_session(session, active_session_path, cliffs_notes_md_path)
+
+        still_in_progress = [
+            str(t.get("id"))
+            for t in threads
+            if t.get("status") != "fixed" and t.get("fixStatus") in ("in_progress", "needs_input")
+        ]
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "changed": changed_session,
+                    "autoCompletedThreadIds": auto_completed_ids,
+                    "needsInputThreadIds": needs_input_ids,
+                    "needsAttentionThreadIds": needs_attention_ids,
+                    "stillInProgressThreadIds": still_in_progress,
+                    "syncedSnapshotFiles": synced_files_rec,
                 },
                 indent=2,
             )

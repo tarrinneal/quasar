@@ -3,7 +3,7 @@
 #
 # Usage:
 #   curl -fsSL https://github.com/tarrinneal/quasar/releases/latest/download/install-standalone.sh | bash
-#   QUASAR_VERSION=1.4.0 curl -fsSL https://raw.githubusercontent.com/tarrinneal/quasar/main/install-standalone.sh | bash
+#   QUASAR_VERSION=1.5.0 curl -fsSL https://raw.githubusercontent.com/tarrinneal/quasar/main/install-standalone.sh | bash
 set -euo pipefail
 
 REPO="${QUASAR_GITHUB_REPO:-tarrinneal/quasar}"

@@ -168,6 +168,7 @@ class ReviewSession {
     required this.workspaceDir,
     required this.conversationId,
     required this.isTutorial,
+    this.securityGate,
   });
 
   factory ReviewSession.fromJson(Map<String, dynamic> json) {
@@ -176,6 +177,10 @@ class ReviewSession {
     final Map<String, dynamic> rawCn =
         (json['cliffsNotes'] as Map<String, dynamic>?) ??
             const <String, dynamic>{};
+    final Map<String, dynamic>? rawSg =
+        json['securityGate'] is Map<String, dynamic>
+            ? json['securityGate'] as Map<String, dynamic>
+            : null;
     final List<dynamic> rawChapters =
         (json['chapters'] as List<dynamic>?) ?? const <dynamic>[];
     final List<dynamic> rawThreads =
@@ -184,6 +189,9 @@ class ReviewSession {
         (json['coverageMatrix'] as List<dynamic>?) ?? const <dynamic>[];
     final List<dynamic> rawDismissed =
         (json['dismissedChecks'] as List<dynamic>?) ?? const <dynamic>[];
+
+    final SecurityGate? parsedSg =
+        rawSg != null ? SecurityGate.fromJson(rawSg) : null;
 
     return ReviewSession(
       sessionId: '${json['sessionId'] ?? ''}',
@@ -210,6 +218,7 @@ class ReviewSession {
       workspaceDir: '${json['workspaceDir'] ?? ''}',
       conversationId: '${json['conversationId'] ?? ''}',
       isTutorial: json['isTutorial'] == true || rawPr['isTutorial'] == true,
+      securityGate: (parsedSg != null && parsedSg.hasAlerts) ? parsedSg : null,
     );
   }
 
@@ -228,6 +237,7 @@ class ReviewSession {
   final String workspaceDir;
   final String conversationId;
   final bool isTutorial;
+  final SecurityGate? securityGate;
 
   List<ReviewThread> get activeThreads =>
       threads.where((ReviewThread t) => t.status != 'dismissed').toList();
@@ -284,6 +294,116 @@ class PrMetadata {
   final bool isOwnedByUser;
 }
 
+class SecuritySignal {
+  const SecuritySignal({
+    required this.severity,
+    required this.category,
+    required this.location,
+    required this.detail,
+    this.path = '',
+    this.line = 1,
+    this.excerpt = '',
+  });
+
+  factory SecuritySignal.fromJson(Map<String, dynamic> json) {
+    return SecuritySignal(
+      severity: '${json['severity'] ?? 'warning'}'.trim().toLowerCase(),
+      category: '${json['category'] ?? 'security'}'.trim(),
+      location: '${json['location'] ?? json['path'] ?? 'PR'}'.trim(),
+      detail: '${json['detail'] ?? ''}'.trim(),
+      path: '${json['path'] ?? ''}'.trim(),
+      line: (json['line'] as num?)?.toInt() ?? 1,
+      excerpt: '${json['excerpt'] ?? ''}'.trim(),
+    );
+  }
+
+  final String severity;
+  final String category;
+  final String location;
+  final String detail;
+  final String path;
+  final int line;
+  final String excerpt;
+
+  bool get isBlocked => severity == 'blocked';
+}
+
+class SecurityGate {
+  const SecurityGate({
+    required this.status,
+    required this.haltLlmReview,
+    required this.overridden,
+    required this.summary,
+    required this.signals,
+  });
+
+  factory SecurityGate.fromJson(Map<String, dynamic> json) {
+    final List<dynamic> rawSignals =
+        (json['signals'] as List<dynamic>?) ?? const <dynamic>[];
+    final List<SecuritySignal> sigs = rawSignals
+        .whereType<Map<String, dynamic>>()
+        .map(SecuritySignal.fromJson)
+        .where((SecuritySignal s) => s.detail.isNotEmpty)
+        .toList();
+    return SecurityGate(
+      status: '${json['status'] ?? 'none'}'.trim().toLowerCase(),
+      haltLlmReview: json['haltLlmReview'] == true,
+      overridden: json['overridden'] == true,
+      summary: '${json['summary'] ?? ''}'.trim(),
+      signals: sigs,
+    );
+  }
+
+  final String status;
+  final bool haltLlmReview;
+  final bool overridden;
+  final String summary;
+  final List<SecuritySignal> signals;
+
+  bool get isBlocked => status == 'blocked';
+  bool get isHalted => isBlocked && !overridden;
+  bool get hasAlerts =>
+      (status == 'blocked' || status == 'warning') && signals.isNotEmpty;
+}
+
+class IntentVsActuality {
+  const IntentVsActuality({
+    required this.status,
+    required this.statedIntent,
+    required this.actualBehavior,
+    required this.discrepancies,
+  });
+
+  factory IntentVsActuality.fromJson(Map<String, dynamic> json) {
+    final List<dynamic> rawDisc =
+        (json['discrepancies'] as List<dynamic>?) ?? const <dynamic>[];
+    final List<String> disc = rawDisc
+        .map((dynamic e) => '$e'.trim())
+        .where((String s) => s.isNotEmpty)
+        .toList();
+    final String rawStatus = '${json['status'] ?? ''}'.trim().toLowerCase();
+    return IntentVsActuality(
+      status: rawStatus.isNotEmpty
+          ? rawStatus
+          : (disc.isNotEmpty ? 'diverges' : 'aligned'),
+      statedIntent: '${json['statedIntent'] ?? ''}'.trim(),
+      actualBehavior: '${json['actualBehavior'] ?? ''}'.trim(),
+      discrepancies: disc,
+    );
+  }
+
+  final String status;
+  final String statedIntent;
+  final String actualBehavior;
+  final List<String> discrepancies;
+
+  bool get diverges => status == 'diverges' || discrepancies.isNotEmpty;
+  bool get hasContent =>
+      statedIntent.isNotEmpty ||
+      actualBehavior.isNotEmpty ||
+      discrepancies.isNotEmpty;
+}
+
 class CliffsNotesData {
   const CliffsNotesData({
     required this.tldr,
@@ -291,6 +411,7 @@ class CliffsNotesData {
     required this.architectureDiagram,
     required this.keySymbols,
     required this.designTradeoffs,
+    this.intentVsActuality,
   });
 
   factory CliffsNotesData.fromJson(Map<String, dynamic> json) {
@@ -298,6 +419,8 @@ class CliffsNotesData {
         (json['keySymbols'] as List<dynamic>?) ?? const <dynamic>[];
     final List<dynamic> rawTradeoffs =
         (json['designTradeoffs'] as List<dynamic>?) ?? const <dynamic>[];
+    final Map<String, dynamic>? rawIva =
+        json['intentVsActuality'] as Map<String, dynamic>?;
     return CliffsNotesData(
       tldr: '${json['tldr'] ?? ''}',
       whatAndWhy: '${json['whatAndWhy'] ?? ''}',
@@ -307,6 +430,8 @@ class CliffsNotesData {
           .map(KeySymbol.fromJson)
           .toList(),
       designTradeoffs: rawTradeoffs.map((dynamic e) => '$e').toList(),
+      intentVsActuality:
+          rawIva != null ? IntentVsActuality.fromJson(rawIva) : null,
     );
   }
 
@@ -315,6 +440,7 @@ class CliffsNotesData {
   final String architectureDiagram;
   final List<KeySymbol> keySymbols;
   final List<String> designTradeoffs;
+  final IntentVsActuality? intentVsActuality;
 }
 
 class KeySymbol {

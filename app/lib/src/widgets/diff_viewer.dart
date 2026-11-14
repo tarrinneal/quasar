@@ -26,11 +26,19 @@ class DiffViewer extends StatefulWidget {
     required this.onReplyInThread,
     required this.onAskAtLine,
     required this.onOpenInExternalEditor,
+    this.tourStops = const <TourStop>[],
+    this.activeStopIndex = 0,
+    this.onStepTourStop,
+    this.onOpenStudyGuide,
     this.scrollRequest,
   });
 
   final List<FileDiff> files;
   final List<ReviewThread> threads;
+  final List<TourStop> tourStops;
+  final int activeStopIndex;
+  final void Function(int delta)? onStepTourStop;
+  final VoidCallback? onOpenStudyGuide;
   final bool isOwnedReview;
   final Future<void> Function(
     ReviewThread thread,
@@ -42,8 +50,13 @@ class DiffViewer extends StatefulWidget {
     String question, {
     bool changeMode,
   }) onReplyInThread;
-  final Future<void> Function(String filePath, int line, String question)
-      onAskAtLine;
+  final Future<void> Function(
+    String filePath,
+    int line,
+    String question, {
+    String mode,
+    String severity,
+  }) onAskAtLine;
   final Future<void> Function(String filePath, int line)
       onOpenInExternalEditor;
   final DiffScrollRequest? scrollRequest;
@@ -61,6 +74,7 @@ class _DiffViewerState extends State<DiffViewer> {
   String? _highlightedThreadId;
   int? _highlightedLine;
   final TextEditingController _lineQuestionCtrl = TextEditingController();
+  String _lineCommentSeverity = 'DESIGN';
   bool _submittingLineQ = false;
 
   final ScrollController _diffScrollController = ScrollController();
@@ -190,14 +204,24 @@ class _DiffViewerState extends State<DiffViewer> {
     );
   }
 
-  Future<void> _submitLineQuestion(String filePath, int line) async {
+  Future<void> _submitLineQuestion(
+    String filePath,
+    int line, {
+    String mode = 'manual',
+  }) async {
     final String q = _lineQuestionCtrl.text.trim();
-    if (q.isEmpty || _submittingLineQ) {
+    if ((q.isEmpty && mode != 'ai_comment') || _submittingLineQ) {
       return;
     }
     setState(() => _submittingLineQ = true);
     try {
-      await widget.onAskAtLine(filePath, line, q);
+      await widget.onAskAtLine(
+        filePath,
+        line,
+        q,
+        mode: mode,
+        severity: _lineCommentSeverity,
+      );
       _lineQuestionCtrl.clear();
       if (mounted) {
         setState(() => _askAtLineOpen = null);
@@ -435,6 +459,96 @@ class _DiffViewerState extends State<DiffViewer> {
         Expanded(
           child: Column(
             children: <Widget>[
+              if (widget.tourStops.isNotEmpty)
+                Builder(
+                  builder: (BuildContext ctx) {
+                    final int safeIdx = widget.activeStopIndex
+                        .clamp(0, widget.tourStops.length - 1);
+                    final TourStop curStop = widget.tourStops[safeIdx];
+                    final String summaryText = curStop.cliffsNotes.isNotEmpty
+                        ? curStop.cliffsNotes
+                        : curStop.title;
+                    return Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 6,
+                      ),
+                      decoration: const BoxDecoration(
+                        color: Color(0xFF0E1D28),
+                        border: Border(
+                          bottom: BorderSide(color: Color(0xFF21262D)),
+                        ),
+                      ),
+                      child: Row(
+                        children: <Widget>[
+                          Text(
+                            '📘 Stop ${safeIdx + 1}/${widget.tourStops.length} (${curStop.stopNumber})',
+                            style: const TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                              color: Color(0xFF79C0FF),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Text(
+                              summaryText,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Color(0xFFC9D1D9),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          OutlinedButton.icon(
+                            onPressed: widget.onStepTourStop == null
+                                ? null
+                                : () => widget.onStepTourStop!(-1),
+                            icon: const Icon(Icons.arrow_back, size: 14),
+                            label: const Text(
+                              'Prev',
+                              style: TextStyle(fontSize: 11.5),
+                            ),
+                            style: OutlinedButton.styleFrom(
+                              visualDensity: VisualDensity.compact,
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          FilledButton.tonalIcon(
+                            onPressed: widget.onStepTourStop == null
+                                ? null
+                                : () => widget.onStepTourStop!(1),
+                            icon: const Icon(Icons.arrow_forward, size: 14),
+                            label: const Text(
+                              'Next Stop',
+                              style: TextStyle(fontSize: 11.5),
+                            ),
+                            style: FilledButton.styleFrom(
+                              visualDensity: VisualDensity.compact,
+                            ),
+                          ),
+                          if (widget.onOpenStudyGuide != null) ...<Widget>[
+                            const SizedBox(width: 6),
+                            TextButton.icon(
+                              onPressed: widget.onOpenStudyGuide,
+                              icon: const Icon(Icons.menu_book, size: 14),
+                              label: const Text(
+                                'Study Guide',
+                                style: TextStyle(fontSize: 11.5),
+                              ),
+                              style: TextButton.styleFrom(
+                                visualDensity: VisualDensity.compact,
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    );
+                  },
+                ),
+
               // File toolbar
               Container(
                 padding:
@@ -565,47 +679,139 @@ class _DiffViewerState extends State<DiffViewer> {
                           Container(
                             padding: const EdgeInsets.all(10),
                             color: const Color(0xFF131B26),
-                            child: Row(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
                               children: <Widget>[
-                                Expanded(
-                                  child: TextField(
-                                    controller: _lineQuestionCtrl,
-                                    autofocus: true,
-                                    onSubmitted: (_) => _submitLineQuestion(
-                                      activeFile.path,
-                                      lineKeyNum,
-                                    ),
-                                    style: const TextStyle(
-                                      fontSize: 12.5,
-                                      color: Color(0xFFE6EDF3),
-                                    ),
-                                    decoration: InputDecoration(
-                                      isDense: true,
-                                      filled: true,
-                                      fillColor: const Color(0xFF0D1117),
-                                      hintText:
-                                          'Ask Antigravity CLI about ${activeFile.shortName}:L$lineKeyNum...',
-                                      border: OutlineInputBorder(
-                                        borderRadius: BorderRadius.circular(6),
+                                Row(
+                                  children: <Widget>[
+                                    Expanded(
+                                      child: TextField(
+                                        controller: _lineQuestionCtrl,
+                                        autofocus: true,
+                                        minLines: 1,
+                                        maxLines: 3,
+                                        onSubmitted: (_) => _submitLineQuestion(
+                                          activeFile.path,
+                                          lineKeyNum,
+                                          mode: 'manual',
+                                        ),
+                                        style: const TextStyle(
+                                          fontSize: 12.5,
+                                          color: Color(0xFFE6EDF3),
+                                        ),
+                                        decoration: InputDecoration(
+                                          isDense: true,
+                                          filled: true,
+                                          fillColor: const Color(0xFF0D1117),
+                                          hintText:
+                                              'Add your review comment on ${activeFile.shortName}:L$lineKeyNum, tell Quasar what to comment on, or ask a question...',
+                                          border: OutlineInputBorder(
+                                            borderRadius:
+                                                BorderRadius.circular(6),
+                                          ),
+                                        ),
                                       ),
                                     ),
-                                  ),
+                                    const SizedBox(width: 4),
+                                    IconButton(
+                                      onPressed: () =>
+                                          setState(() => _askAtLineOpen = null),
+                                      icon: const Icon(Icons.close, size: 16),
+                                    ),
+                                  ],
                                 ),
-                                const SizedBox(width: 8),
-                                FilledButton(
-                                  onPressed: _submittingLineQ
-                                      ? null
-                                      : () => _submitLineQuestion(
-                                            activeFile.path,
-                                            lineKeyNum,
+                                const SizedBox(height: 8),
+                                Wrap(
+                                  spacing: 8,
+                                  runSpacing: 6,
+                                  alignment: WrapAlignment.spaceBetween,
+                                  crossAxisAlignment: WrapCrossAlignment.center,
+                                  children: <Widget>[
+                                    Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: <Widget>[
+                                        const Text(
+                                          'Severity:',
+                                          style: TextStyle(
+                                            fontSize: 11.5,
+                                            color: Color(0xFF8B949E),
                                           ),
-                                  child: const Text('Ask Quasar'),
-                                ),
-                                const SizedBox(width: 4),
-                                IconButton(
-                                  onPressed: () =>
-                                      setState(() => _askAtLineOpen = null),
-                                  icon: const Icon(Icons.close, size: 16),
+                                        ),
+                                        const SizedBox(width: 6),
+                                        DropdownButton<String>(
+                                          value: _lineCommentSeverity,
+                                          isDense: true,
+                                          dropdownColor:
+                                              const Color(0xFF21262D),
+                                          style: const TextStyle(
+                                            fontSize: 12,
+                                            color: Color(0xFFE6EDF3),
+                                          ),
+                                          items: const <DropdownMenuItem<
+                                              String>>[
+                                            DropdownMenuItem<String>(
+                                              value: 'DESIGN',
+                                              child: Text('🟡 Design'),
+                                            ),
+                                            DropdownMenuItem<String>(
+                                              value: 'NIT',
+                                              child: Text('🟢 Nit'),
+                                            ),
+                                            DropdownMenuItem<String>(
+                                              value: 'BLOCKING',
+                                              child: Text('🔴 Blocking'),
+                                            ),
+                                          ],
+                                          onChanged: (String? v) {
+                                            if (v != null) {
+                                              setState(() =>
+                                                  _lineCommentSeverity = v);
+                                            }
+                                          },
+                                        ),
+                                      ],
+                                    ),
+                                    Wrap(
+                                      spacing: 6,
+                                      runSpacing: 6,
+                                      children: <Widget>[
+                                        OutlinedButton(
+                                          onPressed: _submittingLineQ
+                                              ? null
+                                              : () => _submitLineQuestion(
+                                                    activeFile.path,
+                                                    lineKeyNum,
+                                                    mode: 'qa',
+                                                  ),
+                                          child:
+                                              const Text('💬 Ask Question'),
+                                        ),
+                                        OutlinedButton(
+                                          onPressed: _submittingLineQ
+                                              ? null
+                                              : () => _submitLineQuestion(
+                                                    activeFile.path,
+                                                    lineKeyNum,
+                                                    mode: 'ai_comment',
+                                                  ),
+                                          child: const Text(
+                                            '✨ Ask Quasar to Comment',
+                                          ),
+                                        ),
+                                        FilledButton(
+                                          onPressed: _submittingLineQ
+                                              ? null
+                                              : () => _submitLineQuestion(
+                                                    activeFile.path,
+                                                    lineKeyNum,
+                                                    mode: 'manual',
+                                                  ),
+                                          child:
+                                              const Text('➕ Add Comment'),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
                                 ),
                               ],
                             ),

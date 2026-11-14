@@ -141,6 +141,10 @@ When an agent is asked to set up Quasar, it should execute these exact steps:
   - Hover over any changed hunk in the diff editor to see a **📘 Quasar CliffsNotes Hover Card** explaining *what* the hunk does, *why* it changed, and *how* it connects to callers/invariants—without adding comprehension threads into the code.
 - **💬 Comments-Only Mode**:
   - Want just the inline review comments to publish to GitHub or fix with the agent without generating the study guide or reading tour? Select **💬 Comments Only** when launching a review (or say `"comments only"` in chat).
+- **🚨 Deterministic Pre-Review Security & Prompt-Injection Gate (`security_gate.py`)**:
+  - Before any LLM subagent reads a PR, `collect_pr_context.py` deterministically scans PR prose, comments, changed file paths, and diff hunks in Python:
+    - **Quarantine Circuit-Breaker (`status: "blocked"`)**: Halts before invoking any LLM review agents when prompt-injection directives, Trojan-Source BiDi / Unicode tag smuggling, `curl | sh`, obfuscated `eval`/`exec`, or `pull_request_target` head checkouts are detected—surfacing inert excerpts and read-only diff links for human inspection first.
+    - **Build / CI / Agent-Config Warning (`status: "warning"`)**: Highlights modifications to CI workflows, install/build lifecycle hooks, IDE tasks, or repository agent instructions (`AGENTS.md`, `.gemini/*`) before you check out or run code locally (staying completely silent when nothing triggers, never claiming false "Safe" assurance).
 
 ### 2. Ask Quasar & Revise Comments with the Agent (`vscode.comments`)
 - Click the native `+` gutter icon on **any line** in the diff editor (or click `💬 Ask Quasar` in the CodeLens/Hover card).
@@ -174,6 +178,7 @@ Quasar ships with general-purpose review lenses under `plugin/agents/`. Each len
 | Lens | Focus | Default efforts |
 |---|---|---|
 | `review-architect` | Architecture, API surface, backwards compatibility, reading order | medium, high |
+| `review-blind-diff` | Blind diff evaluation (no PR title/body) for Intent vs. Actuality, hidden side effects & scope creep | medium, high |
 | `review-bug-hunter` | Execution paths, nullability, async hazards, leaks, platform edge cases | medium, high |
 | `review-security` | Injection, authn/authz, secrets, unsafe parsing, path traversal, transport/crypto | medium, high |
 | `review-test-critic` | Test falsifiability, coverage matrix, generated file sync, repo hygiene | high |

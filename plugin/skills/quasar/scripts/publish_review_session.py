@@ -258,11 +258,43 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
     )
     session["commentsOnly"] = comments_only
 
+    try:
+        from security_gate import normalize_security_gate
+
+        norm_sg = normalize_security_gate(
+            payload.get("securityGate")
+            or payload.get("security_gate")
+            or existing.get("securityGate")
+        )
+        if norm_sg:
+            session["securityGate"] = norm_sg
+        else:
+            session.pop("securityGate", None)
+    except Exception:
+        pass
+
     if "cliffsNotes" in payload:
         cn = dict(session.get("cliffsNotes") or {})
         cn.update(payload["cliffsNotes"])
         if cn.get("architectureDiagram"):
             cn["architectureDiagram"] = sanitize_mermaid_diagram(cn["architectureDiagram"])
+        raw_iva = cn.get("intentVsActuality")
+        if isinstance(raw_iva, dict):
+            raw_disc = raw_iva.get("discrepancies") or []
+            disc_list = (
+                [str(d).strip() for d in raw_disc if str(d).strip()]
+                if isinstance(raw_disc, list)
+                else ([str(raw_disc).strip()] if str(raw_disc).strip() else [])
+            )
+            raw_status = str(raw_iva.get("status") or "").strip().lower()
+            if raw_status not in ("aligned", "diverges", "missing_intent"):
+                raw_status = "diverges" if disc_list else "aligned"
+            cn["intentVsActuality"] = {
+                "status": raw_status,
+                "statedIntent": str(raw_iva.get("statedIntent") or "").strip(),
+                "actualBehavior": str(raw_iva.get("actualBehavior") or "").strip(),
+                "discrepancies": disc_list,
+            }
         session["cliffsNotes"] = cn
 
     base_root = session.get("baseSnapshotRoot", "")
@@ -336,10 +368,19 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
     prior_threads_by_id: Dict[str, Dict[str, Any]] = {
         str(t.get("id")): t for t in (session.get("threads") or []) if t.get("id")
     }
+    incoming_ids = {
+        str(f.get("id"))
+        for f in (payload.get("findings") or payload.get("threads") or [])
+        if isinstance(f, dict) and f.get("id")
+    }
     raw_existing_threads = [
         t
         for t in (session.get("threads") or [])
         if t.get("kind") in ("github_existing", "user_qa", "user_staged")
+        or (
+            t.get("createdBy") in ("user", "quasar_inline")
+            and str(t.get("id") or "") not in incoming_ids
+        )
     ]
     # Also collapse consecutive ungrouped author replies on the same path+line if migrating an older session
     collapsed_existing: List[Dict[str, Any]] = []

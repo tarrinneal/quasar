@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="1.4.0"
+VERSION="1.5.0"
 EXT_NAME="codeium.codeium-dev-${VERSION}"
 OLD_CODEIUM_EXT_NAME="codeium.codeium-dev-1.0.0"
 OLD_EXT_NAME="antigravity.antigravity-code-review-1.0.0"
@@ -314,7 +314,7 @@ with zipfile.ZipFile(vsix_path, "w", zipfile.ZIP_DEFLATED) as zf:
     if os.path.isdir(plugin_dir):
         import subprocess
         tracked_res = subprocess.run(
-            ["git", "ls-files", "plugin"],
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "plugin"],
             cwd=repo_root,
             capture_output=True,
             text=True,
@@ -376,7 +376,7 @@ for EXT_ROOT in "${HOME}"/.*/extensions; do
         rel_sub="${rel_plugin_file#plugin/}"
         mkdir -p "${TARGET_EXT_DIR}/bundled_plugin/$(dirname "${rel_sub}")"
         cp "${SCRIPT_DIR}/${rel_plugin_file}" "${TARGET_EXT_DIR}/bundled_plugin/${rel_sub}" 2>/dev/null || true
-      done < <(git -C "${SCRIPT_DIR}" ls-files plugin)
+      done < <(git -C "${SCRIPT_DIR}" ls-files --cached --others --exclude-standard plugin)
     else
       cp -R "${SCRIPT_DIR}/plugin/"* "${TARGET_EXT_DIR}/bundled_plugin/" 2>/dev/null || true
     fi

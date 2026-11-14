@@ -5,7 +5,10 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 const http = require('node:http');
 const { pathToFileURL } = require('node:url');
-const { execFile, execFileSync } = require('node:child_process');
+const { execFile, execFileSync, spawn } = require('node:child_process');
+
+let activeAgyCliJobsCount = 0;
+let onAgyCliJobStateChanged = null;
 
 const REVIEW_STATE_DIR = path.join(os.homedir(), '.gemini', 'quasar');
 const WORKSPACES_STATE_DIR = path.join(REVIEW_STATE_DIR, 'workspaces');
@@ -327,6 +330,57 @@ function formatShortSubagentName(agentName) {
     .replace(/^quasar-/, '');
 }
 
+function isReviewCommentThread(t) {
+  return Boolean(t && (t.kind === 'ai_candidate' || t.kind === 'user_staged'));
+}
+
+function deriveCommentTitleFromDraft(rawText, fallback = 'Inline Review Comment') {
+  const cleaned = String(rawText || '')
+    .replace(/\s+/g, ' ')
+    .replace(/^(?:nit|blocking|design|comment|question)\s*:\s*/i, '')
+    .trim();
+  if (!cleaned) return fallback;
+  const firstSentence = cleaned.split(/\.\s+/)[0].trim();
+  const candidate =
+    firstSentence.length >= 8 && firstSentence.length <= 72 ? firstSentence : cleaned;
+  return candidate.length > 72 ? `${candidate.slice(0, 69).trimEnd()}...` : candidate;
+}
+
+function inferSeverityFromCommentText(rawText, fallback = 'DESIGN') {
+  const trimmed = String(rawText || '').trim();
+  if (/^(?:blocking|bug|security|crash)\b/i.test(trimmed)) return 'BLOCKING';
+  if (/^(?:nit|typo|minor|polish|style)\b/i.test(trimmed)) return 'NIT';
+  return fallback;
+}
+
+function buildPrimaryFindingCardBody(t) {
+  const title = (t && t.title) || 'Review Comment';
+  const why = (t && t.whyItMatters) || '';
+  const draft = (t && t.draftComment) || '';
+  const srcAgents = getThreadSourceAgents(t);
+  const srcMd =
+    srcAgents.length > 0
+      ? `\n\n🤖 *Suggested by*: ${srcAgents.map((a) => `\`${a}\``).join(', ')}`
+      : '';
+  if (t && t.status === 'uncertain') {
+    const q =
+      t.uncertaintyQuestion ||
+      `Do you want Quasar to flag issues like "${title}" in future reviews, or skip this pattern?`;
+    return (
+      `### 🤔 Preference Check: ${title}${srcMd}\n\n` +
+      `**Question for You**: *${q}*\n\n` +
+      `*Context & Trade-off*: ${why}\n\n` +
+      `---\n` +
+      `**Candidate GitHub Comment (if kept)**:\n> ${draft}\n\n` +
+      `*(Use the **🤔 Calibrate Preference** button above or 👍/👎 to teach Quasar how to handle this in the future.)*`
+    );
+  }
+  const parts = [`**${title}**${srcMd}`];
+  if (why) parts.push(`*CliffsNotes Context*: ${why}`);
+  if (draft) parts.push(`---\n**Draft GitHub Comment**:\n> ${draft}`);
+  return parts.join('\n\n');
+}
+
 function buildEffortPromptInstruction(effortLevel, commentsOnly = false) {
   const level = normalizeEffortLevel(effortLevel);
   let lensNames = [];
@@ -340,9 +394,10 @@ function buildEffortPromptInstruction(effortLevel, commentsOnly = false) {
     ? ' (instruct `review-architect` to skip the reading tour/mental model and only return API/design findings)'
     : '';
   const lensRule =
-    ` Spawn only the configured lenses for this effort level (\`review_lenses\` in \`pr_context.json\`), skipping any whose \`appliesWhen\` gate clearly does not match this diff, pass each lens its \`learnedDirectives\` from \`review_lenses[i].learnedDirectives\`, and record \`"sourceAgents": ["<lens-name>"]\` on every finding in \`review_synthesis.json\` (listing all contributing lenses when merging duplicates).`;
+    ` Spawn only the configured lenses for this effort level (\`review_lenses\` in \`pr_context.json\`), skipping any whose \`appliesWhen\` gate clearly does not match this diff, pass each lens its \`learnedDirectives\` from \`review_lenses[i].learnedDirectives\`, strictly withhold PR title/description/comments from any lens with \`"blindDiff": true\` (e.g. \`review-blind-diff\`), cross-check blind actuality against stated PR intent in \`cliffsNotes.intentVsActuality\`, and record \`"sourceAgents": ["<lens-name>"]\` on every finding in \`review_synthesis.json\` (listing all contributing lenses when merging duplicates).`;
 
   const noChatQuestionsRule =
+    ` First check \`halt_llm_review\` in \`pr_context.json\`: if \`true\`, STOP immediately without reading \`pr.diff\` or spawning any subagents and report \`security_gate.signals\` to the user.` +
     ` Do NOT call \`ask_question\` during the review — complete and publish the review uninterrupted, and flag any borderline or preference-dependent comments with \`"status": "uncertain"\` so the user can review them in the UI alongside the code.`;
 
   const modePrefix = commentsOnly
@@ -453,6 +508,270 @@ function getAgentApiBinary() {
 }
 
 /**
+ * Resolves the Antigravity CLI (`agy`) binary for direct headless dispatch when no
+ * embedded `language_server` (`ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN`) is present
+ * (e.g. inside standard VS Code or alongside Antigravity 2.0).
+ */
+function findAgyBinary() {
+  const candidates = [
+    process.env.AGY_BIN || '',
+    path.join(os.homedir(), '.gemini', 'bin', 'agy'),
+    '/opt/homebrew/bin/agy',
+    '/usr/local/bin/agy',
+  ];
+  for (const cand of candidates) {
+    if (cand && fs.existsSync(cand)) {
+      try {
+        fs.accessSync(cand, fs.constants.X_OK);
+        return cand;
+      } catch (_) {}
+    }
+  }
+  try {
+    const whichOut = execFileSync('/usr/bin/which', ['agy'], {
+      encoding: 'utf8',
+      timeout: 2000,
+    }).trim();
+    if (whichOut && fs.existsSync(whichOut)) return whichOut;
+  } catch (_) {}
+  return null;
+}
+
+function safeRealpath(p) {
+  if (!p) return '';
+  try {
+    return fs.realpathSync(p);
+  } catch (_) {
+    return path.resolve(p);
+  }
+}
+
+/**
+ * Spawns a background Antigravity CLI (`agy --print`) session with ephemeral, per-invocation
+ * `--settings` permissions scoped strictly to Quasar's scripts and state directory (plus
+ * working-tree edits/tests only when explicitly requested by user action).
+ */
+function dispatchViaAgyCli(prompt, title, effectiveWsRoot, env, options = {}) {
+  return new Promise((resolve) => {
+    const agyBin = findAgyBinary();
+    if (!agyBin) {
+      resolve({
+        success: false,
+        error:
+          'ANTIGRAVITY_LS_ADDRESS is unavailable and `agy` CLI was not found at ~/.gemini/bin/agy',
+      });
+      return;
+    }
+
+    const allowRepoEdits = Boolean(options && options.allowRepoEdits);
+    const allowAgentConfigEdits = Boolean(options && options.allowAgentConfigEdits);
+    const realStateDir = safeRealpath(REVIEW_STATE_DIR);
+    const realPluginDir = safeRealpath(
+      path.join(os.homedir(), '.gemini', 'config', 'plugins', 'quasar')
+    );
+    const realConfigAgentsDir = safeRealpath(
+      path.join(os.homedir(), '.gemini', 'config', 'agents')
+    );
+    const hasValidWs = Boolean(effectiveWsRoot && fs.existsSync(effectiveWsRoot));
+    const realWs = hasValidWs ? safeRealpath(effectiveWsRoot) : '';
+
+    const allowRules = [
+      'command(regex:^python3\\s+.*quasar/skills/quasar/scripts/.*)',
+      'command(git)',
+      `read_file(${realStateDir}/)`,
+      `write_file(${realStateDir}/)`,
+      `read_file(${realPluginDir}/)`,
+    ];
+    if (realConfigAgentsDir) {
+      allowRules.push(`read_file(${realConfigAgentsDir}/)`);
+      if (allowAgentConfigEdits) {
+        allowRules.push(`write_file(${realConfigAgentsDir}/)`);
+      }
+    }
+    if (realWs) {
+      allowRules.push(`read_file(${realWs}/)`);
+      if (allowAgentConfigEdits) {
+        allowRules.push(`write_file(${realWs}/.gemini/)`);
+      }
+      if (allowRepoEdits) {
+        allowRules.push(
+          `write_file(${realWs}/)`,
+          'command(flutter)',
+          'command(dart)',
+          'command(npm)',
+          'command(pnpm)',
+          'command(yarn)',
+          'command(npx)',
+          'command(pytest)',
+          'command(python3)',
+          'command(cargo)',
+          'command(go)',
+          'command(make)'
+        );
+      }
+    }
+
+    const sessionSettings = JSON.stringify({
+      permissions: { allow: allowRules },
+    });
+
+    const args = [
+      '--output-format=stream-json',
+      `--mode=${allowRepoEdits || allowAgentConfigEdits ? 'accept-edits' : 'auto'}`,
+    ];
+    const addedDirs = new Set();
+    for (const d of [realWs, realStateDir, realPluginDir]) {
+      if (d && fs.existsSync(d) && !addedDirs.has(d)) {
+        addedDirs.add(d);
+        args.push('--add-dir', d);
+      }
+    }
+    args.push(`--settings=${sessionSettings}`);
+    args.push(`--print=${prompt}`);
+
+    const runCwd = realWs && fs.existsSync(realWs) ? realWs : os.homedir();
+    let settled = false;
+    let discoveredConvId = null;
+    let stdoutBuf = '';
+    let stderrBuf = '';
+
+    let proc;
+    try {
+      proc = spawn(agyBin, args, {
+        cwd: runCwd,
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (spawnErr) {
+      resolve({
+        success: false,
+        error: (spawnErr && spawnErr.message) || 'Failed to spawn agy CLI',
+      });
+      return;
+    }
+
+    activeAgyCliJobsCount++;
+    if (typeof onAgyCliJobStateChanged === 'function') {
+      try {
+        onAgyCliJobStateChanged();
+      } catch (_) {}
+    }
+
+    const persistCliConvId = (cid) => {
+      if (!cid || discoveredConvId) return;
+      discoveredConvId = cid;
+      try {
+        const latestSess = loadActiveSession();
+        if (latestSess) {
+          latestSess.conversationId = cid;
+          if (allowRepoEdits) {
+            latestSess.fixConversationId = cid;
+          }
+          saveActiveSession(latestSess);
+        }
+      } catch (_) {}
+    };
+
+    const finishResolve = (payload) => {
+      if (settled) return;
+      settled = true;
+      resolve(payload);
+    };
+
+    // Resolve promptly once `agy` starts running (or emits `init` with its conversation_id)
+    const earlyResolveTimer = setTimeout(() => {
+      finishResolve({
+        success: true,
+        mode: 'agy-cli',
+        conversationId: discoveredConvId,
+        stdout: '',
+      });
+    }, 2500);
+
+    if (proc.stdout) {
+      proc.stdout.on('data', (chunk) => {
+        stdoutBuf += chunk.toString('utf8');
+        let nlIdx;
+        while ((nlIdx = stdoutBuf.indexOf('\n')) >= 0) {
+          const line = stdoutBuf.slice(0, nlIdx).trim();
+          stdoutBuf = stdoutBuf.slice(nlIdx + 1);
+          if (!line) continue;
+          if (line.startsWith('{') && line.endsWith('}')) {
+            try {
+              const ev = JSON.parse(line);
+              const cid =
+                ev.conversation_id ||
+                ev.conversationId ||
+                (ev.step_update && ev.step_update.conversation_id) ||
+                (ev.result && ev.result.conversation_id) ||
+                '';
+              if (cid) {
+                persistCliConvId(String(cid));
+                clearTimeout(earlyResolveTimer);
+                finishResolve({
+                  success: true,
+                  mode: 'agy-cli',
+                  conversationId: String(cid),
+                  stdout: line,
+                });
+              }
+              if (ev.event === 'result' && ev.result && ev.result.status === 'ERROR') {
+                clearTimeout(earlyResolveTimer);
+                finishResolve({
+                  success: false,
+                  error: ev.result.error || 'agy CLI returned ERROR',
+                });
+              }
+            } catch (_) {}
+          }
+        }
+      });
+    }
+
+    if (proc.stderr) {
+      proc.stderr.on('data', (chunk) => {
+        if (stderrBuf.length < 4096) {
+          stderrBuf += chunk.toString('utf8');
+        }
+      });
+    }
+
+    proc.on('error', (err) => {
+      clearTimeout(earlyResolveTimer);
+      finishResolve({
+        success: false,
+        error: (err && err.message) || 'agy CLI process error',
+      });
+    });
+
+    proc.on('close', (code) => {
+      clearTimeout(earlyResolveTimer);
+      activeAgyCliJobsCount = Math.max(0, activeAgyCliJobsCount - 1);
+      if (!settled) {
+        if (code === 0) {
+          finishResolve({
+            success: true,
+            mode: 'agy-cli',
+            conversationId: discoveredConvId,
+            stdout: '',
+          });
+        } else {
+          finishResolve({
+            success: false,
+            error: stderrBuf.trim() || `agy CLI exited with code ${code}`,
+          });
+        }
+      }
+      if (typeof onAgyCliJobStateChanged === 'function') {
+        try {
+          onAgyCliJobStateChanged();
+        } catch (_) {}
+      }
+    });
+  });
+}
+
+/**
  * Discovers `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN` from the running
  * Antigravity `language_server` process when called from the VS Code Extension Host
  * (which does not inherit those environment variables directly).
@@ -487,20 +806,20 @@ function discoverAntigravityLsEnv(targetWorkspaceRoot = null) {
       const isLs = cmd.includes('language_server');
       const isAgy = cmd.includes('/bin/agy') || cmd.includes(' agy ') || cmd.startsWith('agy ');
       if (!isLs && !isAgy) continue;
-      if (!cmd.includes('--csrf_token')) continue;
+      if (!cmd.includes('--csrf_token') && !cmd.includes('--csrf-token')) continue;
 
-      const csrfMatch = cmd.match(/--csrf_token[=\s]+([^\s]+)/);
+      const csrfMatch = cmd.match(/--csrf[-_]token[=\s]+([^\s]+)/);
       if (!csrfMatch) continue;
       const csrfToken = csrfMatch[1];
-      const isLspOnly = cmd.includes('--enable_lsp');
-      const wsMatch = cmd.match(/--(?:workspace_id|add-dir)[=\s]+([^\s]+)/);
+      const isLspOnly = cmd.includes('--enable_lsp') || cmd.includes('--enable-lsp');
+      const wsMatch = cmd.match(/--(?:workspace[-_]id|add-dir)[=\s]+([^\s]+)/);
       const workspaceId = wsMatch ? wsMatch[1] : '';
       const matchesTargetWs = Boolean(
         targetWorkspaceRoot &&
         ((normWs && workspaceId.includes(normWs)) ||
           (workspaceId && (targetWorkspaceRoot.includes(workspaceId) || workspaceId.includes(targetWorkspaceRoot))))
       );
-      const hubPortMatch = cmd.match(/--hub-port[=\s]+(\d+)/);
+      const hubPortMatch = cmd.match(/--hub[-_]port[=\s]+(\d+)/);
       const hubPort = hubPortMatch ? Number(hubPortMatch[1]) : null;
       procs.push({ pid, csrfToken, isLspOnly, workspaceId, matchesTargetWs, hubPort });
     }
@@ -528,7 +847,9 @@ function discoverAntigravityLsEnv(targetWorkspaceRoot = null) {
         );
         const listeners = [];
         for (const lLine of lsofOut.split('\n')) {
-          const fdMatch = lLine.match(/\s+(\d+)u\s+IPv[46]\s+.*?(?:127\.0\.0\.1|localhost|\*):(\d+)\s+\(LISTEN\)/);
+          const fdMatch = lLine.match(
+            /\s+(\d+)u\s+IPv[46]\s+.*?(?:127\.0\.0\.1|\[::1\]|localhost|\*):(\d+)\s+\(LISTEN\)/
+          );
           if (fdMatch) {
             listeners.push({ fd: Number(fdMatch[1]), port: Number(fdMatch[2]) });
           }
@@ -696,6 +1017,81 @@ function isConversationBlockedOrUndeliverable(convId) {
     }
   } catch (_) {}
   return false;
+}
+
+/**
+ * Inspects the Antigravity conversation transcript to determine whether a dispatched
+ * Fix Agent turn is actively working, paused on `ask_question`, or finished (`idle`).
+ *
+ * Returns `'working' | 'paused_on_question' | 'idle' | 'unknown'`.
+ */
+function inspectConversationFixState(convId) {
+  if (!convId) return 'unknown';
+  const convDir = findConversationBrainDir(convId);
+  if (!convDir) return 'unknown';
+  const tPath = path.join(convDir, '.system_generated', 'logs', 'transcript.jsonl');
+  if (!fs.existsSync(tPath)) return 'unknown';
+  try {
+    const stat = fs.statSync(tPath);
+    const ageMs = Date.now() - stat.mtimeMs;
+    const readSize = Math.min(stat.size, 65536);
+    const startOffset = Math.max(0, stat.size - readSize);
+    const fd = fs.openSync(tPath, 'r');
+    const buf = Buffer.alloc(readSize);
+    const bytesRead = fs.readSync(fd, buf, 0, readSize, startOffset);
+    fs.closeSync(fd);
+    const tailText = buf.slice(0, bytesRead).toString('utf8');
+    const lines = tailText
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith('{') && l.endsWith('}'));
+    const parsedSteps = [];
+    for (const line of lines) {
+      try {
+        parsedSteps.push(JSON.parse(line));
+      } catch (_) {}
+    }
+    if (parsedSteps.length === 0) return 'unknown';
+
+    let lastPlannerIdx = -1;
+    let lastPlannerToolCalls = [];
+    for (let i = parsedSteps.length - 1; i >= 0; i--) {
+      if (parsedSteps[i].type === 'PLANNER_RESPONSE') {
+        lastPlannerIdx = i;
+        lastPlannerToolCalls = Array.isArray(parsedSteps[i].tool_calls)
+          ? parsedSteps[i].tool_calls
+          : [];
+        break;
+      }
+    }
+
+    if (lastPlannerIdx >= 0 && lastPlannerToolCalls.length > 0) {
+      let genericResponsesAfter = 0;
+      for (let j = lastPlannerIdx + 1; j < parsedSteps.length; j++) {
+        if (parsedSteps[j].type === 'GENERIC') {
+          genericResponsesAfter++;
+        }
+      }
+      if (genericResponsesAfter < lastPlannerToolCalls.length) {
+        const asksQuestion = lastPlannerToolCalls.some((tc) => {
+          const nm = String((tc && tc.name) || '');
+          return nm === 'ask_question' || nm.endsWith('ask_question');
+        });
+        return asksQuestion ? 'paused_on_question' : 'working';
+      }
+    }
+
+    const lastStep = parsedSteps[parsedSteps.length - 1];
+    if (lastStep.type !== 'PLANNER_RESPONSE') {
+      return ageMs < 90000 ? 'working' : 'idle';
+    }
+    if (ageMs < 4000) {
+      return 'working';
+    }
+    return 'idle';
+  } catch (_) {
+    return 'unknown';
+  }
 }
 
 /**
@@ -1112,7 +1508,27 @@ function sendPromptToQuasar(prompt, title = 'Quasar', targetWorkspaceRoot = null
     };
 
     const startNewConversation = () => {
+      const tryAgyCliFallback = (priorErrMsg) => {
+        dispatchViaAgyCli(prompt, title, effectiveWsRoot, env, options).then((cliRes) => {
+          if (cliRes && cliRes.success) {
+            resolve(cliRes);
+          } else {
+            resolve({
+              success: false,
+              error:
+                (cliRes && cliRes.error) ||
+                priorErrMsg ||
+                'agentapi and agy CLI dispatch failed',
+            });
+          }
+        });
+      };
+
       const tryDirectHttpFallback = (fallbackErr) => {
+        if (!env.ANTIGRAVITY_LS_ADDRESS || !env.ANTIGRAVITY_CSRF_TOKEN) {
+          tryAgyCliFallback(fallbackErr && fallbackErr.error);
+          return;
+        }
         startNewCascadeViaLsHttp(prompt, title, effectiveWsRoot, effortLevel, env)
           .then((httpRes) => {
             if (httpRes && httpRes.conversationId) {
@@ -1121,13 +1537,9 @@ function sendPromptToQuasar(prompt, title = 'Quasar', targetWorkspaceRoot = null
             resolve(httpRes);
           })
           .catch((httpErr) => {
-            resolve({
-              success: false,
-              error:
-                (httpErr && httpErr.message) ||
-                (fallbackErr && fallbackErr.error) ||
-                'agentapi failed',
-            });
+            tryAgyCliFallback(
+              (httpErr && httpErr.message) || (fallbackErr && fallbackErr.error)
+            );
           });
       };
 
@@ -1691,7 +2103,53 @@ class CliffsNotesTreeProvider {
       }
       rootItems.push(headerItem);
 
-      if (pr.isOwnedByUser && pr.needsBranchSwitch && pr.headRefName) {
+      const sg = session.securityGate;
+      const hasSecuritySignals =
+        sg &&
+        typeof sg === 'object' &&
+        (sg.status === 'blocked' || sg.status === 'warning') &&
+        Array.isArray(sg.signals) &&
+        sg.signals.length > 0;
+      if (hasSecuritySignals) {
+        const isBlocked = sg.status === 'blocked';
+        const isHalted = isBlocked && !sg.overridden;
+        const sigCount = sg.signals.length;
+        const sgLabel = isHalted
+          ? `🚨 Quarantined — LLM Review Halted (${sigCount} Signal${sigCount === 1 ? '' : 's'})`
+          : isBlocked
+          ? `🚨 Security Alert (Overridden • ${sigCount} Signal${sigCount === 1 ? '' : 's'})`
+          : `⚠️ Touches Build / CI / Agent Config (${sigCount} Signal${sigCount === 1 ? '' : 's'})`;
+        const sgNode = new vscode.TreeItem(sgLabel, vscode.TreeItemCollapsibleState.Expanded);
+        sgNode.description = isHalted
+          ? 'Inspect read-only diff first'
+          : 'Inspect before running locally';
+        sgNode.iconPath = new vscode.ThemeIcon(
+          isBlocked ? 'shield' : 'warning',
+          new vscode.ThemeColor(isBlocked ? 'charts.red' : 'charts.yellow')
+        );
+        const sgTip = [
+          isHalted
+            ? '### 🚨 Security / Prompt-Injection Quarantine — LLM Review Halted'
+            : isBlocked
+            ? '### 🚨 Security / Prompt-Injection Alert (Quarantine Overridden)'
+            : '### ⚠️ Touches Build / CI / Agent Config',
+          '',
+          sg.summary || '',
+          '',
+          '*Expand to jump directly to each flagged file/line in the read-only snapshot diff.*',
+        ];
+        sgNode.tooltip = new vscode.MarkdownString(sgTip.join('\n'));
+        sgNode.nodeType = 'security-gate-root';
+        sgNode.securityGate = sg;
+        rootItems.push(sgNode);
+      }
+
+      if (
+        pr.isOwnedByUser &&
+        pr.needsBranchSwitch &&
+        pr.headRefName &&
+        !(hasSecuritySignals && sg.status === 'blocked' && !sg.overridden)
+      ) {
         const switchItem = new vscode.TreeItem(
           `Switch Local Repo to PR Branch '${pr.headRefName}'...`,
           vscode.TreeItemCollapsibleState.None
@@ -1797,6 +2255,71 @@ class CliffsNotesTreeProvider {
       return rootItems;
     }
 
+    if (element.nodeType === 'security-gate-root') {
+      const sg = element.securityGate || session.securityGate || {};
+      const children = [];
+      for (const sig of sg.signals || []) {
+        const isSigBlocked = sig.severity === 'blocked';
+        const locLabel = sig.location || sig.path || 'PR';
+        const sigItem = new vscode.TreeItem(
+          `${locLabel} — ${sig.detail || ''}`,
+          vscode.TreeItemCollapsibleState.None
+        );
+        sigItem.description = sig.excerpt || sig.category || '';
+        sigItem.iconPath = new vscode.ThemeIcon(
+          isSigBlocked ? 'error' : 'warning',
+          new vscode.ThemeColor(isSigBlocked ? 'charts.red' : 'charts.yellow')
+        );
+        const tipParts = [`**${locLabel}**`, '', sig.detail || ''];
+        if (sig.excerpt) {
+          tipParts.push('', `\`${String(sig.excerpt).replace(/`/g, "'")}\``);
+        }
+        if (sig.path) {
+          tipParts.push('', '*Click to inspect this line in the read-only snapshot diff.*');
+          const sigLine = Math.max(1, Number(sig.line) || 1);
+          sigItem.command = {
+            command: 'quasar.openTourStop',
+            title: 'Inspect Flagged Line in Read-Only Diff',
+            arguments: [
+              {
+                id: `sec-${sig.path}-${sigLine}`,
+                title: `${path.basename(sig.path)}:L${sigLine}`,
+                path: sig.path,
+                startLine: sigLine,
+                endLine: sigLine,
+                baseSnapshotPath: session.baseSnapshotRoot
+                  ? path.join(session.baseSnapshotRoot, sig.path)
+                  : '',
+                headSnapshotPath: session.headSnapshotRoot
+                  ? path.join(session.headSnapshotRoot, sig.path)
+                  : '',
+              },
+            ],
+          };
+        }
+        sigItem.tooltip = new vscode.MarkdownString(tipParts.join('\n'));
+        children.push(sigItem);
+      }
+      if (sg.status === 'blocked' && !sg.overridden) {
+        const overrideItem = new vscode.TreeItem(
+          'Override Quarantine & Run Agent Review...',
+          vscode.TreeItemCollapsibleState.None
+        );
+        overrideItem.description = 'Only after inspecting all flagged lines';
+        overrideItem.iconPath = new vscode.ThemeIcon('play');
+        overrideItem.tooltip = new vscode.MarkdownString(
+          '### 🛡️ Override Quarantine & Run Agent Review\n\n' +
+            'Use this **only** after manually verifying in the read-only diff that every flagged signal above is benign (for example, unit tests for a security scanner).'
+        );
+        overrideItem.command = {
+          command: 'quasar.overrideQuarantine',
+          title: 'Override Quarantine & Run Agent Review',
+        };
+        children.push(overrideItem);
+      }
+      return children;
+    }
+
     if (element.nodeType === 'summary-root') {
       const cn = session.cliffsNotes || {};
       const items = [];
@@ -1812,6 +2335,40 @@ class CliffsNotesTreeProvider {
         title: 'Open Full CliffsNotes',
       };
       items.push(tldrItem);
+
+      const iva = cn.intentVsActuality;
+      if (iva && typeof iva === 'object' && (iva.actualBehavior || iva.statedIntent || (iva.discrepancies || []).length > 0)) {
+        const ivaDisc = Array.isArray(iva.discrepancies) ? iva.discrepancies.filter(Boolean) : [];
+        const isDiv = String(iva.status || '').toLowerCase() === 'diverges' || ivaDisc.length > 0;
+        const ivaItem = new vscode.TreeItem(
+          isDiv
+            ? `Intent vs. Actuality: ${ivaDisc.length || 1} Divergence${ivaDisc.length === 1 ? '' : 's'} Found`
+            : 'Intent vs. Actuality: Matches Stated PR Intent',
+          vscode.TreeItemCollapsibleState.None
+        );
+        ivaItem.description = isDiv ? 'Blind-diff check' : 'Verified via blind diff';
+        ivaItem.iconPath = new vscode.ThemeIcon(
+          isDiv ? 'warning' : 'verified',
+          new vscode.ThemeColor(isDiv ? 'charts.yellow' : 'charts.green')
+        );
+        const ivaTipLines = [
+          `### 🎯 Blind-Diff Check: Intent vs. Actuality (\`review-blind-diff\`)`,
+          '',
+        ];
+        if (iva.statedIntent) ivaTipLines.push(`- **Stated Intent**: ${iva.statedIntent}`);
+        if (iva.actualBehavior) ivaTipLines.push(`- **Actual Diff Behavior**: ${iva.actualBehavior}`);
+        if (ivaDisc.length > 0) {
+          ivaTipLines.push('', '**Discrepancies:**');
+          for (const d of ivaDisc) ivaTipLines.push(`- ⚠️ ${d}`);
+        }
+        ivaItem.tooltip = new vscode.MarkdownString(ivaTipLines.join('\n'));
+        ivaItem.command = {
+          command: 'quasar.openCliffsNotesGuide',
+          title: 'Open CliffsNotes Study Guide',
+          arguments: ['summary-section'],
+        };
+        items.push(ivaItem);
+      }
 
       if (cn.architectureDiagram && String(cn.architectureDiagram).trim()) {
         const archItem = new vscode.TreeItem(
@@ -2303,7 +2860,7 @@ class CommentsTreeProvider {
     if (!element) {
       let didAutoStage = false;
       for (const t of threads) {
-        if (t.kind === 'ai_candidate' && t.status === 'candidate' && !t.unstagedByUser) {
+        if (isReviewCommentThread(t) && t.status === 'candidate' && !t.unstagedByUser) {
           t.status = 'staged';
           didAutoStage = true;
         }
@@ -2314,38 +2871,152 @@ class CommentsTreeProvider {
 
       const activeThreads = threads.filter((t) => t.status !== 'dismissed');
       const rootNodes = [];
+      const fixingNow = activeThreads.filter(
+        (t) => t.status !== 'fixed' && t.fixStatus === 'in_progress'
+      );
+      const needsInputFixes = activeThreads.filter(
+        (t) => t.status !== 'fixed' && t.fixStatus === 'needs_input'
+      );
+      const needsAttentionFixes = activeThreads.filter(
+        (t) => t.status !== 'fixed' && t.fixStatus === 'needs_attention'
+      );
+      const queuedOnly = activeThreads.filter(
+        (t) =>
+          t.selectedForFix &&
+          t.status !== 'fixed' &&
+          !['in_progress', 'needs_input', 'needs_attention'].includes(String(t.fixStatus || ''))
+      );
       const queuedForFix = activeThreads.filter((t) => t.selectedForFix && t.status !== 'fixed');
       const fixedThreads = activeThreads.filter((t) => t.status === 'fixed');
       const fixableCount = activeThreads.filter((t) => t.status !== 'fixed').length;
+      const uncertain = activeThreads.filter((t) => t.status === 'uncertain');
+      const staged = activeThreads.filter((t) => t.status === 'staged');
+      const isRemotePr = Boolean(
+        (pr.number && pr.owner && pr.mode !== 'local') ||
+          session.isTutorial ||
+          pr.mode === 'tutorial'
+      );
 
-      if ((isOwned || queuedForFix.length > 0) && fixableCount > 0) {
+      const buildFixActionNode = () => {
+        if (fixingNow.length > 0) {
+          const fixingNode = new vscode.TreeItem(
+            `⏳ Agent Fixing ${fixingNow.length} Comment${fixingNow.length === 1 ? '' : 's'} Now...`,
+            vscode.TreeItemCollapsibleState.None
+          );
+          fixingNode.description =
+            fixedThreads.length > 0
+              ? `${fixedThreads.length} already fixed • working...`
+              : 'Working in local repo...';
+          fixingNode.iconPath = new vscode.ThemeIcon(
+            'loading~spin',
+            new vscode.ThemeColor('charts.blue')
+          );
+          fixingNode.tooltip = new vscode.MarkdownString(
+            `### ⏳ Quasar Agent Is Fixing ${fixingNow.length} Comment(s)\n\n` +
+              `Quasar is editing \`${session.repoDir || 'your local repo'}\` right now. ` +
+              `You will get a notification toast and each item below will turn **\`✅ Fixed\`** as soon as the agent finishes.`
+          );
+          fixingNode.command = {
+            command: 'quasar.fixSelectedComments',
+            title: 'Fix More Comments with Agent',
+          };
+          return fixingNode;
+        }
+        if (needsInputFixes.length > 0) {
+          const waitNode = new vscode.TreeItem(
+            `💬 Agent Waiting for Your Reply in Chat (${needsInputFixes.length} Fix Pending)...`,
+            vscode.TreeItemCollapsibleState.None
+          );
+          waitNode.description = 'Check Antigravity chat pane';
+          waitNode.iconPath = new vscode.ThemeIcon(
+            'comment-discussion',
+            new vscode.ThemeColor('charts.yellow')
+          );
+          waitNode.tooltip = new vscode.MarkdownString(
+            `### 💬 Agent Paused on a Question in Chat\n\n` +
+              `The fix agent asked a question (such as choosing a solution approach) before editing your files. Answer in the Antigravity chat pane to continue.`
+          );
+          return waitNode;
+        }
+        if (fixableCount === 0 && fixedThreads.length > 0) {
+          const allDoneNode = new vscode.TreeItem(
+            `✅ All ${fixedThreads.length} Comment${fixedThreads.length === 1 ? '' : 's'} Fixed in Working Tree!`,
+            vscode.TreeItemCollapsibleState.None
+          );
+          allDoneNode.description = 'Done';
+          allDoneNode.iconPath = new vscode.ThemeIcon(
+            'pass-filled',
+            new vscode.ThemeColor('charts.green')
+          );
+          allDoneNode.tooltip = new vscode.MarkdownString(
+            `### ✅ All Selected Comments Fixed\n\nAll ${fixedThreads.length} comment(s) have been fixed and synced into your side-by-side diff.`
+          );
+          return allDoneNode;
+        }
         const fixActionNode = new vscode.TreeItem(
-          queuedForFix.length > 0
-            ? `Fix ${queuedForFix.length} Checked Comment(s) with Quasar Agent...`
-            : 'Author Self-Review: Select & Fix Comments with Agent...',
+          queuedOnly.length > 0
+            ? `Send ${queuedOnly.length} Checked Comment${queuedOnly.length === 1 ? '' : 's'} to Agent to Fix...`
+            : fixedThreads.length > 0
+            ? `✅ ${fixedThreads.length} Fixed — Fix More Comments with Agent...`
+            : 'Fix Comments with Agent (Check Boxes Below)...',
           vscode.TreeItemCollapsibleState.None
         );
         fixActionNode.description =
-          queuedForFix.length > 0
-            ? 'Click to dispatch checked comments to Quasar'
-            : 'Check boxes below or click to pick issues to fix';
-        fixActionNode.iconPath = new vscode.ThemeIcon('wrench');
+          queuedOnly.length > 0 ? 'Local working tree' : 'Author Self-Review';
+        fixActionNode.iconPath = new vscode.ThemeIcon(
+          fixedThreads.length > 0 && queuedOnly.length === 0 ? 'pass-filled' : 'wrench',
+          new vscode.ThemeColor(
+            queuedOnly.length > 0 || fixedThreads.length > 0 ? 'charts.green' : 'charts.orange'
+          )
+        );
         fixActionNode.tooltip = new vscode.MarkdownString(
-          `### 🔧 Fix Review Comments with Quasar Agent\n\n` +
-            `Check the boxes next to any Quasar findings or existing GitHub PR comments below, then click here to have Quasar fix them in \`${session.repoDir || 'your local repo'}\`.`
+          `### 🔧 Send Comments to Quasar Agent to Fix\n\n` +
+            `Applies fixes directly to your local working tree in \`${
+              session.repoDir || 'your local repo'
+            }\` (never posts to GitHub).`
         );
         fixActionNode.command = {
           command: 'quasar.fixSelectedComments',
           title: 'Fix Selected Comments with Agent',
         };
-        rootNodes.push(fixActionNode);
-      }
+        return fixActionNode;
+      };
 
-      const uncertain = activeThreads.filter((t) => t.status === 'uncertain');
-      const staged = activeThreads.filter((t) => t.status === 'staged');
+      const buildPublishActionNode = () => {
+        const publishNode = new vscode.TreeItem(
+          staged.length > 0
+            ? `Publish Review to GitHub (${staged.length} Staged Comment${staged.length === 1 ? '' : 's'})...`
+            : 'Publish / Approve Review on GitHub (0 Inline Comments)...',
+          vscode.TreeItemCollapsibleState.None
+        );
+        publishNode.description = pr.number ? `PR #${pr.number}` : 'GitHub PR';
+        publishNode.iconPath = new vscode.ThemeIcon(
+          'cloud-upload',
+          new vscode.ThemeColor('charts.blue')
+        );
+        publishNode.tooltip = new vscode.MarkdownString(
+          `### ☁️ Publish or Stage Pending Review on GitHub\n\n` +
+            `Submit your ${staged.length} staged comment(s) as a **Pending Draft**, **Comment**, **Approve**, or **Request Changes** review on GitHub.`
+        );
+        publishNode.command = {
+          command: 'quasar.exportPendingReview',
+          title: 'Publish / Export Review to GitHub',
+        };
+        return publishNode;
+      };
+
+      if (isOwned) {
+        if (fixableCount > 0 || fixedThreads.length > 0) rootNodes.push(buildFixActionNode());
+        if (isRemotePr) rootNodes.push(buildPublishActionNode());
+      } else {
+        if (isRemotePr) rootNodes.push(buildPublishActionNode());
+        if ((queuedForFix.length > 0 && fixableCount > 0) || fixingNow.length > 0) {
+          rootNodes.push(buildFixActionNode());
+        }
+      }
       const candidates = activeThreads.filter(
         (t) =>
-          t.kind === 'ai_candidate' &&
+          isReviewCommentThread(t) &&
           t.status !== 'staged' &&
           t.status !== 'uncertain' &&
           t.status !== 'fixed'
@@ -2387,13 +3058,60 @@ class CommentsTreeProvider {
       if (ghRepliedCount > 0) existingSummaryParts.push(`✅ ${ghRepliedCount} Addressed`);
 
       const groups = [
-        ...(queuedForFix.length > 0
+        ...(fixingNow.length > 0
+          ? [
+              {
+                id: 'fixing-now',
+                label: `⏳ Fixing with Agent Now (${fixingNow.length})`,
+                description: 'In progress...',
+                icon: 'loading~spin',
+                items: fixingNow,
+                expanded: true,
+              },
+            ]
+          : []),
+        ...(needsInputFixes.length > 0
+          ? [
+              {
+                id: 'fixing-needs-input',
+                label: `💬 Agent Waiting for Chat Reply (${needsInputFixes.length})`,
+                description: 'Answer in chat',
+                icon: 'comment-discussion',
+                items: needsInputFixes,
+                expanded: true,
+              },
+            ]
+          : []),
+        ...(needsAttentionFixes.length > 0
+          ? [
+              {
+                id: 'fixing-needs-attention',
+                label: `⚠️ Agent Turn Ended — Needs Check (${needsAttentionFixes.length})`,
+                description: 'No file edit detected',
+                icon: 'warning',
+                items: needsAttentionFixes,
+                expanded: true,
+              },
+            ]
+          : []),
+        ...(queuedOnly.length > 0
           ? [
               {
                 id: 'queued-fix',
-                label: `Queued for Agent Fix (${queuedForFix.length})`,
+                label: `Queued to Send to Agent (${queuedOnly.length})`,
                 icon: 'tools',
-                items: queuedForFix,
+                items: queuedOnly,
+                expanded: true,
+              },
+            ]
+          : []),
+        ...(fixedThreads.length > 0
+          ? [
+              {
+                id: 'fixed',
+                label: `✅ Fixed in Working Tree (${fixedThreads.length})`,
+                icon: 'pass-filled',
+                items: fixedThreads,
                 expanded: true,
               },
             ]
@@ -2448,17 +3166,6 @@ class CommentsTreeProvider {
           items: existingGh,
           expanded: isOwned && existingGh.length > 0,
         },
-        ...(fixedThreads.length > 0
-          ? [
-              {
-                id: 'fixed',
-                label: `Fixed in Working Tree (${fixedThreads.length})`,
-                icon: 'pass-filled',
-                items: fixedThreads,
-                expanded: true,
-              },
-            ]
-          : []),
       ];
 
       for (const g of groups) {
@@ -2521,7 +3228,11 @@ class CommentsTreeProvider {
             : '';
         const fixBadge =
           !isFixed && t.fixStatus === 'in_progress'
-            ? ' 🔧(Fixing...)'
+            ? ' ⏳(Fixing...)'
+            : !isFixed && t.fixStatus === 'needs_input'
+            ? ' 💬(Waiting in Chat)'
+            : !isFixed && t.fixStatus === 'needs_attention'
+            ? ' ⚠️(Check Fix)'
             : !isFixed && t.selectedForFix
             ? ' 🔧'
             : '';
@@ -2538,6 +3249,27 @@ class CommentsTreeProvider {
           `${prefix}${fixBadge}${ratingBadge} ${cleanTitle}`,
           vscode.TreeItemCollapsibleState.None
         );
+        if (isFixed) {
+          item.iconPath = new vscode.ThemeIcon(
+            'pass-filled',
+            new vscode.ThemeColor('charts.green')
+          );
+        } else if (t.fixStatus === 'in_progress') {
+          item.iconPath = new vscode.ThemeIcon(
+            'loading~spin',
+            new vscode.ThemeColor('charts.blue')
+          );
+        } else if (t.fixStatus === 'needs_input') {
+          item.iconPath = new vscode.ThemeIcon(
+            'comment-discussion',
+            new vscode.ThemeColor('charts.yellow')
+          );
+        } else if (t.fixStatus === 'needs_attention') {
+          item.iconPath = new vscode.ThemeIcon(
+            'warning',
+            new vscode.ThemeColor('charts.orange')
+          );
+        }
         const isTopLevel = Boolean(t.isTopLevel || !t.path);
         const locStr = isTopLevel
           ? t.targetFile
@@ -2570,13 +3302,13 @@ class CommentsTreeProvider {
           ? 'thread-uncertain'
           : t.status === 'staged'
           ? 'thread-staged'
-          : t.kind === 'ai_candidate' || t.kind === 'user_qa'
+          : isReviewCommentThread(t) || t.kind === 'user_qa'
           ? 'thread-candidate'
           : 'thread-existing';
         item.threadId = t.id;
         item.threadData = t;
 
-        if (!isFixed && vscode.TreeItemCheckboxState) {
+        if (!isFixed && (isOwned || t.selectedForFix) && vscode.TreeItemCheckboxState) {
           item.checkboxState = t.selectedForFix
             ? vscode.TreeItemCheckboxState.Checked
             : vscode.TreeItemCheckboxState.Unchecked;
@@ -2972,6 +3704,7 @@ class ChecksTreeProvider {
 
 const BUILTIN_REVIEW_AGENT_NAMES = new Set([
   'review-architect',
+  'review-blind-diff',
   'review-bug-hunter',
   'review-test-critic',
   'review-advocate',
@@ -2993,6 +3726,7 @@ const CUSTOM_LENS_DEFAULT_EFFORTS = ['medium', 'high'];
 const BUILTIN_LENS_FALLBACKS = {
   'review-advocate': { role: 'filter', efforts: [] },
   'review-architect': { efforts: ['medium', 'high'] },
+  'review-blind-diff': { efforts: ['medium', 'high'], blindDiff: true },
   'review-bug-hunter': { efforts: ['medium', 'high'] },
   'review-test-critic': { efforts: ['high'] },
   'review-security': { efforts: ['medium', 'high'] },
@@ -3211,6 +3945,48 @@ function activate(context) {
   fs.mkdirSync(REVIEW_STATE_DIR, { recursive: true });
   ensureQuasarPluginBootstrapped();
   let showChecksTree = false;
+  let currentStopIndex = -1;
+
+  function updateEditorReviewContexts(sessionArg) {
+    const session = sessionArg !== undefined ? sessionArg : loadActiveSession();
+    const hasSession = Boolean(session && session.pr);
+    const stops = hasSession ? getAllTourStops(session) : [];
+    const pr = (session && session.pr) || {};
+    const isRemotePr = Boolean(
+      hasSession &&
+        ((pr.number && pr.owner && pr.mode !== 'local') ||
+          session.isTutorial ||
+          pr.mode === 'tutorial')
+    );
+
+    let isReviewDiff = false;
+    const ed = vscode.window.activeTextEditor;
+    if (hasSession && ed && ed.document && ed.document.uri && ed.document.uri.scheme === 'file') {
+      const fsPath = path.resolve(ed.document.uri.fsPath);
+      const headRoot = session.headSnapshotRoot ? path.resolve(session.headSnapshotRoot) : '';
+      const baseRoot = session.baseSnapshotRoot ? path.resolve(session.baseSnapshotRoot) : '';
+      if (
+        (headRoot && (fsPath === headRoot || fsPath.startsWith(headRoot + path.sep))) ||
+        (baseRoot && (fsPath === baseRoot || fsPath.startsWith(baseRoot + path.sep)))
+      ) {
+        isReviewDiff = true;
+      } else {
+        const rel = inferRelPathFromDocument(fsPath, session);
+        if (
+          rel &&
+          (stops.some((s) => s.path === rel) ||
+            (session.threads || []).some((t) => t.path === rel && t.status !== 'dismissed'))
+        ) {
+          isReviewDiff = true;
+        }
+      }
+    }
+
+    vscode.commands.executeCommand('setContext', 'quasar.hasTourStops', stops.length > 0).catch(() => {});
+    vscode.commands.executeCommand('setContext', 'quasar.isRemotePrReview', isRemotePr).catch(() => {});
+    vscode.commands.executeCommand('setContext', 'quasar.isReviewDiffActive', isReviewDiff).catch(() => {});
+  }
+
   vscode.commands.executeCommand('setContext', 'quasar.showChecksTree', false);
   context.subscriptions.push(
     vscode.commands.registerCommand('quasar.toggleChecksTree', async () => {
@@ -3234,6 +4010,7 @@ function activate(context) {
         if (vscode.window.state && vscode.window.state.focused) {
           touchWindowRegistration(true);
         }
+        updateEditorReviewContexts();
       })
     );
   }
@@ -3401,6 +4178,7 @@ function activate(context) {
   function updateStatusBar(session) {
     if (!session || !session.pr) {
       statusBarItem.text = '$(git-pull-request) Quasar';
+      statusBarItem.backgroundColor = undefined;
       statusBarItem.tooltip =
         'Click to open Quasar (Review Local Branch, GitHub PR, or Manage Preferences)';
       statusBarItem.show();
@@ -3409,22 +4187,48 @@ function activate(context) {
     }
     const stops = getAllTourStops(session);
     const readCount = stops.filter((s) => s.read).length;
-    const stagedCount = (session.threads || []).filter((t) => t.status === 'staged').length;
-    const uncertainCount = (session.threads || []).filter((t) => t.status === 'uncertain').length;
-    const queuedFixCount = (session.threads || []).filter(
-      (t) => t.selectedForFix && t.status !== 'fixed'
+    const allThreads = session.threads || [];
+    const stagedCount = allThreads.filter((t) => t.status === 'staged').length;
+    const uncertainCount = allThreads.filter((t) => t.status === 'uncertain').length;
+    const fixingCount = allThreads.filter(
+      (t) => t.status !== 'fixed' && t.fixStatus === 'in_progress'
+    ).length;
+    const needsInputCount = allThreads.filter(
+      (t) => t.status !== 'fixed' && t.fixStatus === 'needs_input'
+    ).length;
+    const fixedCount = allThreads.filter((t) => t.status === 'fixed').length;
+    const queuedFixCount = allThreads.filter(
+      (t) =>
+        t.selectedForFix &&
+        t.status !== 'fixed' &&
+        !['in_progress', 'needs_input'].includes(String(t.fixStatus || ''))
     ).length;
     const targetLabel = session.pr.number
       ? `PR #${session.pr.number}`
       : `$(git-branch) ${session.pr.headBranch || session.pr.headRefName || 'Local Branch'}`;
-    const spin = session.analysisStatus === 'analyzing' ? '$(sync~spin) ' : '$(book) ';
-    statusBarItem.text = `${spin}Quasar: ${targetLabel}`;
+    const isQuarantined = session.analysisStatus === 'quarantined';
+    const spin = isQuarantined
+      ? '$(shield) '
+      : session.analysisStatus === 'analyzing' || fixingCount > 0 || activeAgyCliJobsCount > 0
+      ? '$(sync~spin) '
+      : '$(book) ';
+    statusBarItem.text = isQuarantined
+      ? `${spin}Quasar: ${targetLabel} (Quarantined)`
+      : fixingCount > 0
+      ? `${spin}Quasar: ${targetLabel} (Fixing ${fixingCount}...)`
+      : `${spin}Quasar: ${targetLabel}`;
+    statusBarItem.backgroundColor = isQuarantined
+      ? new vscode.ThemeColor('statusBarItem.errorBackground')
+      : undefined;
     statusBarItem.tooltip = 'Click to open Quasar Sidebar & Menu';
     statusBarItem.show();
 
     const uncertainSuffix = uncertainCount > 0 ? ` • $(question) ${uncertainCount} Uncertain` : '';
-    const fixSuffix = queuedFixCount > 0 ? ` • $(wrench) ${queuedFixCount} Queued to Fix` : '';
-    tourStatusBarItem.text = `$(arrow-down) Tour ${readCount}/${stops.length} • ${stagedCount} Staged${uncertainSuffix}${fixSuffix}`;
+    const fixingSuffix = fixingCount > 0 ? ` • $(sync~spin) Fixing ${fixingCount}` : '';
+    const waitSuffix = needsInputCount > 0 ? ` • $(comment-discussion) ${needsInputCount} Waiting in Chat` : '';
+    const fixSuffix = queuedFixCount > 0 ? ` • $(wrench) ${queuedFixCount} Queued` : '';
+    const doneFixSuffix = fixedCount > 0 ? ` • $(pass-filled) ${fixedCount} Fixed` : '';
+    tourStatusBarItem.text = `$(arrow-right) Tour ${readCount}/${stops.length} • ${stagedCount} Staged${uncertainSuffix}${fixingSuffix}${waitSuffix}${fixSuffix}${doneFixSuffix}`;
     tourStatusBarItem.tooltip = 'Click to step to the next CliffsNotes Tour Stop (Alt+Down)';
     tourStatusBarItem.show();
   }
@@ -3489,7 +4293,11 @@ function activate(context) {
       }
 
       const isFixInProgress = t.status !== 'fixed' && t.fixStatus === 'in_progress';
-      const isQueuedForFix = t.status !== 'fixed' && (Boolean(t.selectedForFix) || isFixInProgress);
+      const isFixNeedsInput = t.status !== 'fixed' && t.fixStatus === 'needs_input';
+      const isFixNeedsAttention = t.status !== 'fixed' && t.fixStatus === 'needs_attention';
+      const isQueuedForFix =
+        t.status !== 'fixed' &&
+        (Boolean(t.selectedForFix) || isFixInProgress || isFixNeedsInput || isFixNeedsAttention);
       const fixStateTag =
         t.status === 'fixed' ? 'fix_done' : isQueuedForFix ? 'fix_queued' : 'fix_unqueued';
       const cmdArg = encodeURIComponent(JSON.stringify({ threadId: t.id }));
@@ -3566,12 +4374,16 @@ function activate(context) {
         t.status === 'fixed'
           ? `\n\n---\n✅ **Fixed in Working Tree**${t.fixedSummary ? ` — ${t.fixedSummary}` : ''}${subagentActionBarMd}`
           : isFixInProgress
-          ? `\n\n---\n⏳ **🔧 Agent Fix in Progress...**  •  [$(debug-restart) Retry Fix Now](command:quasar.fixSingleComment?${cmdArg})  •  [$(close) Remove from Fix Queue](command:quasar.unqueueForFix?${cmdArg})${subagentActionBarMd}`
+          ? `\n\n---\n⏳ **🔧 Agent Fix in Progress...**  •  [$(pass-filled) Mark as Fixed](command:quasar.markCommentFixed?${cmdArg})  •  [$(debug-restart) Retry Fix Now](command:quasar.fixSingleComment?${cmdArg})  •  [$(close) Remove from Fix Queue](command:quasar.unqueueForFix?${cmdArg})${subagentActionBarMd}`
+          : isFixNeedsInput
+          ? `\n\n---\n💬 **Agent Waiting for Your Reply in Chat...**  •  [$(pass-filled) Mark as Fixed](command:quasar.markCommentFixed?${cmdArg})  •  [$(debug-restart) Retry Fix Now](command:quasar.fixSingleComment?${cmdArg})${subagentActionBarMd}`
+          : isFixNeedsAttention
+          ? `\n\n---\n⚠️ **Agent Turn Finished (No File Edit Detected)**  •  [$(wrench) Retry Fix Now](command:quasar.fixSingleComment?${cmdArg})  •  [$(pass-filled) Mark as Fixed](command:quasar.markCommentFixed?${cmdArg})  •  [$(close) Remove from Fix Queue](command:quasar.unqueueForFix?${cmdArg})${subagentActionBarMd}`
           : isQueuedForFix
-          ? `\n\n---\n✅ **🔧 Queued for Agent Fix**  •  [$(close) Remove from Fix Queue](command:quasar.unqueueForFix?${cmdArg})  •  [$(wrench) Fix Now](command:quasar.fixSingleComment?${cmdArg})${subagentActionBarMd}`
+          ? `\n\n---\n✅ **🔧 Queued for Agent Fix**  •  [$(wrench) Fix Now](command:quasar.fixSingleComment?${cmdArg})  •  [$(pass-filled) Mark as Fixed](command:quasar.markCommentFixed?${cmdArg})  •  [$(close) Remove from Fix Queue](command:quasar.unqueueForFix?${cmdArg})${subagentActionBarMd}`
           : isAlreadyAddressedGh
           ? `\n\n---\n✅ **No Code Changes Needed**  •  [$(tools) Queue Fix Anyway](command:quasar.queueForFix?${cmdArg})`
-          : `\n\n---\n[$(tools) Queue for Agent Fix](command:quasar.queueForFix?${cmdArg})  •  [$(wrench) Fix Now](command:quasar.fixSingleComment?${cmdArg})${subagentActionBarMd}`;
+          : `\n\n---\n[$(tools) Queue for Agent Fix](command:quasar.queueForFix?${cmdArg})  •  [$(wrench) Fix Now](command:quasar.fixSingleComment?${cmdArg})  •  [$(pass-filled) Mark as Fixed](command:quasar.markCommentFixed?${cmdArg})${subagentActionBarMd}`;
 
       const actionTargetIdx =
         t.kind === 'github_existing'
@@ -3615,7 +4427,11 @@ function activate(context) {
       });
 
       const queuedSuffix = isFixInProgress
-        ? ' [🔧 FIXING...]'
+        ? ' [⏳ FIXING NOW...]'
+        : isFixNeedsInput
+        ? ' [💬 WAITING IN CHAT]'
+        : isFixNeedsAttention
+        ? ' [⚠️ CHECK FIX]'
         : isQueuedForFix
         ? ' [🔧 QUEUED FOR FIX ✓]'
         : '';
@@ -3634,7 +4450,10 @@ function activate(context) {
 
       if (t.status === 'fixed') {
         desiredContextValue = `fixed:${fixStateTag}`;
-        desiredLabel = `✅ Fixed in Working Tree${subagentLabelSuffix} — ${t.title || ''}`;
+        const shortFixNote = t.fixedSummary
+          ? ` (${String(t.fixedSummary).replace(/\s+/g, ' ').slice(0, 65)})`
+          : '';
+        desiredLabel = `✅ Fixed in Working Tree${subagentLabelSuffix} — ${t.title || ''}${shortFixNote}`;
         initialCollapsible = vscode.CommentThreadCollapsibleState.Collapsed;
       } else if (t.status === 'uncertain') {
         desiredContextValue = `uncertain:${fixStateTag}${hasSolutionsTag}`;
@@ -3651,16 +4470,18 @@ function activate(context) {
           : '💬 Review';
         desiredContextValue = `staged:${fixStateTag}${hasSolutionsTag}`;
         desiredLabel = `✅ Staged for GitHub Review (${badge})${subagentLabelSuffix}${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
-      } else if (t.kind === 'ai_candidate') {
+      } else if (isReviewCommentThread(t)) {
         desiredContextValue = `candidate:${fixStateTag}${hasSolutionsTag}`;
         const sev = (t.severity || '').toUpperCase();
         const badge = sev.includes('BLOCK')
           ? '🔴 Blocking'
           : sev.includes('DESIGN')
           ? '🟡 Design'
-          : '🟢 Nit';
+          : sev.includes('NIT')
+          ? '🟢 Nit'
+          : '💬 Review';
         desiredLabel = `${badge} Draft (Unstaged)${subagentLabelSuffix}${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
-      } else if (t.kind === 'user_qa') {
+      } else if (t.kind === 'user_qa' || t.kind === 'user_question') {
         desiredContextValue = `qa:${fixStateTag}${hasSolutionsTag}`;
         desiredLabel = `💬 Quasar Q&A${queuedSuffix}${solutionSuffix} — ${t.title || ''}`;
       } else {
@@ -3863,12 +4684,27 @@ function activate(context) {
     const session = loadActiveSession();
     if (!session || !stop) return;
 
+    const allStops = getAllTourStops(session);
+    const matchedStopIdx = allStops.findIndex(
+      (s) =>
+        (stop.id && s.id === stop.id) ||
+        (stop.stopNumber && s.stopNumber === stop.stopNumber && s.path === stop.path) ||
+        (s.path === stop.path && s.startLine === stop.startLine)
+    );
+    if (matchedStopIdx !== -1) {
+      currentStopIndex = matchedStopIdx;
+    }
+
     const baseFilePath = stop.baseSnapshotPath || path.join(session.baseSnapshotRoot || '', stop.path);
     const headFilePath = stop.headSnapshotPath || path.join(session.headSnapshotRoot || '', stop.path);
     const baseUri = vscode.Uri.file(baseFilePath);
     const headUri = vscode.Uri.file(headFilePath);
 
-    const diffTitle = `[Stop ${stop.stopNumber}] ${path.basename(stop.path)} — ${
+    const stopCounter =
+      matchedStopIdx !== -1 && allStops.length > 0
+        ? `Stop ${matchedStopIdx + 1}/${allStops.length}`
+        : `Stop ${stop.stopNumber}`;
+    const diffTitle = `[${stopCounter}] ${path.basename(stop.path)} — ${
       stop.cliffsNotes || stop.description || ''
     }`.slice(0, 90);
 
@@ -4325,8 +5161,27 @@ function activate(context) {
                     ? `<button type="button" class="q-btn q-btn-sm ${
                         t.selectedForFix ? 'q-btn-primary' : ''
                       }" data-act="toggleFixThread" data-thread-id="${escapeHtmlText(t.id)}">${
-                        t.selectedForFix ? '🔧 Queued ✓' : '🔧 Fix'
+                        t.fixStatus === 'in_progress'
+                          ? '⏳ Fixing...'
+                          : t.fixStatus === 'needs_input'
+                          ? '💬 Waiting in Chat'
+                          : t.fixStatus === 'needs_attention'
+                          ? '⚠️ Check Fix'
+                          : t.selectedForFix
+                          ? '🔧 Queued ✓'
+                          : '🔧 Fix'
                       }</button>`
+                    : ''
+                }
+                ${
+                  t.status !== 'fixed' &&
+                  (t.fixStatus === 'in_progress' ||
+                    t.fixStatus === 'needs_input' ||
+                    t.fixStatus === 'needs_attention' ||
+                    t.selectedForFix)
+                    ? `<button type="button" class="q-btn q-btn-sm" data-act="markThreadFixed" data-thread-id="${escapeHtmlText(
+                        t.id
+                      )}" title="Mark this comment as fixed in your working tree">✓ Mark Fixed</button>`
                     : ''
                 }
                 <button type="button" class="q-btn q-btn-sm" data-act="dismissThread" data-thread-id="${escapeHtmlText(
@@ -4931,9 +5786,97 @@ function activate(context) {
       : ''
   }
 
+  ${(() => {
+    const sg = session.securityGate;
+    if (
+      !sg ||
+      typeof sg !== 'object' ||
+      (sg.status !== 'blocked' && sg.status !== 'warning') ||
+      !Array.isArray(sg.signals) ||
+      sg.signals.length === 0
+    ) {
+      return '';
+    }
+    const isBlocked = sg.status === 'blocked';
+    const isHalted = isBlocked && !sg.overridden;
+    const borderCol = isBlocked ? 'rgba(248, 81, 73, 0.7)' : 'rgba(227, 179, 65, 0.6)';
+    const bgCol = isBlocked ? 'rgba(248, 81, 73, 0.11)' : 'rgba(227, 179, 65, 0.09)';
+    const headingText = isHalted
+      ? '🚨 Security / Prompt-Injection Quarantine — LLM Review Halted'
+      : isBlocked
+      ? '🚨 Security / Prompt-Injection Alert (Quarantine Overridden by User)'
+      : '⚠️ Touches Build / CI / Agent Config — Inspect Before Running Locally';
+    const sigRows = sg.signals
+      .map((sig) => {
+        const icon = sig.severity === 'blocked' ? '🚨' : '⚠️';
+        const loc = escapeHtmlText(sig.location || sig.path || 'PR');
+        const detail = escapeHtmlText(sig.detail || '');
+        const excerptHtml = sig.excerpt
+          ? `<div style="margin-top:3px;font-family:var(--vscode-editor-font-family,monospace);font-size:11.5px;opacity:0.9;word-break:break-word;"><code>${escapeHtmlText(
+              sig.excerpt
+            )}</code></div>`
+          : '';
+        const jumpBtn = sig.path
+          ? `<button type="button" class="q-btn q-btn-sm" data-act="openSignalDiff" data-sig-path="${escapeHtmlText(
+              sig.path
+            )}" data-sig-line="${Math.max(1, Number(sig.line) || 1)}">🔍 Inspect Diff</button>`
+          : '';
+        return `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;padding:7px 10px;border-radius:6px;background:var(--q-card-bg);border:1px solid var(--q-border);">
+          <div style="flex:1;min-width:0;">
+            <div><strong>${icon} ${loc}</strong> — ${detail}</div>
+            ${excerptHtml}
+          </div>
+          ${jumpBtn}
+        </div>`;
+      })
+      .join('');
+    return `
+      <div class="q-section" id="security-gate-section" style="border: 1.5px solid ${borderCol}; background: ${bgCol};">
+        <h2>
+          <span>${headingText}</span>
+          ${
+            isHalted
+              ? `<button type="button" class="q-btn q-btn-sm" data-act="runCommand" data-cmd="quasar.overrideQuarantine">🛡️ Override Quarantine &amp; Run Review</button>`
+              : ''
+          }
+        </h2>
+        ${sg.summary ? `<p style="margin:0 0 10px 0;font-size:12.5px;">${escapeHtmlText(sg.summary)}</p>` : ''}
+        <div style="display:grid;gap:7px;font-size:12.5px;">${sigRows}</div>
+      </div>`;
+  })()}
+
   <div class="q-section" id="summary-section">
     <h2>⚡ In Plain English</h2>
     <div class="q-tldr-box">${formatInlineMd(headlineSource)}</div>
+    ${(() => {
+      const iva = cn.intentVsActuality;
+      if (!iva || typeof iva !== 'object') return '';
+      const disc = Array.isArray(iva.discrepancies) ? iva.discrepancies.filter(Boolean) : [];
+      if (!iva.actualBehavior && !iva.statedIntent && disc.length === 0) return '';
+      const statusLower = String(iva.status || 'aligned').toLowerCase();
+      const isDiv = statusLower === 'diverges' || disc.length > 0;
+      if (isDiv) {
+        return `
+          <div style="margin-top:10px;padding:10px 12px;border-radius:7px;border:1px solid rgba(227,179,65,0.55);background:rgba(227,179,65,0.08);font-size:12.5px;">
+            <div style="font-weight:700;margin-bottom:5px;">⚠️ Blind-Diff Check: Diverges from Stated PR Intent (<code>review-blind-diff</code>)</div>
+            ${iva.statedIntent ? `<div style="margin-bottom:3px;"><strong>Stated Intent:</strong> ${formatInlineMd(iva.statedIntent)}</div>` : ''}
+            ${iva.actualBehavior ? `<div style="margin-bottom:5px;"><strong>Actual Diff Behavior:</strong> ${formatInlineMd(iva.actualBehavior)}</div>` : ''}
+            ${disc.length > 0 ? `<ul style="margin:4px 0 0 18px;padding:0;">${disc.map((d) => `<li>${formatInlineMd(d)}</li>`).join('')}</ul>` : ''}
+          </div>`;
+      }
+      const summaryLabel =
+        statusLower === 'missing_intent'
+          ? 'ℹ️ Blind-Diff Check: No PR description provided — summary derived strictly from code'
+          : '✅ Blind-Diff Check: Code matches stated PR intent';
+      return `
+        <details class="q-section-drawer" style="margin-top:8px;">
+          <summary>${summaryLabel}</summary>
+          <div class="q-stop-details-body" style="font-size:12.5px;">
+            ${iva.statedIntent ? `<div style="margin-bottom:4px;"><strong>Stated Intent:</strong> ${formatInlineMd(iva.statedIntent)}</div>` : ''}
+            ${iva.actualBehavior ? `<div><strong>Actual Diff Behavior:</strong> ${formatInlineMd(iva.actualBehavior)}</div>` : ''}
+          </div>
+        </details>`;
+    })()}
     ${
       hasDeepDive
         ? `<details class="q-section-drawer" id="symbols-section">
@@ -4995,6 +5938,33 @@ function activate(context) {
         }
       </span>
     </h2>
+    ${(() => {
+      const fNow = activeThreads.filter(
+        (t) => t.status !== 'fixed' && t.fixStatus === 'in_progress'
+      ).length;
+      const fWait = activeThreads.filter(
+        (t) => t.status !== 'fixed' && t.fixStatus === 'needs_input'
+      ).length;
+      const fDone = activeThreads.filter((t) => t.status === 'fixed').length;
+      if (fNow > 0) {
+        return `<div style="margin-bottom:10px;padding:9px 12px;border-radius:7px;border:1px solid rgba(56,139,253,0.55);background:rgba(56,139,253,0.1);font-size:12.5px;">
+          <strong>⏳ Agent Fixing ${fNow} Comment${fNow === 1 ? '' : 's'} Now...</strong>${
+            fDone > 0 ? ` (${fDone} already completed)` : ''
+          } — Cards below will automatically switch to <code>✅ Fixed</code> when finished.
+        </div>`;
+      }
+      if (fWait > 0) {
+        return `<div style="margin-bottom:10px;padding:9px 12px;border-radius:7px;border:1px solid rgba(227,179,65,0.55);background:rgba(227,179,65,0.1);font-size:12.5px;">
+          <strong>💬 Agent Waiting for Your Answer in Chat (${fWait} Fix Pending)</strong> — Reply in the Antigravity chat pane to continue applying fixes.
+        </div>`;
+      }
+      if (fDone > 0) {
+        return `<div style="margin-bottom:10px;padding:9px 12px;border-radius:7px;border:1px solid rgba(46,160,67,0.5);background:rgba(46,160,67,0.1);font-size:12.5px;">
+          <strong>✅ ${fDone} Comment${fDone === 1 ? '' : 's'} Fixed in Working Tree</strong> — Snapshot diffs have been updated to reflect your changes.
+        </div>`;
+      }
+      return '';
+    })()}
     ${commentsCardsHtml || '<p style="color:var(--q-muted);">No review comments in this session.</p>'}
   </div>
 
@@ -5119,6 +6089,8 @@ function activate(context) {
           vscode.postMessage({ type: 'toggleStageThread', threadId: el.getAttribute('data-thread-id') });
         } else if (act === 'toggleFixThread') {
           vscode.postMessage({ type: 'toggleFixThread', threadId: el.getAttribute('data-thread-id') });
+        } else if (act === 'markThreadFixed') {
+          vscode.postMessage({ type: 'markThreadFixed', threadId: el.getAttribute('data-thread-id') });
         } else if (act === 'dismissThread') {
           vscode.postMessage({ type: 'dismissThread', threadId: el.getAttribute('data-thread-id') });
         } else if (act === 'calibrateThread') {
@@ -5133,6 +6105,12 @@ function activate(context) {
           });
         } else if (act === 'openRawMarkdown') {
           vscode.postMessage({ type: 'openRawMarkdown' });
+        } else if (act === 'openSignalDiff') {
+          vscode.postMessage({
+            type: 'openSignalDiff',
+            path: el.getAttribute('data-sig-path'),
+            line: Number(el.getAttribute('data-sig-line') || 1),
+          });
         } else if (act === 'runCommand') {
           vscode.postMessage({ type: 'runCommand', command: el.getAttribute('data-cmd') });
         }
@@ -5217,6 +6195,24 @@ function activate(context) {
         const stops = getAllTourStops(curSession);
         const found = stops.find((s) => s.id === msg.stopId);
         if (found) await openTourStopInDiff(found, false);
+      } else if (msg.type === 'openSignalDiff' && msg.path) {
+        const sigLine = Math.max(1, Number(msg.line) || 1);
+        await openTourStopInDiff(
+          {
+            id: `sec-${msg.path}-${sigLine}`,
+            title: `${path.basename(msg.path)}:L${sigLine}`,
+            path: msg.path,
+            startLine: sigLine,
+            endLine: sigLine,
+            baseSnapshotPath: curSession.baseSnapshotRoot
+              ? path.join(curSession.baseSnapshotRoot, msg.path)
+              : '',
+            headSnapshotPath: curSession.headSnapshotRoot
+              ? path.join(curSession.headSnapshotRoot, msg.path)
+              : '',
+          },
+          false
+        );
       } else if (msg.type === 'toggleStopRead') {
         for (const ch of curSession.chapters || []) {
           for (const s of ch.stops || []) {
@@ -5291,9 +6287,12 @@ function activate(context) {
         const t = (curSession.threads || []).find((th) => th.id === msg.threadId);
         if (t) {
           t.selectedForFix = !t.selectedForFix;
+          if (!t.selectedForFix) delete t.fixStatus;
           saveActiveSession(curSession);
           refreshAllUI(false);
         }
+      } else if (msg.type === 'markThreadFixed' && msg.threadId) {
+        await vscode.commands.executeCommand('quasar.markCommentFixed', { threadId: msg.threadId });
       } else if (msg.type === 'dismissThread') {
         const t = (curSession.threads || []).find((th) => th.id === msg.threadId);
         if (t) {
@@ -5416,8 +6415,72 @@ function activate(context) {
     })
   );
 
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.overrideQuarantine', async () => {
+      const session = loadActiveSession();
+      const sg = session && session.securityGate;
+      if (!session || !sg || sg.status !== 'blocked') {
+        vscode.window.showInformationMessage('The active Quasar session is not quarantined.');
+        return;
+      }
+      const sigLines = (sg.signals || [])
+        .slice(0, 5)
+        .map((s) => `• ${s.location || s.path || 'PR'}: ${s.detail || ''}`)
+        .join('\n');
+      const choice = await vscode.window.showWarningMessage(
+        '🛡️ Override Security / Prompt-Injection Quarantine?',
+        {
+          modal: true,
+          detail:
+            'Only proceed if you have manually inspected all flagged lines in the read-only diff and confirmed they are benign (for example, unit tests for a security scanner).\n\n' +
+            sigLines,
+        },
+        'Override & Run Review'
+      );
+      if (choice !== 'Override & Run Review') return;
+
+      const windowWsRoot = getWindowWorkspaceRoot();
+      const windowStateDir = getWindowStateDir();
+      const scriptPath = path.join(PLUGIN_SCRIPTS_DIR, 'collect_pr_context.py');
+      execFile(
+        'python3',
+        [scriptPath, '--override-quarantine', '--workspace-dir', windowWsRoot],
+        { timeout: 15000, env: getQuasarScriptEnv() },
+        async (err) => {
+          if (err) {
+            vscode.window.showErrorMessage(`Failed to override quarantine: ${err.message}`);
+            return;
+          }
+          refreshAllUI(false);
+          const effortLevel = normalizeEffortLevel(session.effortLevel || 'high');
+          const commentsOnly = Boolean(session.commentsOnly);
+          const effortInstruction = buildEffortPromptInstruction(effortLevel, commentsOnly);
+          const publishFlags = commentsOnly
+            ? `--comments-only --workspace-dir "${windowWsRoot}"`
+            : `--workspace-dir "${windowWsRoot}"`;
+          const prMeta = session.pr || {};
+          const targetDesc = prMeta.url
+            ? prMeta.url
+            : `local branch "${prMeta.headBranch || prMeta.headRefName || 'HEAD'}" in "${session.repoDir || windowWsRoot}"`;
+          await sendPromptToQuasar(
+            `The user manually inspected and overrode the security quarantine for ${targetDesc} in workspace "${windowWsRoot}". Context and snapshots are ready in "${windowStateDir}/active_session.json" and "${windowStateDir}/pr_context.json" (\`halt_llm_review\` is now \`false\`; do NOT execute local repo scripts). ${effortInstruction} Run Phase 2 and Phase 3 (\`publish_review_session.py ${publishFlags}\`).`,
+            `Quasar (Quarantine Overridden): ${prMeta.number ? `PR #${prMeta.number}` : targetDesc}`,
+            null,
+            { effortLevel, commentsOnly }
+          );
+        }
+      );
+    })
+  );
+
   async function maybePromptToCheckoutOwnedPrBranch(session) {
     if (!session || !session.pr) return;
+    if (
+      session.securityGate &&
+      (session.securityGate.status === 'blocked' || session.securityGate.status === 'warning')
+    ) {
+      return;
+    }
     const pr = session.pr;
     const sid = session.sessionId || `pr-${pr.number}`;
     if (!pr.isOwnedByUser || !pr.needsBranchSwitch || !pr.headRefName || !pr.number) return;
@@ -5442,8 +6505,192 @@ function activate(context) {
     }
   }
 
+  let fixProgressInterval = null;
+  let fixReconcileBusy = false;
+  const trackedDispatchedFixIds = new Set();
+  const knownFixedIds = new Set();
+  const notifiedNeedsInputIds = new Set();
+  let fixTrackingInitializedSessionId = null;
+
+  context.subscriptions.push({
+    dispose() {
+      if (fixProgressInterval) {
+        clearInterval(fixProgressInterval);
+        fixProgressInterval = null;
+      }
+    },
+  });
+
+  function ensureFixProgressWatcher(session) {
+    const activeInFlight =
+      session && Array.isArray(session.threads)
+        ? session.threads.filter(
+            (t) =>
+              t.status !== 'fixed' &&
+              (t.fixStatus === 'in_progress' || t.fixStatus === 'needs_input')
+          )
+        : [];
+    if (activeInFlight.length === 0) {
+      if (fixProgressInterval) {
+        clearInterval(fixProgressInterval);
+        fixProgressInterval = null;
+      }
+      return;
+    }
+    if (fixProgressInterval) return;
+
+    fixProgressInterval = setInterval(async () => {
+      if (fixReconcileBusy) return;
+      const curSess = loadActiveSession();
+      if (!curSess || !Array.isArray(curSess.threads)) {
+        clearInterval(fixProgressInterval);
+        fixProgressInterval = null;
+        return;
+      }
+      const inFlight = curSess.threads.filter(
+        (t) =>
+          t.status !== 'fixed' &&
+          (t.fixStatus === 'in_progress' || t.fixStatus === 'needs_input')
+      );
+      if (inFlight.length === 0) {
+        clearInterval(fixProgressInterval);
+        fixProgressInterval = null;
+        return;
+      }
+      const targetConvId =
+        curSess.fixConversationId || extractSessionConversationId(curSess) || null;
+      const turnState = inspectConversationFixState(targetConvId);
+      if (turnState === 'unknown') return;
+
+      const args = ['--reconcile-fixes'];
+      if (turnState === 'paused_on_question') {
+        args.push('--paused-on-question');
+      } else if (turnState === 'idle') {
+        args.push('--agent-idle');
+      }
+      // Only invoke Python when state might change (`paused_on_question`, `idle`, or resuming from `needs_input`)
+      const anyNeedsInput = inFlight.some((t) => t.fixStatus === 'needs_input');
+      if (turnState === 'working' && !anyNeedsInput) return;
+
+      fixReconcileBusy = true;
+      try {
+        const recRes = await runManageFixes(args);
+        if (recRes && recRes.changed) {
+          refreshAllUI(true);
+        }
+      } finally {
+        fixReconcileBusy = false;
+      }
+    }, 2500);
+  }
+
+  function trackAndNotifyFixTransitions(session, allowToasts) {
+    if (!session || !Array.isArray(session.threads)) {
+      trackedDispatchedFixIds.clear();
+      knownFixedIds.clear();
+      notifiedNeedsInputIds.clear();
+      fixTrackingInitializedSessionId = null;
+      return;
+    }
+    if (fixTrackingInitializedSessionId !== session.sessionId) {
+      trackedDispatchedFixIds.clear();
+      knownFixedIds.clear();
+      notifiedNeedsInputIds.clear();
+      fixTrackingInitializedSessionId = session.sessionId;
+      for (const t of session.threads) {
+        const tid = String(t.id || '');
+        if (!tid) continue;
+        if (t.status === 'fixed') {
+          knownFixedIds.add(tid);
+        } else if (
+          t.fixStatus === 'in_progress' ||
+          t.fixStatus === 'needs_input' ||
+          t.fixStatus === 'needs_attention'
+        ) {
+          trackedDispatchedFixIds.add(tid);
+        }
+      }
+      return;
+    }
+
+    const newlyCompletedThreads = [];
+    const newlyWaitingThreads = [];
+    for (const t of session.threads) {
+      const tid = String(t.id || '');
+      if (!tid) continue;
+      if (
+        t.status !== 'fixed' &&
+        (t.fixStatus === 'in_progress' ||
+          t.fixStatus === 'needs_input' ||
+          t.fixStatus === 'needs_attention')
+      ) {
+        trackedDispatchedFixIds.add(tid);
+      }
+      if (t.status === 'fixed' && !knownFixedIds.has(tid)) {
+        knownFixedIds.add(tid);
+        if (trackedDispatchedFixIds.has(tid) || allowToasts) {
+          newlyCompletedThreads.push(t);
+        }
+        trackedDispatchedFixIds.delete(tid);
+        notifiedNeedsInputIds.delete(tid);
+      } else if (
+        t.status !== 'fixed' &&
+        t.fixStatus === 'needs_input' &&
+        !notifiedNeedsInputIds.has(tid)
+      ) {
+        notifiedNeedsInputIds.add(tid);
+        if (allowToasts) {
+          newlyWaitingThreads.push(t);
+        }
+      } else if (t.fixStatus === 'in_progress') {
+        notifiedNeedsInputIds.delete(tid);
+      }
+    }
+
+    if (allowToasts && newlyCompletedThreads.length > 0) {
+      const remainingFixing = session.threads.filter(
+        (t) => t.status !== 'fixed' && t.fixStatus === 'in_progress'
+      ).length;
+      const repoLabel = path.basename(
+        session.repoDir || (session.pr && session.pr.repo) || 'working tree'
+      );
+      const firstFixed = newlyCompletedThreads[0];
+      const summaryHint = firstFixed.fixedSummary
+        ? ` — ${String(firstFixed.fixedSummary).replace(/\s+/g, ' ').slice(0, 90)}`
+        : '';
+      const remNote = remainingFixing > 0 ? ` (${remainingFixing} still fixing...)` : '';
+      vscode.window
+        .showInformationMessage(
+          `✅ Quasar finished fixing ${newlyCompletedThreads.length} comment${
+            newlyCompletedThreads.length === 1 ? '' : 's'
+          } in ${repoLabel}${remNote}${summaryHint}`,
+          'Inspect Fixed Diff',
+          'View Comments'
+        )
+        .then((choice) => {
+          if (choice === 'Inspect Fixed Diff' && firstFixed) {
+            jumpToCommentThread(firstFixed, { preserveFocus: false }).catch(() => {});
+          } else if (choice === 'View Comments') {
+            vscode.commands.executeCommand('quasar.commentsTree.focus').catch(() => {});
+          }
+        });
+    } else if (allowToasts && newlyWaitingThreads.length > 0) {
+      vscode.window.showInformationMessage(
+        `💬 Quasar Fix Agent is waiting for your answer in the Antigravity chat (${newlyWaitingThreads.length} comment${
+          newlyWaitingThreads.length === 1 ? '' : 's'
+        } paused).`
+      );
+    }
+  }
+
   function refreshAllUI(autoOpenIfNew = false) {
+    onAgyCliJobStateChanged = () => {
+      refreshAllUI(true);
+    };
     const session = loadActiveSession();
+    vscode.commands
+      .executeCommand('setContext', 'quasar.hasActiveReview', Boolean(session && session.pr))
+      .catch(() => {});
     vscode.commands
       .executeCommand(
         'setContext',
@@ -5451,6 +6698,7 @@ function activate(context) {
         Boolean(session && (!session.pr || session.pr.isOwnedByUser !== false))
       )
       .catch(() => {});
+    updateEditorReviewContexts(session);
     cliffsProvider.refresh();
     commentsProvider.refresh();
     checksProvider.refresh();
@@ -5458,11 +6706,18 @@ function activate(context) {
     syncNativeCommentThreads(session);
     codeLensEmitter.fire();
     updateCliffsNotesWebviewContent();
+    trackAndNotifyFixTransitions(session, Boolean(autoOpenIfNew));
+    ensureFixProgressWatcher(session);
 
     if (!session) {
       lastSessionId = null;
       lastAnalysisStatus = null;
+      currentStopIndex = -1;
       return;
+    }
+
+    if (session.sessionId !== lastSessionId) {
+      currentStopIndex = -1;
     }
 
     if (!autoOpenIfNew) {
@@ -5534,9 +6789,12 @@ function activate(context) {
               JSON.stringify({ path: stop.path, line: line1, stopTitle: stop.title })
             );
             md.appendMarkdown(
-              `---\n[$(comment-discussion) Ask Quasar in Comment](command:quasar.askAtLine?${askArgs})  •  ` +
-                `[$(book) Open CliffsNotes Guide](command:quasar.openCliffsNotesGuide)  •  ` +
-                `[$(arrow-down) Next Tour Stop](command:quasar.nextTourStop)`
+              `---\n[$(arrow-left) Prev Stop](command:quasar.prevTourStop)  •  ` +
+                `[$(arrow-right) Next Stop](command:quasar.nextTourStop)  •  ` +
+                `[$(add) Add Comment](command:quasar.addCommentAtLine?${askArgs})  •  ` +
+                `[$(sparkle) Ask Quasar to Comment](command:quasar.askToAddCommentAtLine?${askArgs})  •  ` +
+                `[$(comment-discussion) Ask Question](command:quasar.askAtLine?${askArgs})  •  ` +
+                `[$(book) CliffsNotes Guide](command:quasar.openCliffsNotesGuide)`
             );
             return new vscode.Hover(md);
           }
@@ -5555,23 +6813,44 @@ function activate(context) {
         if (!session) return [];
         const lenses = [];
         const stops = getAllTourStops(session);
-        for (const stop of stops) {
+        for (let idx = 0; idx < stops.length; idx++) {
+          const stop = stops[idx];
           if (!matchesSessionPath(document.uri.fsPath, stop.path, session)) continue;
           const line0 = Math.max(0, Math.min(document.lineCount - 1, (stop.startLine || 1) - 1));
           const range = new vscode.Range(line0, 0, line0, 0);
+          const stopArgs = [{ path: stop.path, line: stop.startLine || 1, stopTitle: stop.title }];
+          const nextIdx = (idx + 1) % stops.length;
           lenses.push(
             new vscode.CodeLens(range, {
-              title: `📘 CliffsNotes ${stop.stopNumber}: ${(stop.cliffsNotes || stop.description || '').slice(0, 75)}`,
+              title: `📘 Stop ${idx + 1}/${stops.length} (${stop.stopNumber}): ${(stop.cliffsNotes || stop.description || '').slice(0, 68)}`,
               command: 'quasar.openCliffsNotesGuide',
             }),
+            ...(stops.length > 1
+              ? [
+                  new vscode.CodeLens(range, {
+                    title: `⬅️ Prev`,
+                    command: 'quasar.prevTourStop',
+                  }),
+                  new vscode.CodeLens(range, {
+                    title: `➡️ Next (${nextIdx + 1}/${stops.length})`,
+                    command: 'quasar.nextTourStop',
+                  }),
+                ]
+              : []),
             new vscode.CodeLens(range, {
-              title: `💬 Ask Quasar`,
-              command: 'quasar.askAtLine',
-              arguments: [{ path: stop.path, line: stop.startLine || 1, stopTitle: stop.title }],
+              title: `➕ Add Comment`,
+              command: 'quasar.addCommentAtLine',
+              arguments: stopArgs,
             }),
             new vscode.CodeLens(range, {
-              title: `➡️ Next Stop`,
-              command: 'quasar.nextTourStop',
+              title: `✨ Ask Quasar to Comment`,
+              command: 'quasar.askToAddCommentAtLine',
+              arguments: stopArgs,
+            }),
+            new vscode.CodeLens(range, {
+              title: `💬 Ask Question`,
+              command: 'quasar.askAtLine',
+              arguments: stopArgs,
             })
           );
         }
@@ -5912,6 +7191,16 @@ function activate(context) {
         }
         items.push(
           {
+            label: '$(add) Add Inline Review Comment...',
+            description: 'Add your own staged review comment at the current line or any changed file',
+            command: 'quasar.addCommentAtLine',
+          },
+          {
+            label: '$(sparkle) Ask Quasar to Add Inline Comment...',
+            description: 'Ask Quasar to inspect a line/hunk and draft a staged review comment',
+            command: 'quasar.askToAddCommentAtLine',
+          },
+          {
             label: '$(book) Open Full CliffsNotes Study Guide',
             description: 'Open Interactive CliffsNotes Study Guide in editor',
             command: 'quasar.openCliffsNotesGuide',
@@ -6023,6 +7312,29 @@ function activate(context) {
                   return;
                 }
                 refreshAllUI(true);
+                const freshSession = loadActiveSession();
+                if (
+                  freshSession &&
+                  freshSession.securityGate &&
+                  freshSession.securityGate.status === 'blocked' &&
+                  !freshSession.securityGate.overridden
+                ) {
+                  if (!commentsOnly) {
+                    openInteractiveCliffsNotesPanel('security-gate-section').catch(() => {});
+                  }
+                  const pick = await vscode.window.showWarningMessage(
+                    `🚨 Quasar Quarantined ${trimmedUrl}: Potential prompt injection or malicious execution pattern detected. LLM review was halted so untrusted text is not fed to subagents.`,
+                    'Inspect Flagged Diff',
+                    'Override Quarantine...'
+                  );
+                  if (pick === 'Inspect Flagged Diff') {
+                    openInteractiveCliffsNotesPanel('security-gate-section').catch(() => {});
+                  } else if (pick === 'Override Quarantine...') {
+                    vscode.commands.executeCommand('quasar.overrideQuarantine');
+                  }
+                  resolve();
+                  return;
+                }
                 progress.report({
                   message: `Snapshots ready! Dispatching Quasar (${modeTitleTag})...`,
                 });
@@ -6273,6 +7585,29 @@ function activate(context) {
                   return;
                 }
                 refreshAllUI(true);
+                const freshSession = loadActiveSession();
+                if (
+                  freshSession &&
+                  freshSession.securityGate &&
+                  freshSession.securityGate.status === 'blocked' &&
+                  !freshSession.securityGate.overridden
+                ) {
+                  if (!commentsOnly) {
+                    openInteractiveCliffsNotesPanel('security-gate-section').catch(() => {});
+                  }
+                  const pick = await vscode.window.showWarningMessage(
+                    `🚨 Quasar Quarantined ${repoName}@${targetBranch}: Potential prompt injection or malicious execution pattern detected. LLM review was halted so untrusted text is not fed to subagents.`,
+                    'Inspect Flagged Diff',
+                    'Override Quarantine...'
+                  );
+                  if (pick === 'Inspect Flagged Diff') {
+                    openInteractiveCliffsNotesPanel('security-gate-section').catch(() => {});
+                  } else if (pick === 'Override Quarantine...') {
+                    vscode.commands.executeCommand('quasar.overrideQuarantine');
+                  }
+                  resolve();
+                  return;
+                }
                 progress.report({
                   message: `Snapshots ready! Dispatching Quasar (${modeTitleTag})...`,
                 });
@@ -6312,15 +7647,17 @@ function activate(context) {
   );
 
   // 4. Next / Previous Tour Stop
-  let currentStopIndex = 0;
   context.subscriptions.push(
     vscode.commands.registerCommand('quasar.nextTourStop', async () => {
       const session = loadActiveSession();
       const stops = getAllTourStops(session);
       if (stops.length === 0) return;
-      const nextUnreadIdx = stops.findIndex((s) => !s.read);
-      currentStopIndex =
-        nextUnreadIdx !== -1 ? nextUnreadIdx : (currentStopIndex + 1) % stops.length;
+      if (currentStopIndex < 0 || currentStopIndex >= stops.length) {
+        const firstUnreadIdx = stops.findIndex((s) => !s.read);
+        currentStopIndex = firstUnreadIdx !== -1 ? firstUnreadIdx : 0;
+      } else {
+        currentStopIndex = (currentStopIndex + 1) % stops.length;
+      }
       await openTourStopInDiff(stops[currentStopIndex], false);
     })
   );
@@ -6330,7 +7667,11 @@ function activate(context) {
       const session = loadActiveSession();
       const stops = getAllTourStops(session);
       if (stops.length === 0) return;
-      currentStopIndex = (currentStopIndex - 1 + stops.length) % stops.length;
+      if (currentStopIndex < 0 || currentStopIndex >= stops.length) {
+        currentStopIndex = stops.length - 1;
+      } else {
+        currentStopIndex = (currentStopIndex - 1 + stops.length) % stops.length;
+      }
       await openTourStopInDiff(stops[currentStopIndex], false);
     })
   );
@@ -6344,42 +7685,33 @@ function activate(context) {
 
   // Helper to keep the top finding message card in sync when draftComment/title/whyItMatters changes
   function syncPrimaryThreadMessageInJs(t) {
-    if (!t || !Array.isArray(t.messages) || t.messages.length === 0) return;
+    if (!t || !Array.isArray(t.messages)) return;
+    if (t.messages.length === 0) {
+      if (isReviewCommentThread(t)) {
+        t.messages.push({
+          author: t.createdBy === 'user' ? 'You' : 'Quasar',
+          body: buildPrimaryFindingCardBody(t),
+          timestamp: new Date().toISOString(),
+        });
+      }
+      return;
+    }
     const first = t.messages[0];
-    if (!first || !String(first.author || '').startsWith('Quasar')) return;
+    if (!first) return;
+    const firstAuthor = String(first.author || '');
     const firstBody = String(first.body || '');
     if (
-      !firstBody.includes('**Draft GitHub Comment**:') &&
-      !firstBody.includes('**Candidate GitHub Comment (if kept)**:') &&
-      t.kind !== 'ai_candidate'
+      !isReviewCommentThread(t) &&
+      !(
+        (firstAuthor.startsWith('Quasar') || firstAuthor.startsWith('You')) &&
+        (firstBody.includes('**Draft GitHub Comment**:') ||
+          firstBody.includes('**Candidate GitHub Comment (if kept)**:') ||
+          firstBody.includes('**Staged GitHub Comment**:'))
+      )
     ) {
       return;
     }
-    const title = t.title || 'Review Finding';
-    const why = t.whyItMatters || '';
-    const draft = t.draftComment || '';
-    const srcAgents = getThreadSourceAgents(t);
-    const srcMd =
-      srcAgents.length > 0
-        ? `\n\n🤖 *Suggested by*: ${srcAgents.map((a) => `\`${a}\``).join(', ')}`
-        : '';
-    if (t.status === 'uncertain') {
-      const q =
-        t.uncertaintyQuestion ||
-        `Do you want Quasar to flag issues like "${title}" in future reviews, or skip this pattern?`;
-      first.body =
-        `### 🤔 Preference Check: ${title}${srcMd}\n\n` +
-        `**Question for You**: *${q}*\n\n` +
-        `*Context & Trade-off*: ${why}\n\n` +
-        `---\n` +
-        `**Candidate GitHub Comment (if kept)**:\n> ${draft}\n\n` +
-        `*(Use the **🤔 Calibrate Preference** button above or 👍/👎 to teach Quasar how to handle this in the future.)*`;
-    } else {
-      const parts = [`**${title}**${srcMd}`];
-      if (why) parts.push(`*CliffsNotes Context*: ${why}`);
-      if (draft) parts.push(`---\n**Draft GitHub Comment**:\n> ${draft}`);
-      first.body = parts.join('\n\n');
-    }
+    first.body = buildPrimaryFindingCardBody(t);
   }
 
   function extractThreadCodeSnippet(session, relPath, startLine, endLine, explicitFsPath = null) {
@@ -6676,61 +8008,459 @@ function activate(context) {
     })
   );
 
-  // 7. Stage a New User Comment Directly from the '+' Gutter Box
-  context.subscriptions.push(
-    vscode.commands.registerCommand('quasar.stageNewComment', (reply) => {
-      const session = loadActiveSession();
-      if (!session || !reply) return;
-      const thread = reply.thread;
-      const text = (reply.text || '').trim();
-      if (!text) return;
-
-      const docFsPath = thread.uri.fsPath;
-      const relPath = thread.relPath || inferRelPathFromDocument(docFsPath, session) || path.basename(docFsPath);
-      const startLine = (thread.range ? thread.range.start.line : 0) + 1;
-      const endLine = (thread.range ? thread.range.end.line : startLine - 1) + 1;
-      const nowIso = new Date().toISOString();
-
-      if (thread.threadId) {
-        const existing = (session.threads || []).find((t) => t.id === thread.threadId);
-        if (existing) {
-          existing.draftComment = text;
-          existing.status = 'staged';
-          existing.kind = 'user_staged';
-          existing.messages = existing.messages || [];
-          syncPrimaryThreadMessageInJs(existing);
-          existing.messages.push({
-            author: 'You (Staged Draft)',
-            body: `**Updated & Staged GitHub Comment**:\n> ${text}`,
-            timestamp: nowIso,
-          });
+  function listSessionSnapshotFiles(session) {
+    const seen = new Set();
+    const out = [];
+    const addRel = (p) => {
+      const clean = String(p || '').replace(/\\/g, '/').replace(/^\/+/, '');
+      if (!clean || clean === 'TOP_LEVEL_PR_COMMENTS.md' || seen.has(clean)) return;
+      seen.add(clean);
+      out.push(clean);
+    };
+    for (const stop of getAllTourStops(session)) {
+      if (stop && stop.path) addRel(stop.path);
+    }
+    for (const t of session.threads || []) {
+      if (t && t.path) addRel(t.path);
+    }
+    if (session.headSnapshotRoot && fs.existsSync(session.headSnapshotRoot)) {
+      const walk = (dir) => {
+        let entries = [];
+        try {
+          entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch (_) {
+          return;
         }
-      } else {
-        const newId = `staged-${Date.now()}`;
-        session.threads = session.threads || [];
-        session.threads.push({
-          id: newId,
-          kind: 'user_staged',
-          severity: 'REVIEW',
-          status: 'staged',
-          path: relPath,
-          startLine,
-          endLine,
-          title: text.slice(0, 60),
-          whyItMatters: 'Authored by reviewer.',
-          draftComment: text,
-          messages: [
-            {
-              author: 'You (Staged for GitHub)',
-              body: `**Staged GitHub Comment**:\n> ${text}`,
-              timestamp: nowIso,
-            },
-          ],
-        });
-      }
+        for (const ent of entries) {
+          const full = path.join(dir, ent.name);
+          if (ent.isDirectory()) {
+            walk(full);
+          } else if (ent.isFile()) {
+            addRel(path.relative(session.headSnapshotRoot, full));
+          }
+        }
+      };
+      walk(session.headSnapshotRoot);
+    }
+    return out;
+  }
 
-      saveActiveSession(session);
-      refreshAllUI(false);
+  async function resolveCommentTargetLocation(session, arg) {
+    if (arg && arg.thread && arg.thread.uri) {
+      const thread = arg.thread;
+      const docFsPath = thread.uri.fsPath;
+      const relPath =
+        thread.relPath || inferRelPathFromDocument(docFsPath, session) || path.basename(docFsPath);
+      const startLine = (thread.range ? thread.range.start.line : 0) + 1;
+      const endLine = Math.max(startLine, (thread.range ? thread.range.end.line : startLine - 1) + 1);
+      return { relPath, startLine, endLine, docFsPath, nativeThread: thread, isTopLevel: false };
+    }
+    if (arg && typeof arg === 'object' && typeof arg.path === 'string' && arg.path) {
+      const sLine = Math.max(1, Number(arg.startLine || arg.line || 1));
+      const eLine = Math.max(sLine, Number(arg.endLine || sLine));
+      const headFs =
+        session.headSnapshotRoot && arg.path ? path.join(session.headSnapshotRoot, arg.path) : '';
+      return {
+        relPath: arg.path,
+        startLine: sLine,
+        endLine: eLine,
+        docFsPath: headFs,
+        nativeThread: null,
+        isTopLevel: false,
+      };
+    }
+
+    const activeEd = vscode.window.activeTextEditor;
+    if (activeEd && activeEd.document && activeEd.document.uri.scheme === 'file') {
+      const fsPath = activeEd.document.uri.fsPath;
+      const inferred = inferRelPathFromDocument(fsPath, session);
+      if (inferred && inferred !== 'TOP_LEVEL_PR_COMMENTS.md') {
+        const sel = activeEd.selection;
+        const sLine = Math.max(1, (sel ? sel.start.line : 0) + 1);
+        const eLine = Math.max(sLine, (sel ? sel.end.line : sLine - 1) + 1);
+        return {
+          relPath: inferred,
+          startLine: sLine,
+          endLine: eLine,
+          docFsPath: fsPath,
+          nativeThread: null,
+          isTopLevel: false,
+        };
+      }
+    }
+
+    const files = listSessionSnapshotFiles(session);
+    const fileItems = [
+      ...files.map((f) => ({
+        label: `$(file-code) ${path.basename(f)}`,
+        description: f,
+        relPath: f,
+        isTopLevel: false,
+      })),
+      {
+        label: '$(note) 📌 Top-Level PR Review Comment (Overall PR)',
+        description: 'Included in the top-level GitHub review summary',
+        relPath: 'TOP_LEVEL_PR_COMMENTS.md',
+        isTopLevel: true,
+      },
+    ];
+    const pickedFile = await vscode.window.showQuickPick(fileItems, {
+      title: 'Quasar: Select File for Inline Comment',
+      placeHolder: 'Choose a changed file in this review (or Top-Level PR Comment)',
+    });
+    if (!pickedFile) return null;
+    if (pickedFile.isTopLevel) {
+      return {
+        relPath: 'TOP_LEVEL_PR_COMMENTS.md',
+        startLine: 1,
+        endLine: 1,
+        docFsPath: '',
+        nativeThread: null,
+        isTopLevel: true,
+      };
+    }
+
+    const lineRaw = await vscode.window.showInputBox({
+      title: `Line Number in ${path.basename(pickedFile.relPath)}`,
+      prompt: 'Enter a line number or range (1-based, e.g. 42 or 42-48)',
+      value: '1',
+      placeHolder: 'e.g. 42 or 42-48',
+    });
+    if (!lineRaw || !lineRaw.trim()) return null;
+    const rangeMatch = lineRaw.trim().match(/^(\d+)(?:\s*-\s*(\d+))?$/);
+    const sLine = rangeMatch ? Math.max(1, parseInt(rangeMatch[1], 10)) : 1;
+    const eLine =
+      rangeMatch && rangeMatch[2] ? Math.max(sLine, parseInt(rangeMatch[2], 10)) : sLine;
+    const headFs = session.headSnapshotRoot
+      ? path.join(session.headSnapshotRoot, pickedFile.relPath)
+      : '';
+    return {
+      relPath: pickedFile.relPath,
+      startLine: sLine,
+      endLine: eLine,
+      docFsPath: headFs,
+      nativeThread: null,
+      isTopLevel: false,
+    };
+  }
+
+  function addOrUpdateUserReviewCommentInSession(session, loc, rawText, explicitSeverity = null) {
+    const text = String(rawText || '').trim();
+    if (!text) return null;
+    const nowIso = new Date().toISOString();
+    const nativeThread = loc.nativeThread;
+
+    if (nativeThread && nativeThread.threadId) {
+      const existing = (session.threads || []).find((t) => t.id === nativeThread.threadId);
+      if (existing) {
+        existing.draftComment = text;
+        existing.status = 'staged';
+        existing.stagedForGithub = true;
+        existing.kind = 'ai_candidate';
+        if (!existing.severity || existing.severity === 'QA' || existing.severity === 'REVIEW') {
+          existing.severity = explicitSeverity || inferSeverityFromCommentText(text, 'DESIGN');
+        } else if (explicitSeverity) {
+          existing.severity = explicitSeverity;
+        }
+        delete existing.unstagedByUser;
+        existing.messages = existing.messages || [];
+        syncPrimaryThreadMessageInJs(existing);
+        existing.messages.push({
+          author: 'You (Staged Draft)',
+          body: `**Updated & Staged GitHub Comment**:\n> ${text}`,
+          timestamp: nowIso,
+        });
+        saveActiveSession(session);
+        refreshAllUI(false);
+        return existing;
+      }
+    }
+
+    const newId = `finding-user-${Date.now()}`;
+    const sev = explicitSeverity || inferSeverityFromCommentText(text, 'DESIGN');
+    const title = deriveCommentTitleFromDraft(text);
+    const isTop = Boolean(loc.isTopLevel || loc.relPath === 'TOP_LEVEL_PR_COMMENTS.md' || !loc.relPath);
+    const newThreadObj = {
+      id: newId,
+      kind: 'ai_candidate',
+      createdBy: 'user',
+      sourceAgents: [],
+      severity: sev,
+      status: 'staged',
+      stagedForGithub: true,
+      isTopLevel: isTop,
+      targetFile: '',
+      path: isTop ? 'TOP_LEVEL_PR_COMMENTS.md' : loc.relPath,
+      startLine: isTop ? 1 : loc.startLine,
+      endLine: isTop ? 1 : loc.endLine,
+      title,
+      whyItMatters: '',
+      draftComment: text,
+      messages: [],
+    };
+    newThreadObj.messages.push({
+      author: 'You',
+      body: buildPrimaryFindingCardBody(newThreadObj),
+      timestamp: nowIso,
+    });
+
+    if (nativeThread && nativeThread.uri && typeof nativeThread.dispose === 'function') {
+      nativeThread.threadId = newId;
+      nativeThread.relPath = newThreadObj.path;
+      nativeThread.canReply = true;
+      activeCommentThreads.set(newId, nativeThread);
+    }
+
+    session.threads = session.threads || [];
+    session.threads.push(newThreadObj);
+    saveActiveSession(session);
+    refreshAllUI(false);
+    return newThreadObj;
+  }
+
+  async function handleAskQuasarToAddComment(replyOrArgs, explicitInstruction = null) {
+    const session = loadActiveSession();
+    if (!session) {
+      vscode.window.showInformationMessage('Start or open a Quasar review session first.');
+      return;
+    }
+    const loc = await resolveCommentTargetLocation(session, replyOrArgs);
+    if (!loc) return;
+
+    let instruction =
+      explicitInstruction !== null
+        ? String(explicitInstruction).trim()
+        : replyOrArgs && typeof replyOrArgs.text === 'string'
+        ? replyOrArgs.text.trim()
+        : '';
+
+    if (!instruction && !(replyOrArgs && typeof replyOrArgs.text === 'string' && replyOrArgs.fromGutterAllowEmpty)) {
+      const locLabel = loc.isTopLevel
+        ? 'Top-Level PR Comment'
+        : `${path.basename(loc.relPath)}:L${loc.startLine}${
+            loc.endLine > loc.startLine ? `-${loc.endLine}` : ''
+          }`;
+      const input = await vscode.window.showInputBox({
+        title: `✨ Ask Quasar to Add Inline Comment (${locLabel})`,
+        prompt:
+          'Tell Quasar what to comment on (or press Enter to let Quasar inspect these lines and draft the best comment)',
+        placeHolder:
+          'e.g. Point out that empty inputs bypass validation, or suggest extracting a helper',
+      });
+      if (input === undefined) return;
+      instruction = input.trim();
+    }
+
+    const nowIso = new Date().toISOString();
+    const newId = `finding-inline-${Date.now()}`;
+    const isTop = Boolean(loc.isTopLevel || loc.relPath === 'TOP_LEVEL_PR_COMMENTS.md' || !loc.relPath);
+    const effectivePath = isTop ? 'TOP_LEVEL_PR_COMMENTS.md' : loc.relPath;
+    const placeholderTitle = instruction
+      ? deriveCommentTitleFromDraft(instruction)
+      : `Drafting comment on ${path.basename(effectivePath)}:L${loc.startLine}...`;
+
+    const pendingThread = {
+      id: newId,
+      kind: 'ai_candidate',
+      createdBy: 'quasar_inline',
+      pendingInlineDraft: true,
+      sourceAgent: 'quasar-inline',
+      sourceAgents: ['quasar-inline'],
+      severity: inferSeverityFromCommentText(instruction, 'DESIGN'),
+      status: 'staged',
+      stagedForGithub: true,
+      isTopLevel: isTop,
+      targetFile: '',
+      path: effectivePath,
+      startLine: isTop ? 1 : loc.startLine,
+      endLine: isTop ? 1 : loc.endLine,
+      title: placeholderTitle,
+      whyItMatters: '',
+      draftComment: '',
+      messages: [
+        {
+          author: 'Quasar',
+          body: instruction
+            ? `_⏳ Quasar is drafting an inline review comment for: "${instruction}"..._`
+            : `_⏳ Quasar is inspecting \`${effectivePath}:L${loc.startLine}-${loc.endLine}\` and drafting an inline review comment..._`,
+          timestamp: nowIso,
+          pending: true,
+        },
+      ],
+    };
+
+    if (loc.nativeThread && loc.nativeThread.uri && typeof loc.nativeThread.dispose === 'function') {
+      loc.nativeThread.threadId = newId;
+      loc.nativeThread.relPath = effectivePath;
+      loc.nativeThread.canReply = true;
+      activeCommentThreads.set(newId, loc.nativeThread);
+    }
+
+    session.threads = session.threads || [];
+    session.threads.push(pendingThread);
+    saveActiveSession(session);
+    refreshAllUI(false);
+
+    if (!loc.nativeThread && !isTop) {
+      await jumpToCommentThread(pendingThread, { preserveFocus: true });
+    }
+
+    const codeSnippet = isTop
+      ? ''
+      : extractThreadCodeSnippet(session, loc.relPath, loc.startLine, loc.endLine, loc.docFsPath);
+    const headSnapshotFile =
+      !isTop && session.headSnapshotRoot && loc.relPath
+        ? path.join(session.headSnapshotRoot, loc.relPath)
+        : '';
+    const repoWorkingFile =
+      !isTop && session.repoDir && loc.relPath ? path.join(session.repoDir, loc.relPath) : '';
+    const fileLocationsNote =
+      (headSnapshotFile ? `- **PR Head Snapshot File**: \`${headSnapshotFile}\`\n` : '') +
+      (repoWorkingFile ? `- **Local Repo File**: \`${repoWorkingFile}\`\n` : '');
+    const answerScript = path.join(PLUGIN_SCRIPTS_DIR, 'answer_comment_question.py');
+    const windowWsRoot = getWindowWorkspaceRoot();
+    const isOwned = !session.pr || session.pr.isOwnedByUser !== false;
+
+    const userGoalText = instruction
+      ? `Reviewer's Instruction / Topic:\n"${instruction}"`
+      : `Reviewer's Request:\nInspect \`${effectivePath}\` around lines ${loc.startLine}-${loc.endLine} and draft a concise, high-signal code review comment for the most important issue, edge case, or improvement here.`;
+
+    const prompt =
+      `The reviewer asked Quasar to add an inline review comment on ${
+        isTop
+          ? 'the overall PR (Top-Level Comment)'
+          : `\`${loc.relPath}\` (lines ${loc.startLine}-${loc.endLine})`
+      } on PR #${(session.pr && session.pr.number) || 'local'} (Thread ID: \`${newId}\`):\n\n` +
+      `${userGoalText}\n\n` +
+      (fileLocationsNote ? `File Paths:\n${fileLocationsNote}\n` : '') +
+      (codeSnippet
+        ? `Code Context (\`${loc.relPath}:L${loc.startLine}-${loc.endLine}\`):\n\`\`\`\n${codeSnippet}\n\`\`\`\n\n`
+        : '') +
+      `Inspect the surrounding code and honor the reviewer's learned preferences (\`~/.gemini/quasar/PREFERENCES.md\`). Populate the inline review comment in place by running:\n` +
+      `\`python3 "${answerScript}" --thread-id "${newId}" --promote-to-comment --workspace-dir "${windowWsRoot}" --updated-title "<SHORT_1_LINE_TITLE>" --updated-why "<CONCISE_CONTEXT_AND_WHY_IT_MATTERS>" --updated-severity "<BLOCKING|DESIGN|NIT>" --updated-draft "<CONCISE_COLLABORATIVE_GITHUB_COMMENT>"` +
+      (isOwned
+        ? ` [--solution-options '<JSON_ARRAY_IF_2+_DISTINCT_VALID_SOLUTIONS>']\`\n`
+        : `\`\n`) +
+      `Keep \`--updated-draft\` concise (1–2 sentences) and collaborative, matching native Quasar review comments.`;
+
+    const dispatchRes = await sendPromptToQuasar(
+      prompt,
+      `Add Inline Comment: ${isTop ? 'Top-Level' : `${path.basename(loc.relPath)}:${loc.startLine}`}`
+    );
+
+    if (dispatchRes && dispatchRes.success) {
+      vscode.window.setStatusBarMessage(
+        `✨ Quasar is drafting an inline comment (${
+          isTop ? 'Top-Level' : `${path.basename(loc.relPath)}:L${loc.startLine}`
+        })...`,
+        4000
+      );
+    } else {
+      const latestSession = loadActiveSession();
+      if (latestSession && Array.isArray(latestSession.threads)) {
+        const targetT = latestSession.threads.find((t) => t.id === newId);
+        if (targetT && Array.isArray(targetT.messages)) {
+          targetT.messages = [
+            {
+              author: 'Quasar',
+              body: `⚠️ *Could not auto-dispatch to Antigravity agent (${
+                (dispatchRes && dispatchRes.error) || 'agentapi unavailable'
+              }). The prompt has been copied to your clipboard — paste it into chat to populate this comment.*`,
+              timestamp: new Date().toISOString(),
+            },
+          ];
+          saveActiveSession(latestSession);
+          refreshAllUI(false);
+        }
+      }
+      await vscode.env.clipboard.writeText(prompt);
+      vscode.window.showWarningMessage(
+        'Could not auto-dispatch via agentapi. Prompt copied to clipboard — paste it into Antigravity chat!'
+      );
+    }
+  }
+
+  // 7. Add User's Own Inline Review Comment OR Ask Quasar to Add an Inline Comment
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.stageNewComment', async (reply) => {
+      const session = loadActiveSession();
+      if (!session) return;
+      if (!reply || !reply.thread) {
+        await vscode.commands.executeCommand('quasar.addCommentAtLine', reply);
+        return;
+      }
+      let text = (reply.text || '').trim();
+      if (!text) {
+        const input = await vscode.window.showInputBox({
+          title: '➕ Add Inline Review Comment',
+          prompt: 'Enter your review comment (staged for GitHub Review; supports all Quasar comment actions)',
+          placeHolder: 'e.g. Should we guard against an empty list before indexing here?',
+        });
+        if (!input || !input.trim()) return;
+        text = input.trim();
+      }
+      const loc = await resolveCommentTargetLocation(session, reply);
+      if (!loc) return;
+      const created = addOrUpdateUserReviewCommentInSession(session, loc, text);
+      if (created) {
+        vscode.window.setStatusBarMessage(
+          `✅ Added & staged inline comment on ${path.basename(created.path || '')}:L${created.startLine}`,
+          3500
+        );
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.addCommentAtLine', async (args) => {
+      const session = loadActiveSession();
+      if (!session) {
+        vscode.window.showInformationMessage('Start or open a Quasar review session first.');
+        return;
+      }
+      const loc = await resolveCommentTargetLocation(session, args);
+      if (!loc) return;
+      const locLabel = loc.isTopLevel
+        ? 'Top-Level PR Comment'
+        : `${path.basename(loc.relPath)}:L${loc.startLine}${
+            loc.endLine > loc.startLine ? `-${loc.endLine}` : ''
+          }`;
+      const text = await vscode.window.showInputBox({
+        title: `➕ Add Review Comment (${locLabel})`,
+        prompt:
+          'Write your comment (staged for GitHub Review — you can edit, revise with Quasar, queue for fix, or teach preferences)',
+        placeHolder: 'e.g. Nit: prefer early return here to avoid nested conditionals',
+      });
+      if (!text || !text.trim()) return;
+
+      const sevPick = await vscode.window.showQuickPick(
+        [
+          { label: '🟡 Design / Comment', description: 'General review comment or design suggestion', sev: 'DESIGN' },
+          { label: '🟢 Nit / Polish', description: 'Minor readability, naming, or cleanup note', sev: 'NIT' },
+          { label: '🔴 Blocking / Bug', description: 'Must-fix bug, regression, or safety issue', sev: 'BLOCKING' },
+        ],
+        {
+          title: `Severity Badge for "${deriveCommentTitleFromDraft(text)}"`,
+          placeHolder: 'Choose a severity badge (only shown inside Quasar; GitHub receives clean markdown)',
+        }
+      );
+      const chosenSev = sevPick ? sevPick.sev : inferSeverityFromCommentText(text, 'DESIGN');
+      const created = addOrUpdateUserReviewCommentInSession(session, loc, text, chosenSev);
+      if (created && !loc.isTopLevel) {
+        await jumpToCommentThread(created, { preserveFocus: true });
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.askToAddComment', async (reply) => {
+      await handleAskQuasarToAddComment(reply, null);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.askToAddCommentAtLine', async (args) => {
+      await handleAskQuasarToAddComment(args, null);
     })
   );
 
@@ -6751,7 +8481,15 @@ function activate(context) {
       const target = (session.threads || []).find((t) => t.id === id);
       if (target) {
         const wasUncertain = target.status === 'uncertain';
+        if (target.kind === 'user_qa' || target.kind === 'user_question') {
+          target.kind = 'ai_candidate';
+          if (!target.severity || target.severity === 'QA') {
+            target.severity = 'DESIGN';
+          }
+          syncPrimaryThreadMessageInJs(target);
+        }
         target.status = 'staged';
+        target.stagedForGithub = true;
         delete target.unstagedByUser;
         saveActiveSession(session);
         await runManagePreferences(['--record-feedback', '--thread-id', id, '--action', 'stage']);
@@ -7560,7 +9298,9 @@ function activate(context) {
             ? `2. Also inspect \`${matchedAgent.mdPath}\` and, if appropriate, refine its checklist, rules of engagement, or \`quasarAppliesWhen\` gate to reflect this learning while keeping valid YAML frontmatter (\`name: ${subagentName}\`, \`subagent: true\`, \`commandExecutionPolicy: off\`).`
             : '');
 
-        await sendPromptToQuasar(prompt, `Evolve Subagent: ${subagentName}`);
+        await sendPromptToQuasar(prompt, `Evolve Subagent: ${subagentName}`, null, {
+          allowAgentConfigEdits: true,
+        });
         vscode.window.showInformationMessage(
           `🎓 Recorded directive for ${subagentName} & dispatched to Antigravity to evolve the subagent!`
         );
@@ -8369,7 +10109,9 @@ function activate(context) {
             `Please update the Quasar review subagent \`${ag.name}\` at \`${ag.mdPath}\` based on these instructions:\n\n` +
             `> ${instructions.trim()}\n\n` +
             `Keep the YAML frontmatter valid (\`name: ${ag.name}\`, \`subagent: true\`, \`commandExecutionPolicy: off\`) and preserve its read-only review output format.`;
-          await sendPromptToQuasar(prompt, `Refine Review Agent: ${ag.name}`);
+          await sendPromptToQuasar(prompt, `Refine Review Agent: ${ag.name}`, null, {
+            allowAgentConfigEdits: true,
+          });
         } else if (pickedAgAction.action === 'delete' && ag.isCustom) {
           const confirm = await vscode.window.showWarningMessage(
             `Delete custom review subagent "${ag.name}" (${ag.dirPath})?`,
@@ -8485,7 +10227,9 @@ function activate(context) {
             `- **Specialty**: ${descInput || agentName}\n` +
             `- **Focus / Instructions**: ${checklistInput || 'Build a comprehensive domain checklist tailored to this repository.'}\n\n` +
             `Please flesh out \`${mdPath}\` with concrete, high-signal review heuristics, examples, and edge cases while keeping its read-only frontmatter (\`name: ${agentName}\`, \`subagent: true\`, \`commandExecutionPolicy: off\`).`;
-          await sendPromptToQuasar(prompt, `Generate Review Subagent: ${agentName}`);
+          await sendPromptToQuasar(prompt, `Generate Review Subagent: ${agentName}`, null, {
+            allowAgentConfigEdits: true,
+          });
         } else {
           vscode.window.showInformationMessage(
             `🧩 Created custom review subagent "${agentName}" at ${mdPath}. Quasar will automatically include it in future reviews!`
@@ -8782,6 +10526,27 @@ function activate(context) {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.markCommentFixed', async (arg) => {
+      const id = resolveThreadId(unwrapCommandArg(arg));
+      if (!id) return;
+      const res = await runManageFixes([
+        '--complete-fix',
+        '--thread-id',
+        String(id),
+        '--summary',
+        'Marked as fixed in working tree.',
+      ]);
+      if (res && res.ok) {
+        refreshAllUI(true);
+      } else {
+        vscode.window.showErrorMessage(
+          `Failed to mark comment as fixed: ${(res && res.error) || 'Unknown error'}`
+        );
+      }
+    })
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand('quasar.fixSelectedComments', async (providedArgs) => {
       const session = loadActiveSession();
       if (!session) {
@@ -8826,7 +10591,7 @@ function activate(context) {
           const defaultRecommended =
             t.kind === 'github_existing'
               ? Boolean(ghTriage && ghTriage.recommendedForFix)
-              : t.kind === 'ai_candidate' && t.status !== 'uncertain';
+              : isReviewCommentThread(t) && t.status !== 'uncertain';
           const rawCommentSnippet = (t.draftComment || '').replace(/\s+/g, ' ').slice(0, 120);
           const detailStr =
             ghTriage && ghTriage.triageSummary
@@ -8921,7 +10686,8 @@ function activate(context) {
       const dispatchRes = await sendPromptToQuasar(
         res.agentPrompt,
         `Quasar Fix (${targetIds.length} comment${targetIds.length === 1 ? '' : 's'})`,
-        res.repoDir || session.repoDir || null
+        res.repoDir || session.repoDir || null,
+        { allowRepoEdits: true }
       );
 
       const prefNote =
@@ -8931,10 +10697,18 @@ function activate(context) {
             })`
           : '';
       if (dispatchRes && dispatchRes.success) {
+        if (dispatchRes.conversationId) {
+          const latestSess = loadActiveSession();
+          if (latestSess) {
+            latestSess.fixConversationId = dispatchRes.conversationId;
+            saveActiveSession(latestSess);
+          }
+        }
+        refreshAllUI(false);
         vscode.window.showInformationMessage(
-          `🔧 Dispatched ${targetIds.length} comment(s) to Quasar to fix in ${path.basename(
+          `🔧 Sent ${targetIds.length} comment(s) to Quasar to fix in ${path.basename(
             res.repoDir || session.repoDir || 'repo'
-          )}${prefNote}!`
+          )}${prefNote} — status bar will spin and notify you as soon as fixes finish!`
         );
       } else {
         const latestSess = loadActiveSession();
@@ -9115,7 +10889,7 @@ function activate(context) {
       if (!session) return;
       const staged = (session.threads || []).filter((t) => t.status === 'staged');
       const candidates = (session.threads || []).filter(
-        (t) => t.kind === 'ai_candidate' && t.status === 'open'
+        (t) => isReviewCommentThread(t) && (t.status === 'open' || t.status === 'candidate')
       );
 
       // Check authentication status first

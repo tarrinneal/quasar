@@ -2,6 +2,36 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [1.5.0] - 2026-11-13
+
+### Added
+- **Live Agent Fix Progress, Completion Notifications & Auto-Reconciliation**:
+  - **Distinct Live Fix States**: Separated unsent `Queued to Send` comments from `⏳ Fixing with Agent Now`, `💬 Agent Waiting for Chat Reply` (when paused on `ask_question`), `⚠️ Agent Turn Ended — Needs Check`, and `✅ Fixed in Working Tree` across the VS Code `Review Comments & Cart` sidebar, spinning Status Bar (`Fixing N...` / `N Fixed`), inline `CommentThread` banners, Interactive Study Guide, `quasar-web`, and the standalone Flutter app (which also now retains a dedicated `✅ Fixed in Working Tree` sidebar section instead of hiding completed items).
+  - **Completion Toast Notifications**: Added immediate completion notifications (`✅ Quasar finished fixing N comment(s) in <repo>!` with 1-click `Inspect Fixed Diff` jump action) across VS Code, `quasar-web`, and the Flutter standalone app, plus `✓ Mark as Fixed` (`quasar.markCommentFixed`) for manual 1-click completion.
+  - **Fallback Working-Tree Auto-Reconciliation (`manage_fixes.py --reconcile-fixes`)**: Recorded baseline SHA-256 hashes on `--prepare-fix` and added a background transcript/file-hash reconciler in `extension.js` and `server.py` so even if an agent finishes editing files without running `--complete-fix`, Quasar automatically syncs the updated files into `headSnapshotRoot`, marks the comments `✅ Fixed`, and notifies you instead of leaving `Fixing...` stuck indefinitely.
+- **Deterministic Pre-Review Security & Prompt-Injection Gate (`security_gate.py`)**:
+  - Added [`plugin/skills/quasar/scripts/security_gate.py`](plugin/skills/quasar/scripts/security_gate.py) running deterministically in Python inside `collect_pr_context.py` **before** any LLM review agent or subagent is invoked:
+    - **Quarantine Circuit-Breaker (`status: "blocked"`, `haltLlmReview: true`)**: Detects prompt-injection / agent-hijack directives (including hidden HTML comments), Trojan-Source bidirectional / Unicode Tag control characters, remote shell-pipe execution (`curl | sh`), obfuscated `eval`/`exec` payloads, and `pull_request_target` untrusted head checkouts. Immediately halts LLM review (in `extension.js`, `quasar-web`, and `SKILL.md`, while redacting untrusted prose from `pr_context.json`) so poisoned content is never fed to review subagents, and displays a red quarantine banner with inert excerpts, click-to-inspect read-only diff links, and a manual `Override Quarantine & Run Review` (`--override-quarantine` / `quasar.overrideQuarantine`) escape hatch.
+    - **Build / CI / Agent-Config Warning (`status: "warning"`)**: Flags edits to CI workflows, build/install lifecycle hooks (`package.json` `preinstall`/`postinstall`, `CMakeLists.txt`, `build.gradle*`, `Makefile`, `setup.py`, `build.rs`), Git/IDE hooks (`.vscode/tasks.json`, `.husky/*`), and repository agent configs (`AGENTS.md`, `CLAUDE.md`, `.gemini/*`), suppressing automatic branch checkout prompts and reminding reviewers to inspect those hunks before running local commands.
+    - **Silent When Clean (`status: "none"`)**: Never displays a false-confidence "Safe" badge when no heuristics fire.
+- **Built-In Blind-Diff & Intent-vs-Actuality Subagent (`review-blind-diff`)**:
+  - Added [`plugin/agents/review-blind-diff/agent.md`](plugin/agents/review-blind-diff/agent.md) (enabled at `medium` and `high` effort by default with `quasarBlindDiff: true` in `review_lenses.py`), evaluating the raw code diff under a strict information firewall (without PR title, description, commit messages, or comments) to uncover what the code actually does, catch half-wired features, and flag hidden side effects or scope creep.
+  - Added `cliffsNotes.intentVsActuality` synthesis and rendering across `SKILL.md`, `publish_review_session.py`, `collect_pr_context.py`, the VS Code sidebar & Interactive Study Guide, `quasar-web`, and the standalone Flutter app—comparing `review-blind-diff`'s unanchored Actuality Report against the author's stated PR intent.
+- **In-Diff Guided Tour Controls & Mode-Aware Action Disambiguation**:
+  - Added `← Previous Tour Stop`, `→ Next Tour Stop`, and `📖 Open CliffsNotes Study Guide` buttons directly to the diff editor's top-right toolbar (`editor/title` when viewing a Quasar review diff), plus stop counters (`Stop X/Y`) and `⬅️ Prev` / `➡️ Next` actions in Tour Stop CodeLenses, Hover cards, `quasar-web`, and the standalone Flutter app's pinned Diff Tour Strip (`Alt+Down` / `Alt+Up`).
+  - Synced `currentStopIndex` whenever jumping to a stop from the Study Guide, flowchart, or sidebar so `Prev` and `Next` always step sequentially from the currently viewed stop.
+  - Decluttered the `Review Comments & Cart` and `CliffsNotes & Reading Tour` sidebar headers (moving secondary/destructive actions to the labeled `⋯` overflow menu) and added distinct, mode-aware full-text primary action rows at the top of `Review Comments & Cart` (`🔧 Send Checked Comments to Agent to Fix...` for owned branches/PRs vs. `☁️ Publish Review to GitHub (N Staged)...` for GitHub PRs).
+- **First-Class Inline Comment Authoring & "Ask Quasar to Add Comment"**:
+  - Added **`+ Add Review Comment`** (`quasar.stageNewComment` / `quasar.addCommentAtLine`) and **`✨ Ask Quasar to Add Comment`** (`quasar.askToAddComment` / `quasar.askToAddCommentAtLine`) across the native VS Code `+` gutter box, editor context menu, Hover cards, Tour Stop CodeLenses, **Review Comments & Cart** sidebar header, `quasar-web`, and the standalone Flutter app (`DiffViewer`).
+  - Added `--create` (`--path`, `--start-line`, `--end-line`) and `--promote-to-comment` to `answer_comment_question.py` (and `SKILL.md`) so Quasar can also create or populate inline review comments directly from chat or inline `+` threads.
+- **Unified Comment Interaction Parity**:
+  - User-added and Quasar-drafted inline comments now share the exact same canonical review-comment schema and lifecycle as review-lens findings—supporting stage/unstage, in-place draft editing (`messages[0]` sync), **💬 Ask Agent to Change Comment**, **🔧 Queue for Agent Fix / Fix Now** (in Author Self-Review mode), **👍 / 👎 / 🧠 Teach Quasar / 🎓 Teach Subagent**, and **☁️ Publish to GitHub**, while staying preserved across session re-publishes.
+
+### Fixed
+- **Headless Antigravity CLI (`agy`) Auto-Dispatch Fallback in VS Code & Web Sidecar**:
+  - Added `dispatchViaAgyCli` to `sendPromptToQuasar` in [`extension/extension.js`](extension/extension.js) so VS Code windows without an embedded `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN` language server (such as standard VS Code running alongside Antigravity 2.0 or after a server restart) automatically dispatch reviews, inline Q&A, comment drafting, and code fixes via `agy` instead of falling back to clipboard copy.
+  - Fixed `agy --print` flag formatting (`--print=<prompt>` so `--print` never consumes `--output-format`), removed unsupported CLI `--effort` flag failures across models, and added tightly-scoped per-session `--settings` `permissions.allow` rules in both `extension.js` and `server.py` so headless `agy` invocations can run Quasar's scripts cleanly without modifying saved user settings.
+
 ## [1.4.0] - 2026-11-12
 
 ### Added

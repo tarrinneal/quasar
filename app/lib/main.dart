@@ -58,6 +58,9 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
   DiffScrollRequest? _diffScrollReq;
   int _scrollNonce = 0;
   Timer? _pollTimer;
+  int _activeStopIndex = 0;
+  String? _trackedFixSessionId;
+  final Set<String> _knownFixedIds = <String>{};
 
   @override
   void initState() {
@@ -96,6 +99,28 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
       if (!mounted) {
         return;
       }
+      int newlyFixedCount = 0;
+      final ReviewSession? nextSess = next.activeSession;
+      if (nextSess == null) {
+        _trackedFixSessionId = null;
+        _knownFixedIds.clear();
+      } else if (_trackedFixSessionId != nextSess.sessionId) {
+        _trackedFixSessionId = nextSess.sessionId;
+        _knownFixedIds
+          ..clear()
+          ..addAll(
+            nextSess.threads
+                .where((ReviewThread t) => t.isFixed)
+                .map((ReviewThread t) => t.id),
+          );
+      } else {
+        for (final ReviewThread t in nextSess.threads) {
+          if (t.isFixed && !_knownFixedIds.contains(t.id)) {
+            _knownFixedIds.add(t.id);
+            newlyFixedCount++;
+          }
+        }
+      }
       setState(() {
         _state = next;
         _connectionError = null;
@@ -107,6 +132,17 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
           }
         }
       });
+      if (newlyFixedCount > 0) {
+        final int remFixing = nextSess!.threads
+            .where(
+              (ReviewThread t) =>
+                  !t.isFixed && t.fixStatus == 'in_progress',
+            )
+            .length;
+        _showSnack(
+          '✅ Agent finished fixing $newlyFixedCount comment${newlyFixedCount == 1 ? '' : 's'} in working tree${remFixing > 0 ? ' ($remFixing still fixing...)' : '!'}',
+        );
+      }
     } catch (e) {
       if (!mounted) {
         return;
@@ -150,6 +186,17 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
 
   Future<void> _handleJumpToStop(TourStop stop) async {
     final ReviewSession? sess = _state?.activeSession;
+    if (sess != null) {
+      final List<TourStop> stops = sess.allStops;
+      final int idx = stops.indexWhere(
+        (TourStop s) =>
+            (stop.id.isNotEmpty && s.id == stop.id) ||
+            (s.path == stop.path && s.startLine == stop.startLine),
+      );
+      if (idx != -1) {
+        _activeStopIndex = idx;
+      }
+    }
     _jumpToDiff(filePath: stop.path, line: stop.startLine);
     if (sess != null && !stop.read && stop.id.isNotEmpty) {
       try {
@@ -160,6 +207,20 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
         await _refreshState(silent: true);
       } catch (_) {}
     }
+  }
+
+  void _stepTourStop(int delta) {
+    final ReviewSession? sess = _state?.activeSession;
+    if (sess == null) {
+      return;
+    }
+    final List<TourStop> stops = sess.allStops;
+    if (stops.isEmpty) {
+      return;
+    }
+    final int nextIdx = (_activeStopIndex + delta + stops.length) % stops.length;
+    _activeStopIndex = nextIdx;
+    _handleJumpToStop(stops[nextIdx]);
   }
 
   Future<void> _handleJumpToThread(ReviewThread t) async {
@@ -470,8 +531,23 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
             .where((ReviewThread t) => t.isStaged && !t.isGithubExisting)
             .length ??
         0;
+    final int fixingNowCount = sess?.activeThreads
+            .where(
+              (ReviewThread t) => !t.isFixed && t.fixStatus == 'in_progress',
+            )
+            .length ??
+        0;
+    final int fixedDoneCount = sess?.activeThreads
+            .where((ReviewThread t) => t.isFixed)
+            .length ??
+        0;
     final int fixQueuedCount = sess?.activeThreads
-            .where((ReviewThread t) => t.selectedForFix && !t.isFixed)
+            .where(
+              (ReviewThread t) =>
+                  t.selectedForFix &&
+                  !t.isFixed &&
+                  t.fixStatus != 'in_progress',
+            )
             .length ??
         0;
 
@@ -479,6 +555,10 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
       bindings: <ShortcutActivator, VoidCallback>{
         const SingleActivator(LogicalKeyboardKey.keyR, meta: true): () =>
             _refreshState(),
+        const SingleActivator(LogicalKeyboardKey.arrowDown, alt: true): () =>
+            _stepTourStop(1),
+        const SingleActivator(LogicalKeyboardKey.arrowUp, alt: true): () =>
+            _stepTourStop(-1),
       },
       child: Focus(
         autofocus: true,
@@ -486,7 +566,13 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
           body: Column(
             children: <Widget>[
               // Top App Header
-              _buildTopHeader(sess, stagedCount, fixQueuedCount),
+              _buildTopHeader(
+                sess,
+                stagedCount,
+                fixQueuedCount,
+                fixingNowCount,
+                fixedDoneCount,
+              ),
 
               // Live Agent Activity Banner (Antigravity CLI progress)
               if (agent != null && (agent.active || agent.completedJustNow))
@@ -520,6 +606,8 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
     ReviewSession? sess,
     int stagedCount,
     int fixQueuedCount,
+    int fixingNowCount,
+    int fixedDoneCount,
   ) {
     final List<SessionSummary> sessions =
         _state?.sessions ?? const <SessionSummary>[];
@@ -649,6 +737,61 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
                 },
                 child: const Text('🎓 Tutorial', style: TextStyle(fontSize: 12)),
               ),
+              if (sess != null && fixingNowCount > 0)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 6,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF58A6FF).withValues(alpha: 0.14),
+                    borderRadius: BorderRadius.circular(999),
+                    border: Border.all(
+                      color: const Color(0xFF58A6FF).withValues(alpha: 0.5),
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      const SizedBox(
+                        width: 12,
+                        height: 12,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                      const SizedBox(width: 7),
+                      Text(
+                        'Fixing $fixingNowCount...',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFF79C0FF),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              if (sess != null && fixedDoneCount > 0)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 6,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF3FB950).withValues(alpha: 0.14),
+                    borderRadius: BorderRadius.circular(999),
+                    border: Border.all(
+                      color: const Color(0xFF3FB950).withValues(alpha: 0.5),
+                    ),
+                  ),
+                  child: Text(
+                    '✅ $fixedDoneCount Fixed',
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: Color(0xFF56D364),
+                    ),
+                  ),
+                ),
               if (sess != null && fixQueuedCount > 0)
                 FilledButton.tonalIcon(
                   onPressed: () async {
@@ -665,16 +808,17 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
                   },
                   icon: const Icon(Icons.build, size: 14),
                   label: Text(
-                    'Fix Queued ($fixQueuedCount)',
+                    'Send $fixQueuedCount to Agent to Fix',
                     style: const TextStyle(fontSize: 12),
                   ),
                 ),
-              if (sess != null)
+              if (sess != null &&
+                  ((sess.pr.number ?? 0) > 0 || sess.isTutorial))
                 OutlinedButton.icon(
                   onPressed: () => _showPublishDialog(sess),
                   icon: const Icon(Icons.cloud_upload_outlined, size: 15),
                   label: Text(
-                    'Publish ($stagedCount)',
+                    'Publish to GitHub ($stagedCount)',
                     style: const TextStyle(fontSize: 12),
                   ),
                 ),
@@ -831,11 +975,22 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
 
   Widget _buildLeftSidebar(ReviewSession sess) {
     final List<ReviewThread> active = sess.activeThreads;
+    final List<ReviewThread> fixingThreads = active
+        .where((ReviewThread t) => !t.isFixed && t.fixStatus == 'in_progress')
+        .toList();
+    final List<ReviewThread> fixedThreads =
+        active.where((ReviewThread t) => t.isFixed).toList();
     final List<ReviewThread> newFindings = active
-        .where((ReviewThread t) => !t.isGithubExisting && !t.isFixed)
+        .where(
+          (ReviewThread t) =>
+              !t.isGithubExisting && !t.isFixed && t.fixStatus != 'in_progress',
+        )
         .toList();
     final List<ReviewThread> ghExisting = active
-        .where((ReviewThread t) => t.isGithubExisting && !t.isFixed)
+        .where(
+          (ReviewThread t) =>
+              t.isGithubExisting && !t.isFixed && t.fixStatus != 'in_progress',
+        )
         .toList();
 
     return Container(
@@ -906,6 +1061,27 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
             const Divider(height: 16),
           ],
 
+          if (fixingThreads.isNotEmpty) ...<Widget>[
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 4, 12, 4),
+              child: Text(
+                '⏳ FIXING WITH AGENT NOW (${fixingThreads.length})',
+                style: const TextStyle(
+                  fontSize: 10.5,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.6,
+                  color: Color(0xFF79C0FF),
+                ),
+              ),
+            ),
+            for (final ReviewThread t in fixingThreads)
+              _SidebarThreadTile(
+                thread: t,
+                onTap: () => _handleJumpToThread(t),
+              ),
+            const Divider(height: 16),
+          ],
+
           // Quasar Findings & Staged Comments
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 4, 12, 4),
@@ -945,6 +1121,27 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
                 onTap: () => _handleJumpToThread(t),
               ),
           ],
+
+          if (fixedThreads.isNotEmpty) ...<Widget>[
+            const Divider(height: 16),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 4, 12, 4),
+              child: Text(
+                '✅ FIXED IN WORKING TREE (${fixedThreads.length})',
+                style: const TextStyle(
+                  fontSize: 10.5,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.6,
+                  color: Color(0xFF56D364),
+                ),
+              ),
+            ),
+            for (final ReviewThread t in fixedThreads)
+              _SidebarThreadTile(
+                thread: t,
+                onTap: () => _handleJumpToThread(t),
+              ),
+          ],
           ],
         ),
       ),
@@ -964,11 +1161,42 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
             );
             await _refreshState(silent: true);
           },
+          onOverrideQuarantine: () async {
+            final bool? confirmed = await showDialog<bool>(
+              context: context,
+              builder: (BuildContext ctx) => AlertDialog(
+                title: const Text(
+                  '🛡️ Override Security / Prompt-Injection Quarantine?',
+                ),
+                content: const Text(
+                  'Only proceed if you have manually inspected all flagged lines in the read-only diff and confirmed they are benign.',
+                ),
+                actions: <Widget>[
+                  TextButton(
+                    onPressed: () => Navigator.of(ctx).pop(false),
+                    child: const Text('Cancel'),
+                  ),
+                  FilledButton(
+                    onPressed: () => Navigator.of(ctx).pop(true),
+                    child: const Text('Override & Run Review'),
+                  ),
+                ],
+              ),
+            );
+            if (confirmed != true) return;
+            await _api.overrideQuarantine(sessionId: sess.sessionId);
+            await _refreshState(silent: false);
+          },
         );
       case _MainTab.diff:
         return DiffViewer(
           files: _state?.filesDiff ?? const <FileDiff>[],
           threads: sess.activeThreads,
+          tourStops: sess.allStops,
+          activeStopIndex: _activeStopIndex,
+          onStepTourStop: _stepTourStop,
+          onOpenStudyGuide: () =>
+              setState(() => _activeTab = _MainTab.studyGuide),
           isOwnedReview: sess.pr.isOwnedByUser,
           scrollRequest: _diffScrollReq,
           onThreadAction: (
@@ -999,14 +1227,28 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
             _showSnack('💬 Sent to Antigravity CLI — answer will appear in place.');
             await _refreshState(silent: true);
           },
-          onAskAtLine: (String path, int line, String q) async {
+          onAskAtLine: (
+            String path,
+            int line,
+            String q, {
+            String mode = 'qa',
+            String severity = 'DESIGN',
+          }) async {
             await _api.askAtLine(
               sessionId: sess.sessionId,
               path: path,
               line: line,
               question: q,
+              mode: mode,
+              severity: severity,
             );
-            _showSnack('💬 Asked Antigravity CLI on $path:L$line');
+            if (mode == 'manual') {
+              _showSnack('✅ Added & staged inline comment on $path:L$line');
+            } else if (mode == 'ai_comment') {
+              _showSnack('✨ Quasar is drafting an inline comment on $path:L$line');
+            } else {
+              _showSnack('💬 Asked Antigravity CLI on $path:L$line');
+            }
             await _refreshState(silent: true);
           },
           onOpenInExternalEditor: (String path, int line) async {
@@ -1129,7 +1371,7 @@ class _SidebarThreadTile extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: <Widget>[
                   Text(
-                    '${thread.selectedForFix ? '🔧 ' : ''}${thread.cleanTitle}',
+                    '${!thread.isFixed && thread.fixStatus == 'in_progress' ? '⏳ ' : (thread.selectedForFix && !thread.isFixed ? '🔧 ' : '')}${thread.cleanTitle}',
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(

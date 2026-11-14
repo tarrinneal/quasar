@@ -9,11 +9,13 @@ class StudyGuideView extends StatelessWidget {
     required this.session,
     required this.onJumpToStop,
     required this.onToggleStopRead,
+    this.onOverrideQuarantine,
   });
 
   final ReviewSession session;
   final ValueChanged<TourStop> onJumpToStop;
   final ValueChanged<TourStop> onToggleStopRead;
+  final VoidCallback? onOverrideQuarantine;
 
   void _handleFlowchartNodeTap(FlowchartNode node) {
     final String needle = node.label
@@ -37,10 +39,153 @@ class StudyGuideView extends StatelessWidget {
   Widget build(BuildContext context) {
     final CliffsNotesData cn = session.cliffsNotes;
     final PrMetadata pr = session.pr;
+    final SecurityGate? sg = session.securityGate;
 
     return ListView(
       padding: const EdgeInsets.all(20),
       children: <Widget>[
+        if (sg != null && sg.hasAlerts) ...<Widget>[
+          Builder(
+            builder: (BuildContext ctx) {
+              final bool isBlocked = sg.isBlocked;
+              final Color accent = isBlocked
+                  ? const Color(0xFFF85149)
+                  : const Color(0xFFD29922);
+              final String heading = sg.isHalted
+                  ? '🚨 Security / Prompt-Injection Quarantine — LLM Review Halted'
+                  : isBlocked
+                      ? '🚨 Security / Prompt-Injection Alert (Quarantine Overridden)'
+                      : '⚠️ Touches Build / CI / Agent Config — Inspect Before Running Locally';
+              return Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: accent.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: accent.withValues(alpha: 0.65),
+                    width: 1.5,
+                  ),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Row(
+                      children: <Widget>[
+                        Expanded(
+                          child: Text(
+                            heading,
+                            style: TextStyle(
+                              fontSize: 13.5,
+                              fontWeight: FontWeight.w700,
+                              color: accent,
+                            ),
+                          ),
+                        ),
+                        if (sg.isHalted && onOverrideQuarantine != null)
+                          OutlinedButton.icon(
+                            onPressed: onOverrideQuarantine,
+                            icon: Icon(Icons.shield_outlined,
+                                size: 15, color: accent),
+                            label: Text(
+                              'Override Quarantine',
+                              style: TextStyle(fontSize: 12, color: accent),
+                            ),
+                            style: OutlinedButton.styleFrom(
+                              side: BorderSide(
+                                color: accent.withValues(alpha: 0.6),
+                              ),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 6,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                    if (sg.summary.isNotEmpty) ...<Widget>[
+                      const SizedBox(height: 6),
+                      Text(
+                        sg.summary,
+                        style: const TextStyle(
+                          fontSize: 12.5,
+                          color: Color(0xFFE6EDF3),
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 8),
+                    for (final SecuritySignal sig in sg.signals) ...<Widget>[
+                      Container(
+                        margin: const EdgeInsets.only(top: 6),
+                        padding: const EdgeInsets.all(9),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF0D1117),
+                          borderRadius: BorderRadius.circular(7),
+                          border: Border.all(color: const Color(0xFF30363D)),
+                        ),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: <Widget>[
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: <Widget>[
+                                  Text(
+                                    '${sig.isBlocked ? '🚨' : '⚠️'} ${sig.location} — ${sig.detail}',
+                                    style: const TextStyle(
+                                      fontSize: 12.5,
+                                      fontWeight: FontWeight.w600,
+                                      color: Color(0xFFE6EDF3),
+                                    ),
+                                  ),
+                                  if (sig.excerpt.isNotEmpty) ...<Widget>[
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      sig.excerpt,
+                                      style: const TextStyle(
+                                        fontFamily: 'monospace',
+                                        fontSize: 11.5,
+                                        color: Color(0xFF8B949E),
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                            ),
+                            if (sig.path.isNotEmpty) ...<Widget>[
+                              const SizedBox(width: 8),
+                              TextButton.icon(
+                                onPressed: () => onJumpToStop(
+                                  TourStop(
+                                    id: 'sec-${sig.path}-${sig.line}',
+                                    stopNumber: '!',
+                                    title: '${sig.path}:L${sig.line}',
+                                    path: sig.path,
+                                    startLine: sig.line,
+                                    endLine: sig.line,
+                                    cliffsNotes: sig.detail,
+                                    whyItChanged: '',
+                                    callersAndInvariants: '',
+                                    read: false,
+                                  ),
+                                ),
+                                icon: const Icon(Icons.difference, size: 14),
+                                label: const Text(
+                                  'Inspect Diff',
+                                  style: TextStyle(fontSize: 12),
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              );
+            },
+          ),
+          const SizedBox(height: 14),
+        ],
         // Overview Card
         Container(
           padding: const EdgeInsets.all(18),
@@ -103,6 +248,68 @@ class StudyGuideView extends StatelessWidget {
                     text: '💡 **TL;DR:** ${cn.tldr}',
                     fontSize: 13.5,
                   ),
+                ),
+              ],
+              if (cn.intentVsActuality != null &&
+                  cn.intentVsActuality!.hasContent) ...<Widget>[
+                const SizedBox(height: 10),
+                Builder(
+                  builder: (BuildContext ctx) {
+                    final IntentVsActuality iva = cn.intentVsActuality!;
+                    final bool isDiv = iva.diverges;
+                    final Color accent = isDiv
+                        ? const Color(0xFFD29922)
+                        : const Color(0xFF3FB950);
+                    return Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(11),
+                      decoration: BoxDecoration(
+                        color: accent.withValues(alpha: 0.08),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                          color: accent.withValues(alpha: 0.45),
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: <Widget>[
+                          Text(
+                            isDiv
+                                ? '⚠️ Blind-Diff Check: Diverges from Stated Intent (review-blind-diff)'
+                                : '✅ Blind-Diff Check: Code Matches Stated Intent',
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.w700,
+                              color: accent,
+                            ),
+                          ),
+                          if (iva.statedIntent.isNotEmpty) ...<Widget>[
+                            const SizedBox(height: 5),
+                            InlineMarkdownText(
+                              text: '**Stated Intent:** ${iva.statedIntent}',
+                              fontSize: 12.5,
+                            ),
+                          ],
+                          if (iva.actualBehavior.isNotEmpty) ...<Widget>[
+                            const SizedBox(height: 3),
+                            InlineMarkdownText(
+                              text:
+                                  '**Actual Diff Behavior:** ${iva.actualBehavior}',
+                              fontSize: 12.5,
+                            ),
+                          ],
+                          for (final String d in iva.discrepancies) ...<Widget>[
+                            const SizedBox(height: 3),
+                            InlineMarkdownText(
+                              text: '• ⚠️ $d',
+                              fontSize: 12.5,
+                              color: const Color(0xFFE3B341),
+                            ),
+                          ],
+                        ],
+                      ),
+                    );
+                  },
                 ),
               ],
               if (cn.whatAndWhy.isNotEmpty) ...<Widget>[

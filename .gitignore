@@ -6,4 +6,5 @@ node_modules/
 *.tar.gz
 plugin/sidecars/quasar-web/flutter_web/
 plugin/sidecars/quasar-web/mermaid-preview.js
+local/
 release.sh

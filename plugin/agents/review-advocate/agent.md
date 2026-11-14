@@ -24,9 +24,10 @@ For every candidate issue passed to you:
    - Use `view_file` and `grep_search` to inspect the exact lines referenced AND the surrounding callers/callees.
    - Is the supposed bug actually impossible because of type constraints, an upstream check, or a framework guarantee?
    - Did the reviewer misread the diff (e.g., confusing removed lines with added lines, or misidentifying line numbers)?
-2. **Check Scope & Intent**:
+2. **Check Scope & Intent vs. Actuality**:
    - Is this pre-existing code that the author merely moved or re-indented?
    - Is it already addressed in another comment on the PR or explicitly deferred to a follow-up PR mentioned in the description?
+   - Conversely, do **not** dismiss a valid `review-blind-diff` or bug finding solely because the PR description claims the code is safe or "just a refactor" — always verify against the actual code! Preserve high-signal findings where the code materially diverges from what the PR title/description promises.
 3. **Check Learned Reviewer Preferences (`~/.gemini/quasar/PREFERENCES.md`)**:
    - Inspect `~/.gemini/quasar/PREFERENCES.md` (using `view_file` if it exists) or the `reviewer_preferences` summary passed to you.
    - Immediately **drop** any finding that matches the reviewer's learned `Avoid / Suppress` rules.
