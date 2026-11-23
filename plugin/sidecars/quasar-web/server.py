@@ -13,9 +13,12 @@ import glob
 import json
 import os
 import re
+import select
+import socket
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -373,6 +376,714 @@ def resolve_conversation_context(
 
 
 ACTIVE_AGENT_JOB: Dict[str, Any] = {}
+_JOB_LOCK = threading.RLock()
+_STATUS_COND = threading.Condition(_JOB_LOCK)
+_STATUS_SEQ = 0
+
+
+def _notify_status_change() -> None:
+    """Wake any live status listeners (e.g. SSE /api/agent-stream) on state change."""
+    global _STATUS_SEQ
+    with _STATUS_COND:
+        _STATUS_SEQ += 1
+        _STATUS_COND.notify_all()
+
+
+def _new_progress_state(title: str = "", prompt_preview: str = "") -> Dict[str, Any]:
+    """Create a fresh structured progress-tracking dictionary."""
+    text = f"{title} {prompt_preview}".lower()
+    is_review = any(k in text for k in ("review", "pr #", "pull request", "branch", "cliffsnotes"))
+    return {
+        "phase": 0,
+        "isReview": is_review,
+        "sawQuasar": False,
+        "stage": "",
+        "detail": "",
+        "percent": 14,
+        "subagentDetails": [],
+        "subagents": [],
+        "recentSteps": [],
+        "stepTools": {},
+    }
+
+
+def _read_tail_lines(path: str, max_bytes: int = 65536, max_lines: int = 200) -> List[str]:
+    """Read up to `max_lines` from the tail of a file without loading multi-MB logs."""
+    if not path or not os.path.isfile(path):
+        return []
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as bf:
+            if size > max_bytes:
+                bf.seek(size - max_bytes)
+                lines = bf.read().decode("utf-8", errors="replace").splitlines()[1:]
+            else:
+                lines = bf.read().decode("utf-8", errors="replace").splitlines()
+        return lines[-max_lines:]
+    except Exception:
+        return []
+
+
+def _decode_tool_args(raw_args: Any) -> Dict[str, Any]:
+    """Normalize tool parameters from stream-json events or JSONL transcript args."""
+    if isinstance(raw_args, str):
+        try:
+            raw_args = json.loads(raw_args)
+        except Exception:
+            return {}
+    if not isinstance(raw_args, dict):
+        return {}
+    decoded: Dict[str, Any] = {}
+    for k, v in raw_args.items():
+        if isinstance(v, str):
+            s = v.strip()
+            if s.startswith(('"', "[", "{")) or s in ("true", "false", "null"):
+                try:
+                    decoded[k] = json.loads(s)
+                    continue
+                except Exception:
+                    pass
+        decoded[k] = v
+    return decoded
+
+
+def _file_uri_to_path(uri: Any) -> str:
+    """Resolve a file:// URI or local filesystem path string into a local path."""
+    s = str(uri or "").strip()
+    if not s:
+        return ""
+    if s.startswith("file://"):
+        parsed = urllib.parse.urlparse(s)
+        return urllib.parse.unquote(parsed.path or "")
+    return s
+
+
+def _resolve_subagent_transcript_path(transcript_uri_or_path: Any, cid: str = "") -> str:
+    """Resolve a subagent transcript.jsonl path from a URI or conversation ID."""
+    cand = _file_uri_to_path(transcript_uri_or_path)
+    if cand and os.path.isfile(cand):
+        return cand
+    if cid:
+        c_dir = find_brain_conversation_dir(cid)
+        if c_dir:
+            tp = os.path.join(c_dir, ".system_generated", "logs", "transcript.jsonl")
+            if os.path.isfile(tp):
+                return tp
+    return cand
+
+
+def _format_tool_activity(tool_name: str, args_obj: Dict[str, Any]) -> str:
+    """Return a concise human-readable description for a tool call."""
+    tname = str(tool_name or "").strip()
+    tlower = tname.lower()
+    summary = str(args_obj.get("toolAction") or args_obj.get("toolSummary") or "").strip()
+    path_val = str(
+        args_obj.get("Path")
+        or args_obj.get("AbsolutePath")
+        or args_obj.get("TargetFile")
+        or args_obj.get("SearchPath")
+        or ""
+    ).strip()
+    base = os.path.basename(path_val.rstrip("/")) if path_val else ""
+
+    if tlower in ("read_file", "view_file", "view_file_outline", "view_code_item"):
+        if base == "SKILL.md":
+            return "Reading Quasar skill instructions"
+        if base == "PREFERENCES.md":
+            return "Loading reviewer preferences"
+        if base == "pr_context.json":
+            return "Reading PR context & changed files"
+        if base:
+            return f"Reading {base}"
+        return "Reading file"
+    if tlower in ("write_file", "edit_file", "replace_file_content", "multi_replace_file_content"):
+        return f"Writing {base}" if base else "Editing file"
+    if tlower in ("grep_search", "find_by_name", "list_dir"):
+        query = str(args_obj.get("Query") or args_obj.get("Pattern") or "").strip()
+        if query and len(query) <= 32:
+            return f"Searching for {query}"
+        return f"Searching {base}" if base else "Searching codebase"
+    if tlower == "invoke_subagent":
+        role = str(args_obj.get("Role") or args_obj.get("TypeName") or "subagent").strip()
+        return f"Launching {role}"
+    if tlower == "send_message":
+        return "Sending message to subagent"
+    if tlower in ("manage_subagents", "schedule"):
+        return ""
+    if tlower == "run_command":
+        if summary:
+            return summary
+        cmd = str(args_obj.get("CommandLine") or "").strip()
+        first = cmd.splitlines()[0].split()[0] if cmd else ""
+        return f"Running {os.path.basename(first)}" if first else "Running command"
+    return summary or (f"Running {tname}" if tname else "")
+
+
+def _add_recent_step(state: Dict[str, Any], text: str) -> None:
+    """Append a non-duplicate milestone description to `recentSteps` (max 8)."""
+    msg = " ".join(str(text or "").split())
+    if not msg:
+        return
+    steps = state.setdefault("recentSteps", [])
+    if steps and steps[-1] == msg:
+        return
+    steps.append(msg)
+    if len(steps) > 8:
+        del steps[:-8]
+
+
+def _sync_subagent_labels(state: Dict[str, Any]) -> None:
+    """Keep flattened `subagents` list aligned with `subagentDetails` for Flutter/UI compatibility."""
+    labels: List[str] = []
+    for entry in state.get("subagentDetails") or []:
+        lbl = str(entry.get("label") or entry.get("role") or entry.get("name") or "").strip()
+        if lbl and lbl not in labels:
+            labels.append(lbl)
+    state["subagents"] = labels
+
+
+def _upsert_subagent_entry(
+    state: Dict[str, Any],
+    *,
+    typename: str = "",
+    role: str = "",
+    conversation_id: str = "",
+    transcript_path: str = "",
+    status: str = "",
+    detail: str = "",
+    step_index: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Insert or update a tracked subagent entry without creating duplicates."""
+    details: List[Dict[str, Any]] = state.setdefault("subagentDetails", [])
+    cid = str(conversation_id or "").strip()
+    tname = str(typename or "").strip()
+    rname = str(role or "").strip()
+    label = rname or tname or cid[:8] or "subagent"
+
+    match: Optional[Dict[str, Any]] = None
+    if cid:
+        for item in details:
+            if item.get("conversationId") == cid:
+                match = item
+                break
+    if match is None and step_index is not None:
+        for item in details:
+            if item.get("stepIndex") == step_index and (not cid or not item.get("conversationId")):
+                match = item
+                break
+    if match is None and tname:
+        for item in details:
+            if item.get("name") == tname and not item.get("conversationId") and (not rname or item.get("role") == rname):
+                match = item
+                break
+    if match is None and cid and not tname and not rname:
+        for item in details:
+            if not item.get("conversationId"):
+                match = item
+                break
+
+    if match is None:
+        match = {
+            "name": tname or label,
+            "role": rname,
+            "label": label,
+            "conversationId": cid,
+            "transcriptPath": transcript_path,
+            "status": status or "running",
+            "detail": detail or "Starting analysis...",
+            "stepIndex": step_index,
+        }
+        details.append(match)
+    else:
+        if tname:
+            match["name"] = tname
+        if rname:
+            match["role"] = rname
+            match["label"] = rname
+        elif tname and not match.get("role"):
+            match["label"] = tname
+        if cid:
+            match["conversationId"] = cid
+        if transcript_path:
+            match["transcriptPath"] = transcript_path
+        if status and (match.get("status") not in ("done", "error") or status in ("done", "error", "running")):
+            match["status"] = status
+        if detail:
+            match["detail"] = detail
+        if step_index is not None and match.get("stepIndex") is None:
+            match["stepIndex"] = step_index
+
+    _sync_subagent_labels(state)
+    return match
+
+
+def _inspect_subagent_transcript(transcript_path: str, conversation_id: str = "") -> Tuple[str, str]:
+    """Read tail lines of a subagent transcript.jsonl to infer live status and tool action."""
+    tp = _resolve_subagent_transcript_path(transcript_path, conversation_id)
+    lines = _read_tail_lines(tp, max_bytes=16384, max_lines=30)
+    if not lines:
+        return "", ""
+    steps: List[Dict[str, Any]] = []
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, dict):
+                steps.append(obj)
+        except Exception:
+            pass
+    if not steps:
+        return "", ""
+
+    last_step = steps[-1]
+    last_type = str(last_step.get("type") or "")
+    last_status = str(last_step.get("status") or "").upper()
+    last_tools = last_step.get("tool_calls") or []
+    if last_type == "PLANNER_RESPONSE":
+        if last_status == "ERROR":
+            return "error", "Subagent reported an error"
+        if last_status == "DONE" and not last_tools:
+            return "done", "Completed analysis"
+
+    for st in reversed(steps):
+        for tc in reversed(st.get("tool_calls") or []):
+            tname = str(tc.get("name") or "")
+            args_obj = _decode_tool_args(tc.get("arguments") or tc.get("args") or {})
+            act = _format_tool_activity(tname, args_obj)
+            if act:
+                return "running", act
+    return "running", "Analyzing changes..."
+
+
+def _parse_subagent_output_text(
+    state: Dict[str, Any],
+    tool_name: str,
+    output_text: str,
+    step_index: Optional[int] = None,
+) -> None:
+    """Extract subagent IDs, transcript paths, and states from tool response output."""
+    text = str(output_text or "").strip()
+    if not text:
+        return
+    tlower = str(tool_name or "").lower()
+
+    if "logabsoluteuri" in text.lower() or "conversationid" in text.lower():
+        if tlower == "invoke_subagent" or ("logAbsoluteUri" in text and not text.lstrip().startswith("You have ")):
+            parsed_obj: Optional[Dict[str, Any]] = None
+            try:
+                cand = json.loads(text)
+                if isinstance(cand, dict):
+                    parsed_obj = cand
+            except Exception:
+                pass
+            if parsed_obj is not None:
+                cid = str(parsed_obj.get("conversationId") or parsed_obj.get("conversation_id") or "").strip()
+                uri = parsed_obj.get("logAbsoluteUri") or parsed_obj.get("transcript") or ""
+            else:
+                m_cid = re.search(r'"conversationId"\s*:\s*"([^"]+)"', text)
+                m_uri = re.search(r'"logAbsoluteUri"\s*:\s*"([^"]+)"', text)
+                cid = m_cid.group(1).strip() if m_cid else ""
+                uri = m_uri.group(1).strip() if m_uri else ""
+            if cid or uri:
+                tp = _resolve_subagent_transcript_path(uri, cid)
+                _upsert_subagent_entry(
+                    state,
+                    conversation_id=cid,
+                    transcript_path=tp,
+                    status="running",
+                    step_index=step_index,
+                )
+                return
+
+    if tlower == "manage_subagents" or "active subagent" in text.lower():
+        listed_cids = set()
+        m_arr = re.search(r"\[[\s\S]*\]", text)
+        if m_arr:
+            try:
+                arr = json.loads(m_arr.group(0))
+                if isinstance(arr, list):
+                    for item in arr:
+                        if not isinstance(item, dict):
+                            continue
+                        cid = str(item.get("conversationId") or "").strip()
+                        if cid:
+                            listed_cids.add(cid)
+                        st_raw = str(item.get("state") or "").strip().lower()
+                        norm_st = "done" if st_raw in ("idle", "done", "completed", "finished") else "running"
+                        if st_raw in ("error", "failed"):
+                            norm_st = "error"
+                        tp = _resolve_subagent_transcript_path(item.get("transcript") or "", cid)
+                        detail = str(item.get("stateDetail") or "").strip()
+                        _upsert_subagent_entry(
+                            state,
+                            typename=str(item.get("type") or ""),
+                            role=str(item.get("role") or ""),
+                            conversation_id=cid,
+                            transcript_path=tp,
+                            status=norm_st,
+                            detail=detail,
+                        )
+            except Exception:
+                pass
+        if "0 active subagent" in text.lower() or listed_cids:
+            for item in state.get("subagentDetails") or []:
+                item_cid = str(item.get("conversationId") or "").strip()
+                if item_cid and item_cid not in listed_cids and item.get("status") == "running":
+                    t_st, t_det = _inspect_subagent_transcript(item.get("transcriptPath") or "", item_cid)
+                    item["status"] = t_st or "done"
+                    if t_det:
+                        item["detail"] = t_det
+
+
+def _record_tool_call_on_state(
+    state: Dict[str, Any],
+    tool_name: str,
+    raw_args: Any,
+    *,
+    step_index: Optional[int] = None,
+    is_done: bool = False,
+    output_text: str = "",
+) -> None:
+    """Update structured progress state from a single structured tool invocation."""
+    tname = str(tool_name or "").strip()
+    tlower = tname.lower()
+    args_obj = _decode_tool_args(raw_args)
+    if step_index is not None and tname:
+        state.setdefault("stepTools", {})[step_index] = tname
+
+    has_running_subs = any(
+        d.get("status") not in ("done", "error")
+        for d in (state.get("subagentDetails") or [])
+    )
+
+    if tlower == "invoke_subagent" or isinstance(args_obj.get("Subagents"), list):
+        state["sawQuasar"] = True
+        entries = args_obj.get("Subagents") if isinstance(args_obj.get("Subagents"), list) else [args_obj]
+        if any(str(sa.get("TypeName") or "").startswith("review-") for sa in entries if isinstance(sa, dict)):
+            state["isReview"] = True
+        for sa in entries:
+            if not isinstance(sa, dict):
+                continue
+            typename = str(sa.get("TypeName") or "").strip()
+            role = str(sa.get("Role") or "").strip()
+            if typename or role:
+                _upsert_subagent_entry(
+                    state,
+                    typename=typename,
+                    role=role,
+                    status="running",
+                    detail="Launching specialist lens...",
+                    step_index=step_index,
+                )
+                _add_recent_step(state, f"Launching {role or typename}")
+        if state.get("isReview") and state.get("phase", 0) < 3:
+            state["phase"] = 2
+            state["percent"] = max(int(state.get("percent") or 0), 34)
+        elif state.get("phase", 0) < 2:
+            state["stage"] = "🤖 Running specialist subagents"
+            state["percent"] = max(int(state.get("percent") or 0), 34)
+        if is_done and output_text:
+            _parse_subagent_output_text(state, tname or "invoke_subagent", output_text, step_index=step_index)
+        return
+
+    if tlower == "manage_subagents":
+        if is_done and output_text:
+            _parse_subagent_output_text(state, tname, output_text, step_index=step_index)
+        return
+
+    if tlower == "run_command":
+        cmd = str(args_obj.get("CommandLine") or "")
+        if "collect_pr_context.py" in cmd:
+            state["sawQuasar"] = True
+            state["isReview"] = True
+            state["phase"] = max(int(state.get("phase") or 0), 1)
+            if state["phase"] <= 1:
+                state["stage"] = "📥 Phase 1/3 — Fetching PR context & snapshots"
+                state["detail"] = "Materializing base/head file snapshots..."
+                state["percent"] = max(int(state.get("percent") or 0), 24)
+            _add_recent_step(state, "Fetching PR context & file snapshots")
+            return
+        if "publish_review_session.py" in cmd:
+            state["sawQuasar"] = True
+            state["isReview"] = True
+            state["phase"] = max(int(state.get("phase") or 0), 3)
+            state["stage"] = "📖 Phase 3/3 — Publishing CliffsNotes & comments"
+            state["detail"] = "Writing session & rendering diffs..."
+            state["percent"] = max(int(state.get("percent") or 0), 92)
+            _add_recent_step(state, "Publishing review session")
+            return
+        if "answer_comment_question.py" in cmd:
+            state["sawQuasar"] = True
+            state["stage"] = "💬 Posting inline answer to thread"
+            state["detail"] = "Updating comment thread in place..."
+            state["percent"] = max(int(state.get("percent") or 0), 75)
+            _add_recent_step(state, "Updating inline thread")
+            return
+        if "manage_fixes.py" in cmd:
+            state["sawQuasar"] = True
+            act = _format_tool_activity(tname, args_obj)
+            state["stage"] = "🔧 Applying Code Fixes & Syncing Diff Snapshots"
+            state["detail"] = act or "Syncing requested code fixes..."
+            state["percent"] = max(int(state.get("percent") or 0), 80)
+            _add_recent_step(state, state["detail"])
+            return
+        if "manage_preferences.py" in cmd:
+            state["sawQuasar"] = True
+            _add_recent_step(state, "Updating review preferences")
+        act = _format_tool_activity(tname, args_obj)
+        if act:
+            _add_recent_step(state, act)
+            if state.get("phase", 0) < 2 or not has_running_subs:
+                state["detail"] = act
+        return
+
+    if tlower in ("write_file", "edit_file", "replace_file_content", "multi_replace_file_content"):
+        path_val = str(args_obj.get("Path") or args_obj.get("TargetFile") or "")
+        base = os.path.basename(path_val)
+        if "review_synthesis" in path_val or "cliffs_notes" in base.lower():
+            state["sawQuasar"] = True
+            state["isReview"] = True
+            state["phase"] = max(int(state.get("phase") or 0), 3)
+            state["stage"] = "✍️ Phase 3/3 — Synthesizing CliffsNotes & inline findings"
+            state["detail"] = f"Writing {base}..."
+            state["percent"] = max(int(state.get("percent") or 0), 86)
+            _add_recent_step(state, f"Synthesizing {base}")
+            return
+        act = _format_tool_activity(tname, args_obj)
+        if act:
+            _add_recent_step(state, act)
+            if state.get("phase", 0) < 2 or not has_running_subs:
+                state["detail"] = act
+        return
+
+    if tlower in ("read_file", "view_file", "view_file_outline", "view_code_item", "grep_search", "find_by_name", "list_dir"):
+        path_val = str(args_obj.get("Path") or args_obj.get("AbsolutePath") or args_obj.get("TargetFile") or "")
+        base = os.path.basename(path_val)
+        if base in ("SKILL.md", "pr_context.json", "review_synthesis.json") or "/quasar/" in path_val:
+            state["sawQuasar"] = True
+            if base in ("SKILL.md", "pr_context.json"):
+                state["isReview"] = True
+        act = _format_tool_activity(tname, args_obj)
+        phase = int(state.get("phase") or 0)
+        if phase == 0:
+            if state.get("isReview"):
+                state["phase"] = 1
+                state["stage"] = "📋 Phase 1/3 — Loading instructions & PR context"
+                state["percent"] = max(int(state.get("percent") or 0), 16)
+            elif not state.get("stage"):
+                state["stage"] = "🔍 Inspecting repository & review files"
+                state["percent"] = max(int(state.get("percent") or 0), 20)
+        if act:
+            _add_recent_step(state, act)
+            if state.get("phase", 0) <= 1:
+                state["detail"] = act
+                if state.get("phase") == 1:
+                    state["percent"] = max(int(state.get("percent") or 0), 28 if base == "pr_context.json" else 18)
+            elif state.get("phase") == 2 and not has_running_subs:
+                state["detail"] = act
+                state["percent"] = max(int(state.get("percent") or 0), 84)
+        return
+
+    act = _format_tool_activity(tname, args_obj)
+    if act and (state.get("phase", 0) < 2 or not has_running_subs):
+        state["detail"] = act
+        _add_recent_step(state, act)
+
+
+def _finalize_progress_metrics(
+    state: Dict[str, Any],
+    started_at: float,
+    now: float,
+    default_stage: str,
+    default_detail: str,
+) -> Dict[str, Any]:
+    """Compute final stage, detail, monotonic percentage, and per-subagent progress."""
+    details_copy: List[Dict[str, Any]] = []
+    for raw_item in state.get("subagentDetails") or []:
+        item = dict(raw_item)
+        tp = str(item.get("transcriptPath") or "")
+        cid = str(item.get("conversationId") or "")
+        if tp or cid:
+            t_st, t_det = _inspect_subagent_transcript(tp, cid)
+            if t_st:
+                item["status"] = t_st
+            if t_det:
+                item["detail"] = t_det
+        details_copy.append({
+            "name": item.get("name") or "",
+            "role": item.get("role") or "",
+            "label": item.get("label") or item.get("name") or "subagent",
+            "status": item.get("status") or "running",
+            "detail": item.get("detail") or "",
+        })
+
+    subagents = [d["label"] for d in details_copy]
+    phase = int(state.get("phase") or 0)
+    percent = int(state.get("percent") or 14)
+    stage = str(state.get("stage") or default_stage)
+    detail = str(state.get("detail") or default_detail)
+    elapsed = max(1, int(now - started_at))
+
+    if details_copy and phase < 3:
+        total = len(details_copy)
+        done = sum(1 for d in details_copy if d["status"] in ("done", "error"))
+        running = [d for d in details_copy if d["status"] not in ("done", "error")]
+        if running:
+            if state.get("isReview"):
+                stage = f"🔬 Phase 2/3 — Running review lenses ({done}/{total} complete)"
+            else:
+                stage = f"🤖 Running specialist subagents ({done}/{total} complete)"
+            parts = [
+                f"{d['label']}: {d['detail']}" if d.get("detail") else d["label"]
+                for d in running[:2]
+            ]
+            if len(running) > 2:
+                parts.append(f"+{len(running) - 2} more")
+            detail = " · ".join(parts)
+            denom = max(total, 4 if state.get("isReview") else total)
+            percent = max(percent, 34 + int(48 * (done / max(1, denom))))
+        else:
+            if state.get("isReview"):
+                stage = f"🔬 Phase 2/3 — All {total} lenses complete, synthesizing..."
+            else:
+                stage = f"🤖 All {total} subagents complete, synthesizing..."
+            if not detail or "Launching" in detail or ":" in detail:
+                detail = "Synthesizing subagent findings..."
+            percent = max(percent, 82)
+
+    if phase == 0:
+        cap = 18
+        percent = min(cap, max(percent, 12 + elapsed // 2))
+    elif phase == 1:
+        cap = 31
+        percent = min(cap, max(percent, 18 + elapsed // 4))
+    elif phase == 2:
+        cap = 84
+        percent = min(cap, max(percent, 34 + min(14, elapsed // 8)))
+    else:
+        cap = 97
+        percent = min(cap, max(percent, 86))
+
+    percent = max(12, min(97, percent))
+    return {
+        "stage": stage,
+        "detail": detail,
+        "percent": percent,
+        "subagents": subagents,
+        "subagentProgress": details_copy,
+        "recentSteps": list(state.get("recentSteps") or [])[-6:],
+    }
+
+
+def _init_active_agent_job(
+    *,
+    title: str,
+    prompt_preview: str,
+    baseline_mtime: float,
+    conversation_id: str,
+    mode: str,
+    cli_stage: str = "",
+    cli_detail: str = "",
+) -> None:
+    """Thread-safely reset `ACTIVE_AGENT_JOB` for a newly dispatched task."""
+    with _JOB_LOCK:
+        ACTIVE_AGENT_JOB.clear()
+        ACTIVE_AGENT_JOB.update({
+            "active": True,
+            "title": title,
+            "promptPreview": prompt_preview,
+            "startedAt": time.time(),
+            "baselineMtime": baseline_mtime,
+            "conversationId": conversation_id,
+            "mode": mode,
+            "cliStage": cli_stage,
+            "cliDetail": cli_detail,
+            "subagents": [],
+            "progress": _new_progress_state(title, prompt_preview),
+            "completedAt": None,
+        })
+    _notify_status_change()
+
+
+def _process_cli_stream_event(
+    ev: Dict[str, Any],
+    job: Dict[str, Any],
+    agent_text_chunks: Optional[List[str]] = None,
+) -> Tuple[bool, str]:
+    """Process one parsed `jetski --output-format=stream-json` dict into `job`.
+
+    Returns `(saw_execution, stream_err)`.
+    """
+    saw_execution = False
+    stream_err = ""
+    with _JOB_LOCK:
+        cid_cand = (
+            ev.get("conversation_id")
+            or ev.get("conversationId")
+            or ev.get("session_id")
+            or ""
+        )
+        su = ev.get("step_update") if isinstance(ev.get("step_update"), dict) else {}
+        if not cid_cand and su:
+            cid_cand = su.get("conversation_id") or su.get("conversationId") or ""
+        if cid_cand:
+            job["conversationId"] = str(cid_cand)
+
+        if su:
+            st_type = str(su.get("step_type") or "")
+            if st_type and st_type != "user_input":
+                saw_execution = True
+            if st_type == "agent_response" and isinstance(su.get("text_delta"), str) and agent_text_chunks is not None:
+                agent_text_chunks.append(su["text_delta"])
+
+            tool_info = su.get("tool_info") if isinstance(su.get("tool_info"), dict) else {}
+            tool_name = str(su.get("tool_name") or tool_info.get("name") or "").strip()
+            if tool_name or st_type == "tool":
+                prog = job.setdefault(
+                    "progress",
+                    _new_progress_state(str(job.get("title") or ""), str(job.get("promptPreview") or "")),
+                )
+                step_idx = su.get("step_index")
+                st_state = str(su.get("state") or "").upper()
+                params = (
+                    tool_info.get("parameters")
+                    or tool_info.get("args")
+                    or tool_info.get("arguments")
+                    or {}
+                )
+                output_text = str(tool_info.get("output") or "")
+                _record_tool_call_on_state(
+                    prog,
+                    tool_name,
+                    params,
+                    step_index=step_idx if isinstance(step_idx, int) else None,
+                    is_done=(st_state in ("DONE", "ERROR")),
+                    output_text=output_text,
+                )
+                if prog.get("stage"):
+                    job["cliStage"] = prog["stage"]
+                if prog.get("detail"):
+                    job["cliDetail"] = prog["detail"]
+                job["subagents"] = list(prog.get("subagents") or [])
+
+        if ev.get("event") == "result" and isinstance(ev.get("result"), dict):
+            res_ev = ev["result"]
+            if res_ev.get("status") == "ERROR":
+                stream_err = str(res_ev.get("error") or "")
+            elif isinstance(res_ev.get("denied_actions"), list) and res_ev["denied_actions"]:
+                denied_names = [
+                    str(a.get("display_name") or a.get("action") or "tool")
+                    for a in res_ev["denied_actions"]
+                    if isinstance(a, dict)
+                ]
+                stream_err = (
+                    f"Headless CLI auto-denied tool permission(s): "
+                    f"{', '.join(denied_names) or 'RunCommand'} "
+                    f"(see ~/.gemini/quasar/last_cli_run.log)"
+                )
+    return saw_execution, stream_err
 
 
 def dispatch_via_agy_cli(
@@ -500,20 +1211,15 @@ def dispatch_via_agy_cli(
     cmd.append(f"--print={prompt}")
 
     cli_bin_name = os.path.basename(agy_bin)
-    ACTIVE_AGENT_JOB.clear()
-    ACTIVE_AGENT_JOB.update({
-        "active": True,
-        "title": title,
-        "promptPreview": prompt.splitlines()[0][:120] if prompt else title,
-        "startedAt": time.time(),
-        "baselineMtime": baseline_mtime,
-        "conversationId": "",
-        "mode": "agy-cli",
-        "cliStage": f"🚀 Running {cli_bin_name} CLI...",
-        "cliDetail": f"Starting {title} ({eff} effort)...",
-        "subagents": [],
-        "completedAt": None,
-    })
+    _init_active_agent_job(
+        title=title,
+        prompt_preview=prompt.splitlines()[0][:120] if prompt else title,
+        baseline_mtime=baseline_mtime,
+        conversation_id="",
+        mode="agy-cli",
+        cli_stage=f"🚀 Running {cli_bin_name} CLI...",
+        cli_detail=f"Starting {title} ({eff} effort)...",
+    )
 
     def _reconcile_any_pending_threads(fallback_text: str, err_text: str) -> None:
         try:
@@ -594,55 +1300,18 @@ def dispatch_via_agy_cli(
                                 r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
                                 ln,
                             )
-                            if m_uuid and not ACTIVE_AGENT_JOB.get("conversationId"):
-                                ACTIVE_AGENT_JOB["conversationId"] = m_uuid.group(1)
+                            with _JOB_LOCK:
+                                if m_uuid and not ACTIVE_AGENT_JOB.get("conversationId"):
+                                    ACTIVE_AGENT_JOB["conversationId"] = m_uuid.group(1)
                             if ln.startswith("{") and ln.endswith("}"):
                                 try:
                                     ev = json.loads(ln)
-                                    cid_cand = (
-                                        ev.get("conversation_id")
-                                        or ev.get("conversationId")
-                                        or ev.get("session_id")
-                                        or ""
-                                    )
-                                    if cid_cand:
-                                        ACTIVE_AGENT_JOB["conversationId"] = str(cid_cand)
-                                    su = ev.get("step_update") or {}
-                                    if su.get("step_type") and su.get("step_type") != "user_input":
+                                    ev_saw, ev_err = _process_cli_stream_event(ev, ACTIVE_AGENT_JOB, agent_text_chunks)
+                                    if ev_saw:
                                         saw_execution = True
-                                        if su.get("step_type") == "agent_response" and isinstance(su.get("text_delta"), str):
-                                            agent_text_chunks.append(su["text_delta"])
-                                    if ev.get("event") == "result" and isinstance(ev.get("result"), dict):
-                                        res_ev = ev["result"]
-                                        if res_ev.get("status") == "ERROR":
-                                            stream_err = str(res_ev.get("error") or "")
-                                        elif isinstance(res_ev.get("denied_actions"), list) and res_ev["denied_actions"]:
-                                            denied_names = [
-                                                str(a.get("display_name") or a.get("action") or "tool")
-                                                for a in res_ev["denied_actions"]
-                                                if isinstance(a, dict)
-                                            ]
-                                            stream_err = (
-                                                f"Headless CLI auto-denied tool permission(s): "
-                                                f"{', '.join(denied_names) or 'RunCommand'} "
-                                                f"(see ~/.gemini/quasar/last_cli_run.log)"
-                                            )
-                                    if "collect_pr_context" in ln:
-                                        ACTIVE_AGENT_JOB["cliStage"] = "📥 Phase 1/3 — Fetching PR context & snapshots"
-                                        ACTIVE_AGENT_JOB["cliDetail"] = "Materializing base/head file snapshots..."
-                                    elif "invoke_subagent" in ln or "review-" in ln:
-                                        ACTIVE_AGENT_JOB["cliStage"] = "🔬 Phase 2/3 — Running specialist review lenses"
-                                        for m_ag in re.findall(r"review-[a-z-]+", ln):
-                                            subs = ACTIVE_AGENT_JOB.setdefault("subagents", [])
-                                            if m_ag not in subs:
-                                                subs.append(m_ag)
-                                        ACTIVE_AGENT_JOB["cliDetail"] = "Analyzing architecture, bugs, & edge cases..."
-                                    elif "publish_review_session" in ln:
-                                        ACTIVE_AGENT_JOB["cliStage"] = "📖 Phase 3/3 — Publishing CliffsNotes & comments"
-                                        ACTIVE_AGENT_JOB["cliDetail"] = "Writing session & rendering diffs..."
-                                    elif "answer_comment_question" in ln:
-                                        ACTIVE_AGENT_JOB["cliStage"] = "💬 Posting inline answer to thread"
-                                        ACTIVE_AGENT_JOB["cliDetail"] = "Updating comment thread in place..."
+                                    if ev_err:
+                                        stream_err = ev_err
+                                    _notify_status_change()
                                 except Exception:
                                     pass
                             elif re.search(r"RESOURCE_EXHAUSTED|exhausted your capacity|soft-denying tool confirmation|headless mode cannot prompt for|auto-denied", ln, re.I):
@@ -662,14 +1331,18 @@ def dispatch_via_agy_cli(
             if rc != 0 and not stream_err:
                 stream_err = "Model quota exhausted" if rc == 3 else f"agy exited with code {rc}"
             if stream_err:
-                ACTIVE_AGENT_JOB["cliError"] = stream_err
+                with _JOB_LOCK:
+                    ACTIVE_AGENT_JOB["cliError"] = stream_err
             _reconcile_any_pending_threads("".join(agent_text_chunks), stream_err)
         except Exception as exc:
-            ACTIVE_AGENT_JOB["cliError"] = str(exc)
+            with _JOB_LOCK:
+                ACTIVE_AGENT_JOB["cliError"] = str(exc)
             _reconcile_any_pending_threads("", str(exc))
         finally:
-            ACTIVE_AGENT_JOB["active"] = False
-            ACTIVE_AGENT_JOB["completedAt"] = time.time()
+            with _JOB_LOCK:
+                ACTIVE_AGENT_JOB["active"] = False
+                ACTIVE_AGENT_JOB["completedAt"] = time.time()
+            _notify_status_change()
 
     threading.Thread(target=_run_stream, daemon=True).start()
     return {
@@ -714,17 +1387,13 @@ def dispatch_to_agent(
         )
 
     def _record_active(cid: Optional[str], mode: str) -> None:
-        ACTIVE_AGENT_JOB.clear()
-        ACTIVE_AGENT_JOB.update({
-            "active": True,
-            "title": title,
-            "promptPreview": prompt.splitlines()[0][:120] if prompt else title,
-            "startedAt": time.time(),
-            "baselineMtime": baseline_mtime,
-            "conversationId": cid or "",
-            "mode": mode,
-            "completedAt": None,
-        })
+        _init_active_agent_job(
+            title=title,
+            prompt_preview=prompt.splitlines()[0][:120] if prompt else title,
+            baseline_mtime=baseline_mtime,
+            conversation_id=cid or "",
+            mode=mode,
+        )
 
     def _is_conv_deliverable(cid_check: Optional[str]) -> bool:
         if not cid_check:
@@ -1007,55 +1676,73 @@ def dispatch_to_agent(
 
 
 def get_live_agent_status(session: Optional[Dict[str, Any]], all_sessions: List[Dict[str, Any]]) -> Dict[str, Any]:
-    import time
-
     now = time.time()
     current_max_mtime = max((s["mtime"] for s in all_sessions), default=0.0)
 
-    # Check if a web-dispatched job just completed because a session file was updated
-    if ACTIVE_AGENT_JOB.get("active"):
-        started_at = float(ACTIVE_AGENT_JOB.get("startedAt") or now)
-        baseline_mtime = float(ACTIVE_AGENT_JOB.get("baselineMtime") or 0.0)
-        is_cli_job = ACTIVE_AGENT_JOB.get("mode") == "agy-cli"
-        if not is_cli_job and current_max_mtime > baseline_mtime + 0.5 and (now - started_at) > 1.0:
-            ACTIVE_AGENT_JOB["active"] = False
-            ACTIVE_AGENT_JOB["completedAt"] = now
-        elif (now - started_at) > (1800 if is_cli_job else 600):
-            ACTIVE_AGENT_JOB["active"] = False
+    with _JOB_LOCK:
+        # Check if a web-dispatched job just completed because a session file was updated
+        if ACTIVE_AGENT_JOB.get("active"):
+            started_at = float(ACTIVE_AGENT_JOB.get("startedAt") or now)
+            baseline_mtime = float(ACTIVE_AGENT_JOB.get("baselineMtime") or 0.0)
+            is_cli_job = ACTIVE_AGENT_JOB.get("mode") == "agy-cli"
+            if not is_cli_job and current_max_mtime > baseline_mtime + 0.5 and (now - started_at) > 1.0:
+                ACTIVE_AGENT_JOB["active"] = False
+                ACTIVE_AGENT_JOB["completedAt"] = now
+            elif (now - started_at) > (1800 if is_cli_job else 600):
+                ACTIVE_AGENT_JOB["active"] = False
 
-    if not ACTIVE_AGENT_JOB.get("active") and ACTIVE_AGENT_JOB.get("completedAt"):
-        comp_at = float(ACTIVE_AGENT_JOB["completedAt"])
-        cli_err = str(ACTIVE_AGENT_JOB.get("cliError") or "").strip()
-        if cli_err and (now - comp_at) <= 30.0:
-            return {
-                "active": False,
-                "completedJustNow": True,
-                "error": cli_err,
-                "title": ACTIVE_AGENT_JOB.get("title") or "Quasar Agent Task",
-                "stage": "⚠️ Quasar Agent could not complete this run",
-                "detail": cli_err,
-                "percent": 100,
-                "elapsedSeconds": int(comp_at - float(ACTIVE_AGENT_JOB.get("startedAt") or comp_at)),
-            }
-        if not cli_err and (now - comp_at) <= 8.0:
-            return {
-                "active": False,
-                "completedJustNow": True,
-                "title": ACTIVE_AGENT_JOB.get("title") or "Quasar Agent Task",
-                "stage": "✅ Agent finished — Review updated!",
-                "detail": "The latest review changes have been loaded.",
-                "percent": 100,
-                "elapsedSeconds": int(comp_at - float(ACTIVE_AGENT_JOB.get("startedAt") or comp_at)),
-            }
+        if not ACTIVE_AGENT_JOB.get("active") and ACTIVE_AGENT_JOB.get("completedAt"):
+            comp_at = float(ACTIVE_AGENT_JOB["completedAt"])
+            cli_err = str(ACTIVE_AGENT_JOB.get("cliError") or "").strip()
+            prog_snap = ACTIVE_AGENT_JOB.get("progress") or {}
+            subs_done = list(prog_snap.get("subagents") or ACTIVE_AGENT_JOB.get("subagents") or [])
+            if cli_err and (now - comp_at) <= 30.0:
+                return {
+                    "active": False,
+                    "completedJustNow": True,
+                    "error": cli_err,
+                    "title": ACTIVE_AGENT_JOB.get("title") or "Quasar Agent Task",
+                    "stage": "⚠️ Quasar Agent could not complete this run",
+                    "detail": cli_err,
+                    "percent": 100,
+                    "subagents": subs_done,
+                    "elapsedSeconds": int(comp_at - float(ACTIVE_AGENT_JOB.get("startedAt") or comp_at)),
+                }
+            if not cli_err and (now - comp_at) <= 8.0:
+                return {
+                    "active": False,
+                    "completedJustNow": True,
+                    "title": ACTIVE_AGENT_JOB.get("title") or "Quasar Agent Task",
+                    "stage": "✅ Agent finished — Review updated!",
+                    "detail": "The latest review changes have been loaded.",
+                    "percent": 100,
+                    "subagents": subs_done,
+                    "elapsedSeconds": int(comp_at - float(ACTIVE_AGENT_JOB.get("startedAt") or comp_at)),
+                }
+
+        job_snapshot = {
+            "active": bool(ACTIVE_AGENT_JOB.get("active")),
+            "mode": ACTIVE_AGENT_JOB.get("mode"),
+            "title": ACTIVE_AGENT_JOB.get("title"),
+            "promptPreview": ACTIVE_AGENT_JOB.get("promptPreview"),
+            "startedAt": ACTIVE_AGENT_JOB.get("startedAt"),
+            "conversationId": ACTIVE_AGENT_JOB.get("conversationId"),
+            "cliStage": ACTIVE_AGENT_JOB.get("cliStage"),
+            "cliDetail": ACTIVE_AGENT_JOB.get("cliDetail"),
+            "subagents": list(ACTIVE_AGENT_JOB.get("subagents") or []),
+            "progress": json.loads(json.dumps(ACTIVE_AGENT_JOB.get("progress") or {}))
+            if ACTIVE_AGENT_JOB.get("progress")
+            else None,
+        }
 
     # Inspect recent transcript activity across all ~/.gemini/*/brain directories.
     # For an active `agy-cli` job, ONLY inspect its own spawned conversationId so we never
     # cross-contaminate the banner with an unrelated IDE/CLI conversation running in parallel.
-    is_active_cli_job = bool(ACTIVE_AGENT_JOB.get("active") and ACTIVE_AGENT_JOB.get("mode") == "agy-cli")
+    is_active_cli_job = bool(job_snapshot["active"] and job_snapshot.get("mode") == "agy-cli")
     target_cid = (
-        ACTIVE_AGENT_JOB.get("conversationId") or ""
+        job_snapshot.get("conversationId") or ""
         if is_active_cli_job
-        else (ACTIVE_AGENT_JOB.get("conversationId") or (session or {}).get("conversationId") or "")
+        else (job_snapshot.get("conversationId") or (session or {}).get("conversationId") or "")
     ).strip()
 
     transcript_path = None
@@ -1080,18 +1767,21 @@ def get_live_agent_status(session: Optional[Dict[str, Any]], all_sessions: List[
         if recent and (now - recent[0][0]) < 45:
             transcript_path = recent[0][1]
 
-    stage = ACTIVE_AGENT_JOB.get("cliStage") or "Initializing Quasar Agent..."
-    detail = ACTIVE_AGENT_JOB.get("cliDetail") or "Waiting for agent response..."
-    percent = 20
-    subagents: List[str] = list(ACTIVE_AGENT_JOB.get("subagents") or [])
+    prog_state: Dict[str, Any] = (
+        job_snapshot["progress"]
+        if isinstance(job_snapshot.get("progress"), dict)
+        else _new_progress_state(
+            str(job_snapshot.get("title") or ""),
+            str(job_snapshot.get("promptPreview") or ""),
+        )
+    )
     transcript_is_running = False
     transcript_started_at = None
 
     if transcript_path and os.path.isfile(transcript_path):
         try:
             t_mtime = os.path.getmtime(transcript_path)
-            with open(transcript_path, "r", encoding="utf-8", errors="replace") as tf:
-                lines = tf.readlines()[-35:]
+            lines = _read_tail_lines(transcript_path, max_bytes=131072, max_lines=200)
             steps = []
             for ln in lines:
                 ln = ln.strip()
@@ -1117,51 +1807,45 @@ def get_live_agent_status(session: Optional[Dict[str, Any]], all_sessions: List[
                         break
                 recent_slice.reverse()
 
-                saw_quasar = False
-                for st in recent_slice:
-                    raw_str = json.dumps(st)
-                    if any(k in raw_str for k in ("collect_pr_context", "publish_review_session", "answer_comment_question", "manage_fixes", "review-architect", "review-bug-hunter")):
-                        saw_quasar = True
-                    for tc in st.get("tool_calls") or []:
-                        args_obj = tc.get("arguments") or tc.get("args") or {}
-                        if isinstance(args_obj, str):
-                            try:
-                                args_obj = json.loads(args_obj)
-                            except Exception:
-                                args_obj = {}
-                        t_act = (args_obj.get("toolAction") or args_obj.get("toolSummary") or tc.get("name") or "").strip()
-                        if t_act:
-                            detail = f"Current step: {t_act}"
-                        cmd_line = str(args_obj.get("CommandLine") or "")
-                        if "collect_pr_context.py" in cmd_line:
-                            stage = "Phase 1/3: Fetching PR Context, Diffs & Snapshots"
-                            percent = max(percent, 28)
-                        elif "invoke_subagent" in str(tc.get("name") or "") or "Subagents" in args_obj:
-                            stage = "Phase 2/3: Running 4 Multi-Lens Subagents (Architect, Bug Hunter, Test Critic, Advocate)"
-                            percent = max(percent, 62)
-                            for sa in (args_obj.get("Subagents") or []):
-                                role = sa.get("Role") or sa.get("TypeName")
-                                if role and role not in subagents:
-                                    subagents.append(role)
-                        elif "publish_review_session.py" in cmd_line:
-                            stage = "Phase 3/3: Synthesizing Study Guide, Flowchart & Inline Findings"
-                            percent = max(percent, 90)
-                        elif "answer_comment_question.py" in cmd_line:
-                            stage = "Updating Inline Comment Thread & Preferences"
-                            percent = max(percent, 75)
-                        elif "manage_fixes.py" in cmd_line:
-                            stage = "Applying Code Fixes & Syncing Diff Snapshots"
-                            percent = max(percent, 80)
-                if not saw_quasar and not ACTIVE_AGENT_JOB.get("active"):
+                # Replay transcript steps when not already tracked directly by CLI stream-json
+                # (or when CLI stream hasn't observed structured tool calls yet).
+                should_replay_transcript = (not is_active_cli_job) or (
+                    int(prog_state.get("phase") or 0) == 0 and not (prog_state.get("subagentDetails") or [])
+                )
+                saw_quasar = bool(prog_state.get("sawQuasar"))
+                if should_replay_transcript:
+                    last_tc_name = ""
+                    for st in recent_slice:
+                        raw_str = json.dumps(st)
+                        if any(k in raw_str for k in ("collect_pr_context", "publish_review_session", "answer_comment_question", "manage_fixes", "review-architect", "review-bug-hunter")):
+                            saw_quasar = True
+                        if st.get("type") == "GENERIC":
+                            _parse_subagent_output_text(
+                                prog_state,
+                                last_tc_name or "manage_subagents",
+                                str(st.get("content") or ""),
+                            )
+                        for tc in st.get("tool_calls") or []:
+                            tc_name = str(tc.get("name") or "")
+                            last_tc_name = tc_name
+                            _record_tool_call_on_state(
+                                prog_state,
+                                tc_name,
+                                tc.get("arguments") or tc.get("args") or {},
+                            )
+                    if saw_quasar:
+                        prog_state["sawQuasar"] = True
+
+                if not prog_state.get("sawQuasar") and not job_snapshot["active"]:
                     transcript_is_running = False
 
                 # If an IDE-hub-dispatched turn already ended with a plain-text reply (no tool calls,
                 # no running background tasks) without updating active_session.json, stop spinning and
                 # surface the agent's message immediately instead of waiting 10 minutes.
-                job_started = float(ACTIVE_AGENT_JOB.get("startedAt") or 0.0)
+                job_started = float(job_snapshot.get("startedAt") or 0.0)
                 if (
-                    ACTIVE_AGENT_JOB.get("active")
-                    and ACTIVE_AGENT_JOB.get("mode") != "agy-cli"
+                    job_snapshot["active"]
+                    and job_snapshot.get("mode") != "agy-cli"
                     and last_type == "PLANNER_RESPONSE"
                     and not last_tools
                     and t_mtime >= job_started
@@ -1177,43 +1861,51 @@ def get_live_agent_status(session: Optional[Dict[str, Any]], all_sessions: List[
                     )
                     if not has_running_bg:
                         reply_txt = " ".join(str(last_step.get("content") or "").split())[:240]
-                        ACTIVE_AGENT_JOB["active"] = False
-                        ACTIVE_AGENT_JOB["completedAt"] = now
-                        ACTIVE_AGENT_JOB["cliError"] = (
-                            reply_txt
-                            or "Agent turn ended in Antigravity IDE without updating the review session."
-                        )
-                        transcript_is_running = False
+                        err_msg = reply_txt or "Agent turn ended in Antigravity IDE without updating the review session."
+                        with _JOB_LOCK:
+                            ACTIVE_AGENT_JOB["active"] = False
+                            ACTIVE_AGENT_JOB["completedAt"] = now
+                            ACTIVE_AGENT_JOB["cliError"] = err_msg
+                        _notify_status_change()
                         return {
                             "active": False,
                             "completedJustNow": True,
-                            "error": ACTIVE_AGENT_JOB["cliError"],
-                            "title": ACTIVE_AGENT_JOB.get("title") or "Quasar Agent Task",
+                            "error": err_msg,
+                            "title": job_snapshot.get("title") or "Quasar Agent Task",
                             "stage": "⚠️ Agent turn ended without updating review",
-                            "detail": ACTIVE_AGENT_JOB["cliError"],
+                            "detail": err_msg,
                             "percent": 100,
+                            "subagents": list(prog_state.get("subagents") or []),
                             "elapsedSeconds": int(now - job_started) if job_started else 0,
                         }
         except Exception:
             pass
 
-    is_active = bool(ACTIVE_AGENT_JOB.get("active") or transcript_is_running)
+    is_active = bool(job_snapshot["active"] or transcript_is_running)
     if not is_active:
         return {"active": False}
 
-    started_at = float(ACTIVE_AGENT_JOB.get("startedAt") or transcript_started_at or now)
+    started_at = float(job_snapshot.get("startedAt") or transcript_started_at or now)
     elapsed = max(1, int(now - started_at))
-    # Smoothly advance progress slightly with time so the bar never looks frozen while subagents think
-    if percent < 85:
-        percent = min(85, max(percent, 15 + int(elapsed * 0.8)))
+    default_stage = str(job_snapshot.get("cliStage") or "Initializing Quasar Agent...")
+    default_detail = str(job_snapshot.get("cliDetail") or "Waiting for agent response...")
+    metrics = _finalize_progress_metrics(
+        prog_state,
+        started_at=started_at,
+        now=now,
+        default_stage=default_stage,
+        default_detail=default_detail,
+    )
 
     return {
         "active": True,
-        "title": ACTIVE_AGENT_JOB.get("title") or "Quasar Multi-Agent Code Review",
-        "stage": stage,
-        "detail": detail,
-        "percent": percent,
-        "subagents": subagents,
+        "title": job_snapshot.get("title") or "Quasar Multi-Agent Code Review",
+        "stage": metrics["stage"],
+        "detail": metrics["detail"],
+        "percent": metrics["percent"],
+        "subagents": metrics["subagents"],
+        "subagentProgress": metrics["subagentProgress"],
+        "recentSteps": metrics["recentSteps"],
         "elapsedSeconds": elapsed,
         "startedAt": started_at,
     }
@@ -1526,6 +2218,7 @@ def build_state_payload(
         "ok": True,
         "activeSession": session,
         "activeSessionPath": session_path,
+        "sessionMaxMtime": max((s["mtime"] for s in all_sessions), default=0.0),
         "defaultWorkspaceDir": default_ws,
         "filesDiff": compute_file_diffs(session),
         "sessions": session_summaries,
@@ -1534,6 +2227,91 @@ def build_state_payload(
         "inbox": inbox_payload,
         "agentStatus": agent_status,
         "sidecarPort": PORT,
+    }
+
+
+_SESSION_META_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
+def _get_fast_session_meta(session_id: Optional[str] = None) -> Tuple[Optional[Dict[str, Any]], float]:
+    """Return lightweight metadata for `session_id` (or latest) and max mtime across sessions."""
+    candidates: List[Tuple[float, str]] = []
+    if os.path.isdir(WORKSPACES_DIR):
+        for entry in os.listdir(WORKSPACES_DIR):
+            p = os.path.join(WORKSPACES_DIR, entry, "active_session.json")
+            if os.path.isfile(p):
+                try:
+                    candidates.append((os.path.getmtime(p), p))
+                except Exception:
+                    pass
+    if os.path.isdir(HISTORY_DIR):
+        for entry in os.listdir(HISTORY_DIR):
+            p = os.path.join(HISTORY_DIR, entry, "session.json")
+            if os.path.isfile(p):
+                try:
+                    candidates.append((os.path.getmtime(p), p))
+                except Exception:
+                    pass
+    if not candidates:
+        return None, 0.0
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    max_mtime = candidates[0][0]
+
+    def read_meta(mtime: float, path: str) -> Optional[Dict[str, Any]]:
+        cached = _SESSION_META_CACHE.get(path)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                sess = json.load(f)
+            if not isinstance(sess, dict):
+                return None
+            sid = str(sess.get("sessionId") or "").strip()
+            if not sid:
+                pr = sess.get("pr") or {}
+                sid = f"{pr.get('owner', 'local')}-{pr.get('repo', 'repo')}-{pr.get('number') or pr.get('headRefName') or 'session'}"
+            clean_id = re.sub(r"[^a-zA-Z0-9._-]+", "-", sid).strip("-")
+            meta = {
+                "id": clean_id,
+                "sessionId": str(sess.get("sessionId") or clean_id),
+                "updatedAt": str(sess.get("updatedAt") or ""),
+                "analysisStatus": str(sess.get("analysisStatus") or ""),
+                "conversationId": str(sess.get("conversationId") or ""),
+                "mtime": mtime,
+            }
+            _SESSION_META_CACHE[path] = (mtime, meta)
+            return meta
+        except Exception:
+            return None
+
+    target_meta: Optional[Dict[str, Any]] = None
+    if session_id:
+        for mtime, path in candidates:
+            meta = read_meta(mtime, path)
+            if meta and (meta["id"] == session_id or meta["sessionId"] == session_id):
+                target_meta = meta
+                break
+    if target_meta is None:
+        for mtime, path in candidates:
+            target_meta = read_meta(mtime, path)
+            if target_meta is not None:
+                break
+    return target_meta, max_mtime
+
+
+def build_agent_status_payload(session_id: Optional[str] = None) -> Dict[str, Any]:
+    """Build a lightweight status payload for `/api/agent-status` and SSE `/api/agent-stream`."""
+    meta, max_mtime = _get_fast_session_meta(session_id)
+    all_stubs = [{"mtime": max_mtime}] if max_mtime > 0 else []
+    agent_status = get_live_agent_status(meta, all_stubs)
+    return {
+        "ok": True,
+        "agentStatus": agent_status,
+        "sessionMaxMtime": max_mtime,
+        "activeSessionId": (meta or {}).get("sessionId") or "",
+        "activeSessionUpdatedAt": (meta or {}).get("updatedAt") or "",
+        "activeAnalysisStatus": (meta or {}).get("analysisStatus") or "",
     }
 
 
@@ -1701,7 +2479,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
   <main id="mainContent" class="flex-1 p-4 max-w-7xl w-full mx-auto space-y-4"></main>
 
   <!-- Modal Container -->
-  <div id="modalBackdrop" class="hidden fixed inset-0 bg-black/70 z-40 flex items-center justify-center p-4">
+  <div id="modalBackdrop" class="hidden">
     <div id="modalBox" class="q-card max-w-lg w-full p-5 space-y-3 shadow-2xl"></div>
   </div>
 
@@ -1719,6 +2497,16 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
     let TRACKED_FIX_SESSION_ID = null;
     const TRACKED_FIXING_IDS = new Set();
     const KNOWN_FIXED_IDS = new Set();
+    let IS_REFRESHING_STATE = false;
+    let PENDING_REFRESH_SESSION = undefined;
+    let IS_POLLING_STATUS = false;
+    let USER_SELECTED_SESSION_ID = null;
+    let LAST_SESSION_MAX_MTIME = 0;
+    let LAST_COMPLETED_KEY = null;
+    let LAST_STATUS_AT = 0;
+    let SSE_SOURCE = null;
+    let SSE_CONNECTED = false;
+    let LAST_SSE_AT = 0;
 
     function checkFixTransitions(session) {
       if (!session || !Array.isArray(session.threads)) {
@@ -1787,8 +2575,8 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       let status = null;
       if (srv.active || srv.completedJustNow) {
         status = srv;
-        if (srv.completedJustNow) OPTIMISTIC_AGENT_JOB = null;
-      } else if (OPTIMISTIC_AGENT_JOB && (Date.now() / 1000 - OPTIMISTIC_AGENT_JOB.startedAt) < 25) {
+        if (srv.completedJustNow || srv.active) OPTIMISTIC_AGENT_JOB = null;
+      } else if (OPTIMISTIC_AGENT_JOB && (Date.now() / 1000 - OPTIMISTIC_AGENT_JOB.startedAt) < 30) {
         const el = Math.floor(Date.now() / 1000 - OPTIMISTIC_AGENT_JOB.startedAt);
         status = { ...OPTIMISTIC_AGENT_JOB, elapsedSeconds: el, percent: Math.min(40, 18 + el) };
       } else {
@@ -1803,6 +2591,25 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       }
 
       if (status.completedJustNow) {
+        if (status.error) {
+          if (pill) {
+            pill.className = 'q-badge border-red-500/60 bg-red-500/15 text-red-300';
+            pill.innerHTML = '⚠️ Review Interrupted';
+          }
+          banner.className = 'max-w-7xl w-full mx-auto px-4 pt-3';
+          banner.innerHTML = `
+            <div class="rounded-lg border border-red-500/50 bg-red-950/30 px-4 py-3 flex items-center justify-between text-xs gap-3">
+              <div class="flex items-center gap-2.5 min-w-0">
+                <span class="text-base">⚠️</span>
+                <div class="min-w-0">
+                  <div class="font-bold text-red-300">${esc(status.stage || 'Quasar Agent could not complete this run')}</div>
+                  <div class="text-red-200/80 break-words">${esc(status.error || status.detail || '')}</div>
+                </div>
+              </div>
+              <button class="q-btn shrink-0" onclick="OPTIMISTIC_AGENT_JOB=null; document.getElementById('agentActivityBanner').className='hidden';">Dismiss</button>
+            </div>`;
+          return;
+        }
         if (pill) {
           pill.className = 'q-badge border-emerald-500/60 bg-emerald-500/15 text-emerald-300';
           pill.innerHTML = '✅ Review Updated';
@@ -1825,14 +2632,30 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       const elapsed = status.startedAt
         ? Math.max(status.elapsedSeconds || 1, Math.floor(Date.now() / 1000 - status.startedAt))
         : (status.elapsedSeconds || 1);
-      const pct = Math.min(95, Math.max(12, status.percent || 20));
-      const subBadges = (status.subagents || []).map((sa) =>
-        `<span class="px-2 py-0.5 rounded-full bg-purple-500/20 border border-purple-500/40 text-purple-200 text-[11px]">🤖 ${esc(sa)}</span>`
-      ).join('');
+      const pct = Math.min(98, Math.max(10, Math.round(Number(status.percent || 14))));
+      const subItems = Array.isArray(status.subagentProgress) && status.subagentProgress.length
+        ? status.subagentProgress
+        : (status.subagents || []).map((sa) => ({ label: String(sa), status: 'running', detail: '' }));
+      const subBadges = subItems.map((sa) => {
+        const st = sa.status || 'running';
+        const label = esc(sa.label || sa.role || sa.name || 'subagent');
+        const det = sa.detail ? `<span class="text-[10px] opacity-80">· ${esc(sa.detail)}</span>` : '';
+        if (st === 'done') {
+          return `<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-500/15 border border-emerald-500/40 text-emerald-200 text-[11px]">✅ <span>${label}</span></span>`;
+        }
+        if (st === 'error') {
+          return `<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-red-500/15 border border-red-500/40 text-red-200 text-[11px]">⚠️ <span>${label}</span>${det}</span>`;
+        }
+        return `<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-purple-500/20 border border-purple-500/40 text-purple-200 text-[11px]"><span class="inline-block w-1.5 h-1.5 rounded-full bg-purple-300 animate-ping"></span><span>${label}</span>${det}</span>`;
+      }).join('');
+      const recentSteps = Array.isArray(status.recentSteps) ? status.recentSteps.slice(-3) : [];
+      const recentHtml = recentSteps.length
+        ? `<div class="text-[11px] text-[var(--q-muted)] font-mono truncate border-t border-white/5 pt-1.5">Recent: ${recentSteps.map((s) => esc(s)).join(' → ')}</div>`
+        : '';
 
       if (pill) {
         pill.className = 'q-badge border-blue-500/60 bg-blue-500/15 text-blue-300';
-        pill.innerHTML = `<span class="inline-block w-2 h-2 rounded-full bg-blue-400 animate-ping"></span> Agent Working (${formatElapsed(elapsed)})`;
+        pill.innerHTML = `<span class="inline-block w-2 h-2 rounded-full bg-blue-400 animate-ping"></span> Agent Working (${formatElapsed(elapsed)} · ${pct}%)`;
       }
 
       banner.className = 'max-w-7xl w-full mx-auto px-4 pt-3';
@@ -1847,16 +2670,18 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 <div class="text-xs font-bold text-blue-200 flex items-center gap-2">
                   <span>${esc(status.title || 'Quasar Multi-Agent Review in Progress')}</span>
                   <span class="px-2 py-0.5 rounded bg-blue-500/20 text-blue-300 font-mono text-[11px]">${formatElapsed(elapsed)} elapsed</span>
+                  <span class="px-2 py-0.5 rounded bg-blue-500/15 text-blue-200 font-mono text-[11px]">${pct}%</span>
                 </div>
                 <div class="text-xs text-blue-300/90 font-medium mt-0.5">${esc(status.stage || 'Analyzing PR & running review subagents...')}</div>
               </div>
             </div>
-            <div class="text-[11px] text-[var(--q-muted)] font-mono">${esc(status.detail || 'Auto-refreshing when complete...')}</div>
+            <div class="text-[11px] text-[var(--q-muted)] font-mono max-w-md truncate" title="${esc(status.detail || '')}">${esc(status.detail || 'Live updates active...')}</div>
           </div>
           ${subBadges ? `<div class="flex flex-wrap gap-1.5 pt-0.5">${subBadges}</div>` : ''}
           <div class="w-full h-1.5 bg-black/50 rounded-full overflow-hidden">
             <div class="h-full q-progress-fill rounded-full" style="width: ${pct}%"></div>
           </div>
+          ${recentHtml}
         </div>`;
     }
 
@@ -1877,45 +2702,158 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       setTimeout(() => { el.className = 'hidden'; }, 4200);
     }
 
+    function buildApiUrl(path, includeConversationId = true) {
+      let fullPath = path;
+      if (SIDECAR_TOKEN) {
+        fullPath += (fullPath.includes('?') ? '&' : '?') + `token=${encodeURIComponent(SIDECAR_TOKEN)}`;
+      }
+      if (CONVERSATION_ID && includeConversationId && !fullPath.includes('conversationId=')) {
+        fullPath += (fullPath.includes('?') ? '&' : '?') + `conversationId=${encodeURIComponent(CONVERSATION_ID)}`;
+      }
+      return `${API_BASE}${fullPath}`;
+    }
+
+    function isModalOpen() {
+      const bd = document.getElementById('modalBackdrop');
+      return Boolean(bd && !bd.classList.contains('hidden'));
+    }
+
     async function apiCall(path, method = 'GET', body = null) {
       const headers = { 'Content-Type': 'application/json' };
       if (SIDECAR_TOKEN) {
         headers['X-Sidecar-Token'] = SIDECAR_TOKEN;
       }
-      let fullPath = path;
-      if (SIDECAR_TOKEN) {
-        fullPath += (fullPath.includes('?') ? '&' : '?') + `token=${encodeURIComponent(SIDECAR_TOKEN)}`;
-      }
-      if (CONVERSATION_ID && method === 'GET' && !fullPath.includes('conversationId=')) {
-        fullPath += (fullPath.includes('?') ? '&' : '?') + `conversationId=${encodeURIComponent(CONVERSATION_ID)}`;
-      }
-      const opts = { method, headers, credentials: 'include' };
+      const url = buildApiUrl(path, method === 'GET');
+      const opts = { method, headers, credentials: 'include', cache: 'no-store' };
       if (body !== null) {
         const payload = (typeof body === 'object' && body !== null && CONVERSATION_ID && !body.conversationId)
           ? { ...body, conversationId: CONVERSATION_ID }
           : body;
         opts.body = JSON.stringify(payload);
       }
-      const res = await fetch(`${API_BASE}${fullPath}`, opts);
+      const res = await fetch(url, opts);
       return await res.json();
     }
 
     async function refreshState(sessionId = null) {
+      if (IS_REFRESHING_STATE) {
+        PENDING_REFRESH_SESSION = sessionId;
+        return;
+      }
+      IS_REFRESHING_STATE = true;
+      const startedFetchAt = Date.now();
       try {
         const q = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : '';
         const data = await apiCall(`/api/state${q}`);
         if (data && data.ok) {
+          if (data.sessionMaxMtime) {
+            LAST_SESSION_MAX_MTIME = Math.max(LAST_SESSION_MAX_MTIME, Number(data.sessionMaxMtime || 0));
+          }
+          if (LAST_STATUS_AT > startedFetchAt && STATE && STATE.agentStatus) {
+            data.agentStatus = STATE.agentStatus;
+          }
           checkFixTransitions(data.activeSession);
           STATE = data;
-          renderAll();
+          try {
+            renderAll();
+          } catch (renderErr) {
+            console.error('Quasar renderAll failed:', renderErr);
+          }
         }
       } catch (err) {
-        if (STATE) {
-          renderAll();
-        } else {
+        if (!STATE) {
           document.getElementById('mainContent').innerHTML = `<div class="q-card p-6 text-sm">Could not reach Quasar sidecar server (${err.message}).</div>`;
         }
+      } finally {
+        IS_REFRESHING_STATE = false;
+        if (PENDING_REFRESH_SESSION !== undefined) {
+          const nextSid = PENDING_REFRESH_SESSION;
+          PENDING_REFRESH_SESSION = undefined;
+          refreshState(nextSid);
+        }
       }
+    }
+
+    async function applyStatusPayload(payload) {
+      if (!payload || !payload.ok) return;
+      const prevActive = Boolean(STATE?.agentStatus?.active);
+      const prevSessionId = STATE?.activeSession?.sessionId || null;
+      const prevAnalysis = STATE?.activeSession?.analysisStatus || null;
+      const nextStatus = payload.agentStatus || { active: false };
+      if (!STATE) STATE = {};
+      STATE.agentStatus = nextStatus;
+      LAST_STATUS_AT = Date.now();
+      renderAgentActivityBanner();
+
+      const nextMtime = Number(payload.sessionMaxMtime || 0);
+      const mtimeIncreased = nextMtime > 0 && LAST_SESSION_MAX_MTIME > 0 && nextMtime > LAST_SESSION_MAX_MTIME + 0.05;
+      const appearedFirstSession = nextMtime > 0 && !STATE.activeSession && Boolean(payload.activeSessionId);
+      const analysisFlipped = Boolean(
+        payload.activeSessionId &&
+        prevSessionId &&
+        payload.activeSessionId === prevSessionId &&
+        payload.activeAnalysisStatus &&
+        prevAnalysis &&
+        payload.activeAnalysisStatus !== prevAnalysis
+      );
+      if (nextMtime > 0) {
+        LAST_SESSION_MAX_MTIME = Math.max(LAST_SESSION_MAX_MTIME, nextMtime);
+      }
+
+      const compKey = nextStatus.completedJustNow ? `${nextStatus.stage || ''}:${nextStatus.error || ''}:${nextStatus.elapsedSeconds || ''}` : null;
+      const justCompleted = (prevActive && !nextStatus.active) || Boolean(compKey && compKey !== LAST_COMPLETED_KEY);
+      if (compKey) LAST_COMPLETED_KEY = compKey;
+
+      if ((mtimeIncreased || appearedFirstSession || analysisFlipped || justCompleted) && !isModalOpen()) {
+        const targetSid = USER_SELECTED_SESSION_ID || payload.activeSessionId || STATE?.activeSession?.sessionId || null;
+        await refreshState(targetSid);
+      }
+    }
+
+    async function pollAgentStatus() {
+      if (IS_POLLING_STATUS) return;
+      IS_POLLING_STATUS = true;
+      try {
+        const sid = USER_SELECTED_SESSION_ID || STATE?.activeSession?.sessionId || '';
+        const q = sid ? `?sessionId=${encodeURIComponent(sid)}` : '';
+        const payload = await apiCall(`/api/agent-status${q}`);
+        await applyStatusPayload(payload);
+      } catch (_) {
+        // Transient polling failure; banner continues smoothly via startedAt clock.
+      } finally {
+        IS_POLLING_STATUS = false;
+      }
+    }
+
+    function connectStatusStream() {
+      if (typeof EventSource === 'undefined' || window.location.protocol === 'file:') return;
+      if (SSE_SOURCE) {
+        try { SSE_SOURCE.close(); } catch (_) {}
+      }
+      const sid = USER_SELECTED_SESSION_ID || '';
+      const q = sid ? `?sessionId=${encodeURIComponent(sid)}` : '';
+      const src = new EventSource(buildApiUrl(`/api/agent-stream${q}`, true), { withCredentials: true });
+      SSE_SOURCE = src;
+      src.onopen = () => {
+        SSE_CONNECTED = true;
+        LAST_SSE_AT = Date.now();
+      };
+      src.addEventListener('status', (evt) => {
+        SSE_CONNECTED = true;
+        LAST_SSE_AT = Date.now();
+        try {
+          const data = JSON.parse(evt.data);
+          applyStatusPayload(data);
+        } catch (_) {}
+      });
+      src.onerror = () => {
+        SSE_CONNECTED = false;
+        if (src.readyState === EventSource.CLOSED) {
+          setTimeout(() => {
+            if (SSE_SOURCE === src) connectStatusStream();
+          }, 4000);
+        }
+      };
     }
 
     function setTab(tab) {
@@ -1945,7 +2883,10 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         sel.innerHTML = sessions.length
           ? sessions.map((s) => `<option value="${esc(s.id)}" ${session && (session.sessionId === s.sessionId || session.sessionId === s.id) ? 'selected' : ''}>${esc(s.title)}</option>`).join('')
           : '<option value="">No active reviews yet</option>';
-        sel.onchange = (e) => refreshState(e.target.value);
+        sel.onchange = (e) => {
+          USER_SELECTED_SESSION_ID = e.target.value || null;
+          refreshState(USER_SELECTED_SESSION_ID);
+        };
       }
 
       const ghBtn = document.getElementById('ghAuthBtn');
@@ -2925,6 +3866,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       if (res && res.ok) {
         showToast('🎓 Sandbox PR Tutorial loaded!');
         ACTIVE_TAB = 'guide';
+        USER_SELECTED_SESSION_ID = res.sessionId || null;
         await refreshState(res.sessionId);
       } else {
         showToast(res?.error || 'Failed to start tutorial', true);
@@ -3505,10 +4447,12 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       if (res && res.ok && res.quarantined) {
         OPTIMISTIC_AGENT_JOB = null;
         renderAgentActivityBanner();
+        USER_SELECTED_SESSION_ID = res.sessionId || null;
         await refreshState(res.sessionId);
         showToast('🚨 Quarantined before LLM review — inspect flagged diff lines first!', true);
       } else if (res && res.ok) {
         showToast('🚀 Review context collected and dispatched to agent!');
+        USER_SELECTED_SESSION_ID = res.sessionId || null;
         await refreshState(res.sessionId);
       } else {
         OPTIMISTIC_AGENT_JOB = null;
@@ -3674,18 +4618,19 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
     (async () => {
       await detectApiBase();
       if (STATE) renderAll();
+      if (window.location.protocol === 'file:') return;
       await refreshState();
+      connectStatusStream();
       let lastPollAt = Date.now();
       setInterval(() => {
         if (STATE?.agentStatus?.active || OPTIMISTIC_AGENT_JOB) {
           renderAgentActivityBanner();
         }
-        const pollIntervalMs = (STATE?.agentStatus?.active || OPTIMISTIC_AGENT_JOB) ? 2000 : 4000;
-        if (Date.now() - lastPollAt >= pollIntervalMs) {
+        const pollIntervalMs = (STATE?.agentStatus?.active || OPTIMISTIC_AGENT_JOB) ? 2000 : 5000;
+        const sseHealthy = SSE_CONNECTED && LAST_SSE_AT > 0 && (Date.now() - LAST_SSE_AT) < 15000;
+        if (!sseHealthy && (Date.now() - lastPollAt >= pollIntervalMs)) {
           lastPollAt = Date.now();
-          if (!document.getElementById('modalBackdrop')?.classList.contains('fixed')) {
-            refreshState(STATE?.activeSession?.sessionId);
-          }
+          pollAgentStatus();
         }
       }, 1000);
     })();
@@ -3704,6 +4649,7 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Sidecar-Token")
@@ -3715,8 +4661,90 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.end_headers()
         self.wfile.write(body)
+
+    def _is_client_disconnected(self) -> bool:
+        """Check non-blockingly whether the SSE TCP peer closed its socket."""
+        if getattr(self.server, "_quasar_stopping", False):
+            return True
+        sock = getattr(self, "connection", None)
+        if sock is None:
+            return False
+        try:
+            r, _, _ = select.select([sock], [], [], 0)
+            if r:
+                flags = socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0)
+                peeked = sock.recv(1, flags)
+                if peeked == b"":
+                    return True
+        except BlockingIOError:
+            return False
+        except OSError:
+            return True
+        except Exception:
+            return False
+        return False
+
+    def _send_status_stream(self, sid: Optional[str]) -> None:
+        """Push live `agentStatus` updates over Server-Sent Events (SSE)."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self.close_connection = True
+
+        last_sig: Optional[str] = None
+        last_seq = -1
+        last_write = time.monotonic()
+
+        try:
+            while not self._is_client_disconnected():
+                with _JOB_LOCK:
+                    cur_seq = _STATUS_SEQ
+                payload = build_agent_status_payload(sid)
+                st = payload.get("agentStatus") or {}
+                sig = json.dumps(
+                    {
+                        "active": st.get("active"),
+                        "completedJustNow": st.get("completedJustNow"),
+                        "error": st.get("error"),
+                        "stage": st.get("stage"),
+                        "detail": st.get("detail"),
+                        "percent": st.get("percent"),
+                        "subagentProgress": st.get("subagentProgress"),
+                        "subagents": st.get("subagents"),
+                        "recentSteps": st.get("recentSteps"),
+                        "sessionMaxMtime": payload.get("sessionMaxMtime"),
+                        "activeSessionId": payload.get("activeSessionId"),
+                        "activeSessionUpdatedAt": payload.get("activeSessionUpdatedAt"),
+                        "activeAnalysisStatus": payload.get("activeAnalysisStatus"),
+                    },
+                    sort_keys=True,
+                )
+                now_mono = time.monotonic()
+                if sig != last_sig:
+                    frame = f"event: status\ndata: {json.dumps(payload)}\n\n".encode("utf-8")
+                    self.wfile.write(frame)
+                    self.wfile.flush()
+                    last_sig = sig
+                    last_write = now_mono
+                elif now_mono - last_write >= 12.0:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    last_write = now_mono
+
+                last_seq = cur_seq
+                wait_timeout = 1.0 if (st.get("active") or st.get("completedJustNow")) else 3.5
+                with _STATUS_COND:
+                    if _STATUS_SEQ == last_seq and not getattr(self.server, "_quasar_stopping", False):
+                        _STATUS_COND.wait(timeout=wait_timeout)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
 
     def _read_json(self) -> Dict[str, Any]:
         length = int(self.headers.get("Content-Length") or 0)
@@ -3760,6 +4788,16 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+
+        if pathname == "/api/agent-status":
+            sid = (qs.get("sessionId") or [None])[0]
+            self._send_json(200, build_agent_status_payload(sid))
+            return
+
+        if pathname == "/api/agent-stream":
+            sid = (qs.get("sessionId") or [None])[0]
+            self._send_status_stream(sid)
             return
 
         if pathname == "/api/state":
@@ -4847,6 +5885,16 @@ def export_standalone_html(output_path: str, session_id: Optional[str] = None) -
     return output_path
 
 
+class _QuasarHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def shutdown(self) -> None:
+        self._quasar_stopping = True
+        _notify_status_change()
+        super().shutdown()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Quasar Web UI Sidecar Server & HTML Exporter")
     parser.add_argument("--export-html", default=None, help="Export a self-contained interactive HTML file and exit")
@@ -4862,11 +5910,11 @@ def main() -> None:
     global STANDALONE_WEB_MODE
     STANDALONE_WEB_MODE = bool(args.standalone_daemon)
 
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), QuasarWebHandler)
+    server = _QuasarHTTPServer(("127.0.0.1", PORT), QuasarWebHandler)
     if PORT != STANDALONE_PORT:
         def run_standalone() -> None:
             try:
-                s2 = ThreadingHTTPServer(("127.0.0.1", STANDALONE_PORT), QuasarWebHandler)
+                s2 = _QuasarHTTPServer(("127.0.0.1", STANDALONE_PORT), QuasarWebHandler)
                 s2.serve_forever()
             except Exception:
                 pass
